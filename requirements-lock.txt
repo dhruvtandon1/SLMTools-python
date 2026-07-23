@@ -1,0 +1,5 @@
+# Exact environment used for the final Python parity run.
+numpy==2.3.5
+Pillow==12.2.0
+pyFFTW==0.15.1
+pytest==9.1.1
