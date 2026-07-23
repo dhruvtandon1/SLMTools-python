@@ -36,7 +36,8 @@ subsystem instead of creating one file for each module.
    filler-typed inexact padding; plot-image whitespace trimming; homogeneous
    and complex IFT dispatch; exact raw `gsIter`/`pdgsIter` element types;
    zero/negative logging cadence; low-precision `oneShot` arithmetic and
-   metadata; `SinkhornIterBase!` same-type dispatch and mutation/return semantics;
+   metadata; `SinkhornIterBase!` same-type dispatch, column-major
+   element-by-element partial mutation, and return semantics;
    complex-target, Rational-result dtype, square-only dispatch, and
    underflowing `otPhase2`; checked complex `mapify`; direct-helper NaNs;
    Julia signed-maximum dense-OT geometry including its invalid
@@ -54,9 +55,12 @@ subsystem instead of creating one file for each module.
    norm tolerance, mixed promotion, line orientation, and dualation;
    nonuniform multidimensional linear interpolation, direct versus nested
    one-dimensional boundary tuples, and tuple-valued fills;
-   exact-number OT costs/integration and linear fitting; low-precision
-   the working `pdotBeamEstimate(LFine=None)` path and explicit failure of its
-   broken fine-lattice branch; signed-Int64 factor dispatch;
+   exact-number OT costs/integration and linear fitting; Decimal/BigFloat-like
+   dense `otPhase`, square `otPhase2`, and beam-estimation paths; empty-domain
+   cost/map behavior; strict dense-Sinkhorn Int64 keywords; low-precision
+   `pdotBeamEstimate`, including working `LFine=None` and integer-range
+   `LFine` paths plus explicit failure of the upstream-broken noninteger
+   fine-lattice branch; signed-Int64 factor dispatch;
    OpenLibm DFT and the explicitly unavailable upstream Hermite/FrFT helpers;
    Rational and Decimal template promotion, values, matrix overloads, and
    random-sampler boundaries; integer, Float16/Float32 StepRangeLen, and
@@ -98,19 +102,26 @@ are never copied into this port.
 
 The audited manifest identifies Julia 1.11.6; the local differential run used
 Julia 1.12.6 with that same project/manifest and compiled modules disabled.
-The exact Python package versions are in `requirements-lock.txt`.
+The publication baseline is CPython 3.14.6. The exact package versions are in
+`requirements-lock.txt`: NumPy 2.5.1, Pillow 12.3.0, pyFFTW 0.15.1,
+Matplotlib 3.11.1, pytest 9.1.1, setuptools 83.0.0, build 1.5.0, wheel 0.47.0,
+and twine 6.2.0. Runtime metadata specifies these validated releases as
+minimums rather than exact pins, while this lock makes the release validation
+environment reproducible.
 
 ## Commands
 
 ```bash
-python -m pytest
-python -m pytest -q tests/test_reference_parity.py
+python3.14 -m pip install -r requirements-lock.txt
+python3.14 -m pip install --no-deps -e .
+python3.14 -m pytest
+python3.14 -m pytest -q tests/test_reference_parity.py
 ```
 
 To enable optional read-only fixture checks:
 
 ```bash
-SLMTOOLS_JULIA_REPO=/absolute/path/to/SLMTools python -m pytest
+SLMTOOLS_JULIA_REPO=/absolute/path/to/SLMTools python3.14 -m pytest
 ```
 
 Before and after differential testing, record both `git status --short` and a

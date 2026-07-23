@@ -12,7 +12,7 @@ from decimal import Decimal
 from fractions import Fraction
 import math
 import struct
-from numbers import Integral, Real
+from numbers import Integral, Number, Real
 from typing import Any, Callable
 
 import numpy as np
@@ -41,6 +41,7 @@ from .lattice_field import (
     UnwrappedPhase,
     _axis,
     _is_real_number,
+    _is_julia_platform_int,
     _julia_literal_array,
     _julia_assignment_values,
     _julia_array_array_operation,
@@ -131,8 +132,8 @@ def _step(axis: Any) -> Any:
 def natrange(n: int) -> LatticeAxis:
     """Return the length-*n* centered range that is self-dual under a DFT."""
 
-    if not isinstance(n, Integral):
-        raise TypeError("natrange expects an integer.")
+    if not _is_julia_platform_int(n):
+        raise TypeError("natrange expects Julia's concrete platform Int.")
     n = int(n)
     if n < 0:
         raise DomainError("natrange expects a nonnegative length.")
@@ -153,10 +154,10 @@ def natrange(n: int) -> LatticeAxis:
 def natlat(*sizes: Any) -> Lattice:
     """Return natural axes for a tuple or positional sequence of sizes."""
 
-    if len(sizes) == 1 and isinstance(sizes[0], (tuple, list, np.ndarray)):
+    if len(sizes) == 1 and isinstance(sizes[0], tuple):
         sizes = tuple(sizes[0])
-    if not all(isinstance(item, Integral) for item in sizes):
-        raise TypeError("natlat expects integer sizes.")
+    if not all(_is_julia_platform_int(item) for item in sizes):
+        raise TypeError("natlat ultimately requires Julia platform Int sizes.")
     return tuple(natrange(int(item)) for item in sizes)
 
 
@@ -342,13 +343,28 @@ def latticeDisplacement(lattice: Any) -> np.ndarray:
 def toDim(vector: Any, dimension: int, total_dimensions: int) -> np.ndarray:
     """Reshape a vector along a Julia-style one-based dimension number."""
 
+    if not _is_julia_platform_int(dimension) or not _is_julia_platform_int(
+        total_dimensions
+    ):
+        raise TypeError("toDim dimensions must be Julia platform Int values.")
+    if isinstance(vector, tuple) or isinstance(vector, (str, bytes)) or np.isscalar(
+        vector
+    ):
+        raise TypeError("toDim expects a Julia array or AbstractRange value.")
+    if not isinstance(vector, (list, range, np.ndarray)):
+        raise TypeError("toDim expects a Julia array or AbstractRange value.")
+    dimension = int(dimension)
+    total_dimensions = int(total_dimensions)
     values = np.asarray(vector)
     if values.ndim != 1:
         values = values.reshape(-1, order="F")
-    if not 1 <= dimension <= total_dimensions:
-        raise DimensionMismatch("dimension must lie in 1:total_dimensions.")
-    shape = [1] * total_dimensions
-    shape[dimension - 1] = len(values)
+    # The Julia source does not bounds-check d against n. If d lies outside
+    # 1:n every generated dimension is singleton; reshape itself decides
+    # whether that shape is possible.
+    shape = [
+        len(values) if index == dimension else 1
+        for index in range(1, total_dimensions + 1)
+    ]
     return values.reshape(shape, order="F")
 
 
@@ -357,7 +373,7 @@ def r2(lattice: Any) -> np.ndarray:
 
     axes = as_lattice(lattice)
     if not axes:
-        return np.asarray(0.0)
+        raise TypeError("r2 on a zero-dimensional lattice is ambiguous in Julia.")
     output: np.ndarray | None = None
     for i, axis in enumerate(axes, start=1):
         values = np.asarray(axis)
@@ -382,6 +398,13 @@ def r2(lattice: Any) -> np.ndarray:
 def ldot(left: Any, right: Any) -> np.ndarray:
     """Dot a vector with lattice coordinates, accepting either argument order."""
 
+    if (
+        isinstance(left, tuple)
+        and isinstance(right, tuple)
+        and not left
+        and not right
+    ):
+        raise TypeError("ldot((), ()) is ambiguous in Julia.")
     if _looks_like_lattice(left):
         lattice = as_lattice(left)
         vector_input = right
@@ -411,6 +434,10 @@ def ldot(left: Any, right: Any) -> np.ndarray:
 
     if len(coefficients) != len(lattice):
         raise ValueError("Vector length != Lattice dimension.")
+    if not lattice:
+        raise TypeError(
+            "ldot on a zero-dimensional lattice reaches ambiguous +() in Julia."
+        )
     output: np.ndarray | None = None
     for i, (coefficient, axis) in enumerate(
         zip(coefficients, lattice, strict=True), start=1
@@ -426,7 +453,9 @@ def ldot(left: Any, right: Any) -> np.ndarray:
             else _julia_array_array_operation(output, term, np.add)
         )
     if output is None:
-        return np.asarray(0.0)
+        raise TypeError(
+            "ldot on a zero-dimensional lattice reaches ambiguous +() in Julia."
+        )
     # Julia expresses ldot as broadcasted splatted ``.+``.  The one-axis case
     # is unary plus, for which ``+(::Bool)`` returns platform Int.
     if len(lattice) == 1 and output.dtype == np.dtype(np.bool_):
@@ -437,7 +466,17 @@ def ldot(left: Any, right: Any) -> np.ndarray:
 def Nyquist(lattice: Any) -> tuple[Any, ...]:
     """Return the per-axis Nyquist coordinate ``1 / (2*step)``."""
 
-    return tuple(1 / (2 * _step(axis)) for axis in as_lattice(lattice))
+    output: list[Any] = []
+    for axis in as_lattice(lattice):
+        doubled = _julia_array_scalar_operation(
+            np.asarray(_step(axis)), np.int64(2), np.multiply
+        ).reshape(())[()]
+        output.append(
+            _julia_array_scalar_operation(
+                np.asarray(np.int64(1)), doubled, np.divide
+            ).reshape(())[()]
+        )
+    return tuple(output)
 
 
 # OpenLibm/fdlibm constants used by Julia for Float64 trigonometry.  FrFTBasis
@@ -555,9 +594,9 @@ def shiftedDFTBasis(n: int) -> np.ndarray:
     if not isinstance(n, Integral):
         raise TypeError("shiftedDFTBasis expects an integer.")
     n = int(n)
-    if n < 0:
-        raise ValueError("n must be nonnegative.")
-    if n == 0:
+    if n <= 0:
+        # ``0:n-1`` is empty for every nonpositive n, so Julia's matrix
+        # comprehension never evaluates the otherwise-invalid sqrt/division.
         return np.empty((0, 0), dtype=np.complex128)
     shift = n // 2
     scale = 1.0 / math.sqrt(n)
@@ -597,9 +636,29 @@ def FrFTBasis(n: int, alpha: Real) -> np.ndarray:
 def wigner_fft(signal: Any) -> np.ndarray:
     """Return the Julia-compatible ``n × 2n`` real Wigner distribution."""
 
-    values = np.asarray(signal)
+    # Julia declares a concrete ``Vector{T} where T<:Number`` method, not an
+    # AbstractVector method. Python lists are the natural Vector literal;
+    # tuples and ranges intentionally do not match that dispatch.
+    if isinstance(signal, tuple) or isinstance(signal, range) or not isinstance(
+        signal, (list, np.ndarray)
+    ):
+        raise TypeError("wigner_fft expects a dense numeric vector.")
+    values = (
+        _julia_literal_array(signal)
+        if isinstance(signal, list)
+        else np.asarray(signal)
+    )
     if values.ndim != 1:
         raise TypeError("wigner_fft expects a one-dimensional vector.")
+    if values.dtype.kind not in "buifcO" or (
+        values.dtype.kind == "O"
+        and not all(
+            isinstance(value, (Number, Decimal, Fraction))
+            or hasattr(value, "__complex__")
+            for value in values.flat
+        )
+    ):
+        raise TypeError("wigner_fft expects a numeric element type.")
     values = values.astype(np.complex128, copy=False)
     n = len(values)
     if n == 0:

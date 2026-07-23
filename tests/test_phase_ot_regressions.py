@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 import unittest
 import warnings
 
@@ -388,6 +389,52 @@ class OptimalTransportContractTests(unittest.TestCase):
         np.testing.assert_array_equal(v, [1, 2])
         self.assertFalse(np.array_equal(v, original_v))
 
+    def test_sinkhorn_mutations_are_elementwise_not_atomic(self) -> None:
+        cases = (
+            (
+                np.asarray([1, 2]),
+                np.asarray([9, 9]),
+                np.asarray([1, 1]),
+                np.asarray([1, 3]),
+                np.asarray([1, 2]),
+                np.asarray([1, 9]),
+            ),
+            (
+                np.ones(3, dtype=np.int64),
+                np.asarray([9, 9, 9]),
+                np.ones(3, dtype=np.int64),
+                np.asarray([4, 1, -1]),
+                np.asarray([1, 1, 1]),
+                np.asarray([1, 1, -1]),
+            ),
+            (
+                np.ones(4, dtype=np.int64),
+                np.full(4, 9, dtype=np.int64),
+                np.asarray([4, 1, 1, 0]),
+                np.asarray([2, 2, -3, 0]),
+                np.asarray([2, 1, 1, 1]),
+                np.asarray([2, 2, -3, 0]),
+            ),
+            (
+                np.ones(4, dtype=np.int64),
+                np.full(4, 9, dtype=np.int64),
+                np.asarray([8, 2, 3, 0]),
+                np.asarray([2, 2, -3, 0]),
+                np.asarray([1, 1, -1, 0]),
+                np.asarray([2, 2, -3, 0]),
+            ),
+        )
+        for u, v, source, target, expected_u, expected_v in cases:
+            transform = np.ones(len(u), dtype=np.complex128)
+            with self.assertRaisesRegex(
+                ValueError, "Inexact assignment"
+            ):
+                getattr(slm, "SinkhornIterBase!")(
+                    u, v, source, target, transform, transform
+                )
+            np.testing.assert_array_equal(u, expected_u)
+            np.testing.assert_array_equal(v, expected_v)
+
     def test_sinkhorn_mutating_helper_uses_float32_fftw_path(self) -> None:
         u = np.asarray(
             [1e-5, 0.13, 0.27, 0.19, 0.40999], dtype=np.float32
@@ -684,6 +731,34 @@ class OptimalTransportContractTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             slm.SinkhornConvN(source, target, 0.2, 0, every=1.0)
 
+    def test_dense_sinkhorn_keywords_require_julia_int64(self) -> None:
+        lattice = (range(1, 4),)
+        source = slm.LF[slm.Intensity](
+            np.asarray([1.0, 2.0, 3.0]), lattice
+        )
+        target = slm.LF[slm.Intensity](
+            np.asarray([3.0, 2.0, 1.0]), lattice
+        )
+        for keyword in ("maxiter", "check_convergence"):
+            for invalid in (True, np.int32(1)):
+                with self.assertRaisesRegex(TypeError, "Int"):
+                    slm.otPhase(
+                        source,
+                        target,
+                        0.5,
+                        **{keyword: invalid},
+                    )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            result = slm.otPhase(
+                source,
+                target,
+                0.5,
+                maxiter=np.int64(1),
+                check_convergence=np.int64(0),
+            )
+        self.assertEqual(result.shape, (3,))
+
     def test_float32_sinkhorn_conv_retains_upstream_dispatch_failure(self) -> None:
         # Julia allocates ``u`` as Float64 but ``v`` as Float32 and therefore
         # misses SinkhornIterBase!'s same-type dispatch on the first update.
@@ -730,6 +805,32 @@ class OptimalTransportContractTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(u, source)
         np.testing.assert_array_equal(v, target)
+
+    def test_convolutional_ot_rejects_bigfloat_work_like_fftw(self) -> None:
+        source = np.asarray([0.2, 0.3, 0.5])
+        target = np.asarray([0.4, 0.1, 0.5])
+        lattice = (np.arange(3.0),)
+        with self.assertRaisesRegex(TypeError, "BigFloat"):
+            slm.SinkhornConvN(
+                source, target, Decimal("0.2"), 0
+            )
+        with self.assertRaisesRegex(TypeError, "BigFloat"):
+            slm.dualToGradients(
+                np.ones(3),
+                np.ones(3),
+                source,
+                lattice,
+                Decimal("0.2"),
+            )
+        source_field = slm.LF[slm.Intensity](source, lattice)
+        target_field = slm.LF[slm.Intensity](target, lattice)
+        with self.assertRaisesRegex(TypeError, "BigFloat"):
+            slm.otQuickPhase(
+                source_field,
+                target_field,
+                Decimal("0.2"),
+                0,
+            )
 
     def test_otphase2_iteration_argument_matches_exact_julia_int_dispatch(self) -> None:
         lattice = slm.natlat((2, 2))
@@ -840,10 +941,12 @@ class OptimalTransportContractTests(unittest.TestCase):
         target = slm.LF[slm.Intensity](
             np.asarray([2.0, 1.0]), (np.arange(2.0),)
         )
-        with self.assertRaisesRegex(
-            ValueError, "logical step"
-        ):
-            slm.otPhase(source, target, 1.0, maxiter=10)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            with self.assertRaisesRegex(
+                FloatingPointError, "sinkhorn returned nan"
+            ):
+                slm.otPhase(source, target, 1.0, maxiter=10)
 
     def test_dense_ot_singleton_axis_retains_julia_invalid_geometry(self) -> None:
         for source_shape, target_shape in (

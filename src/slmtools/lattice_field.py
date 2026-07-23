@@ -636,8 +636,45 @@ def _materialize_julia_step_range(
     if empty:
         return np.empty(0, dtype=dtype)
 
-    step_magnitude = abs(int(step))
-    count = abs(int(last) - int(start_value)) // step_magnitude + 1
+    def trunc_div(left: int, right: int) -> int:
+        quotient = abs(left) // abs(right)
+        return -quotient if (left < 0) != (right < 0) else quotient
+
+    def wrap_signed(value: int, bits: int) -> int:
+        modulus = 1 << bits
+        wrapped = value % modulus
+        sign = 1 << (bits - 1)
+        return wrapped - modulus if wrapped >= sign else wrapped
+
+    # Julia specializes ``length`` for Int64-backed StepRange. Reproduce its
+    # modular quotient rather than using the mathematical distance: at a
+    # handful of overflow boundaries Base deliberately reports length zero
+    # even though ``start``/``stop`` appear directionally compatible.
+    diff = _julia_integer_binary(last, start_value, np.subtract)
+    step_value = int(step)
+    negated_step = int(_julia_integer_negate(step))
+    if (
+        np.asarray(step).dtype.kind == "u"
+        or -1 <= step_value <= 1
+        or step_value == negated_step
+    ):
+        quotient = trunc_div(int(diff), step_value)
+    elif step_value < 0:
+        negative_diff = _julia_integer_negate(diff)
+        unsigned_diff = np.asarray(
+            negative_diff, dtype=np.int64
+        ).view(np.uint64).reshape(())[()]
+        quotient = int(unsigned_diff) // negated_step
+    else:
+        unsigned_diff = np.asarray(
+            diff, dtype=np.int64
+        ).view(np.uint64).reshape(())[()]
+        quotient = int(unsigned_diff) // step_value
+    count = wrap_signed(quotient, dtype.itemsize * 8)
+    count = wrap_signed(count + 1, dtype.itemsize * 8)
+    if count <= 0:
+        return np.empty(0, dtype=dtype)
+
     # NumPy arrays are materialized while Julia ranges are lazy.  Reject an
     # allocation that cannot be represented (or would be unreasonably large
     # for this eager public type) before entering the iteration loop.
@@ -2561,6 +2598,31 @@ def _isapprox_array(left: Any, right: Any) -> bool:
                 return difference <= tolerance * scale
             except (TypeError, ValueError, ArithmeticError):
                 return False
+        if tolerance == 0:
+            return all(
+                x == y for x, y in zip(a.flat, b.flat, strict=True)
+            )
+        try:
+            difference_values = _julia_array_array_operation(
+                a, b, np.subtract
+            )
+            difference = float(np.linalg.norm(difference_values))
+
+            def object_norm(values: np.ndarray) -> float:
+                if values.dtype.kind != "O":
+                    return float(np.linalg.norm(values))
+                return math.sqrt(
+                    sum(float(abs(value)) ** 2 for value in values.flat)
+                )
+
+            scale = max(
+                object_norm(a),
+                object_norm(b),
+            )
+            if np.isfinite(difference):
+                return difference <= float(tolerance) * scale
+        except (TypeError, ValueError, ArithmeticError, OverflowError):
+            pass
         return all(
             _isapprox_scalar(x, y, rtol=tolerance)
             for x, y in zip(a.flat, b.flat, strict=True)
@@ -2733,8 +2795,20 @@ class _CheckedFlatIterator:
         return np.asarray(self._owner).flat[key]
 
     def __setitem__(self, key: Any, value: Any) -> None:
-        converted = _julia_assignment_values(value, np.asarray(self._owner))
-        np.asarray(self._owner).flat[key] = converted
+        flat_indices = np.arange(self._owner.size)[key]
+        target_indices = np.asarray(flat_indices)
+        if target_indices.ndim == 0:
+            coordinates = np.unravel_index(
+                int(target_indices), self._owner.shape, order="C"
+            )
+            self._owner[coordinates] = value
+            return
+        values = np.broadcast_to(np.asarray(value), target_indices.shape)
+        for index in np.ndindex(target_indices.shape):
+            coordinates = np.unravel_index(
+                int(target_indices[index]), self._owner.shape, order="C"
+            )
+            self._owner[coordinates] = values[index]
 
     def __getattr__(self, name: str) -> Any:
         return getattr(np.asarray(self._owner).flat, name)
@@ -2754,7 +2828,14 @@ class _CheckedFieldArray(np.ndarray):
     def __new__(cls, values: Any) -> "_CheckedFieldArray":
         if isinstance(values, cls):
             return values
-        return np.asarray(values).view(cls)
+        source = np.asarray(values)
+        result = np.array(
+            source,
+            copy=True,
+            order="F" if source.flags.f_contiguous else "C",
+        ).view(cls)
+        result.setflags(write=False)
+        return result
 
     def __array_finalize__(self, obj: Any) -> None:
         del obj
@@ -2766,8 +2847,57 @@ class _CheckedFieldArray(np.ndarray):
         return result
 
     def __setitem__(self, key: Any, value: Any) -> None:
-        converted = _julia_assignment_values(value, np.asarray(self))
-        super().__setitem__(key, converted)
+        target = np.ndarray.__getitem__(self, key)
+        if not isinstance(target, np.ndarray):
+            if isinstance(value, np.ndarray) and value.ndim != 0:
+                raise ValueError(
+                    f"Inexact assignment to scalar element type {self.dtype}."
+                )
+            if isinstance(value, np.ndarray) and value.ndim == 0:
+                # Julia does not convert a zero-dimensional Array to its
+                # scalar element for setindex!.
+                raise ValueError(
+                    f"Inexact assignment to scalar element type {self.dtype}."
+                )
+            converted = _julia_assignment_values(
+                np.asarray(value), np.asarray(self)
+            )
+            if converted.ndim != 0:
+                raise ValueError(
+                    f"Inexact assignment to scalar element type {self.dtype}."
+                )
+            self.setflags(write=True)
+            try:
+                np.ndarray.__setitem__(self, key, converted.reshape(())[()])
+            finally:
+                self.setflags(write=False)
+            return
+
+        try:
+            broadcast = np.broadcast_to(np.asarray(value), target.shape)
+        except ValueError as error:
+            raise ValueError(
+                "Assignment source cannot be broadcast to the selected shape."
+            ) from error
+
+        # Julia's broadcast assignment converts and stores one element at a
+        # time in column-major Cartesian order. A late InexactError therefore
+        # leaves the successfully converted prefix mutated.
+        self.setflags(write=True)
+        try:
+            writable_target = np.ndarray.__getitem__(self, key)
+            for linear_index in range(writable_target.size):
+                index = np.unravel_index(
+                    linear_index, writable_target.shape, order="F"
+                )
+                converted = _julia_assignment_values(
+                    np.asarray(broadcast[index]), np.asarray(self)
+                )
+                np.ndarray.__setitem__(
+                    writable_target, index, converted.reshape(())[()]
+                )
+        finally:
+            self.setflags(write=False)
 
     @property
     def flat(self) -> _CheckedFlatIterator:
@@ -2775,14 +2905,17 @@ class _CheckedFieldArray(np.ndarray):
 
     @flat.setter
     def flat(self, value: Any) -> None:
-        converted = _julia_assignment_values(value, np.asarray(self))
-        np.asarray(self).flat = converted
+        self.flat[:] = value
 
     def fill(self, value: Any) -> None:
         converted = _julia_assignment_values(value, np.asarray(self))
         if converted.ndim != 0:
             raise ValueError("fill requires a scalar value")
-        super().fill(converted.reshape(())[()])
+        self.setflags(write=True)
+        try:
+            np.ndarray.fill(self, converted.reshape(())[()])
+        finally:
+            self.setflags(write=False)
 
     def put(
         self,
@@ -2790,8 +2923,42 @@ class _CheckedFieldArray(np.ndarray):
         values: Any,
         mode: str = "raise",
     ) -> None:
-        converted = _julia_assignment_values(values, np.asarray(self))
-        super().put(indices, converted, mode=mode)
+        raw_indices = np.asarray(indices)
+        raw_values = np.broadcast_to(np.asarray(values), raw_indices.shape)
+        for index in np.ndindex(raw_indices.shape):
+            flat_index = int(raw_indices[index])
+            if mode == "wrap":
+                flat_index %= self.size
+            elif mode == "clip":
+                flat_index = min(max(flat_index, 0), self.size - 1)
+            elif flat_index < 0:
+                flat_index += self.size
+            coordinates = np.unravel_index(flat_index, self.shape, order="C")
+            self[coordinates] = raw_values[index]
+
+    def _inplace(self, other: Any, operation: np.ufunc) -> "_CheckedFieldArray":
+        if np.asarray(other).ndim == 0:
+            result = _julia_array_scalar_operation(
+                np.asarray(self), np.asarray(other).reshape(())[()], operation
+            )
+        else:
+            result = _julia_array_array_operation(
+                np.asarray(self), np.asarray(other), operation
+            )
+        self[...] = result
+        return self
+
+    def __iadd__(self, other: Any) -> "_CheckedFieldArray":
+        return self._inplace(other, np.add)
+
+    def __isub__(self, other: Any) -> "_CheckedFieldArray":
+        return self._inplace(other, np.subtract)
+
+    def __imul__(self, other: Any) -> "_CheckedFieldArray":
+        return self._inplace(other, np.multiply)
+
+    def __itruediv__(self, other: Any) -> "_CheckedFieldArray":
+        return self._inplace(other, np.divide)
 
 
 class LatticeField:
@@ -2813,6 +2980,11 @@ class LatticeField:
             "flambda",
             "field_type",
         }:
+            if name == "data" and value is getattr(self, "data", None):
+                # Python writes the result of ``field.data += value`` back to
+                # the attribute after the checked in-place mutation. This is
+                # not a metadata change.
+                return
             raise AttributeError(f"LatticeField metadata {name!r} is immutable.")
         object.__setattr__(self, name, value)
 
@@ -3394,6 +3566,8 @@ def sublattice(lattice: Any, *selectors: Any) -> Lattice:
         raise DimensionMismatch(
             "Wrong number of indices while attempting to make sublattice."
         )
+    if any(isinstance(selector, (bool, np.bool_)) for selector in selectors):
+        raise TypeError("Boolean values do not match Julia Integer selectors.")
     output: list[LatticeAxis] = []
     for axis, selector in zip(axes, selectors, strict=True):
         if isinstance(selector, (int, np.integer)):

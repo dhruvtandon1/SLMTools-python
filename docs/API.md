@@ -287,19 +287,19 @@ their concrete Julia array element-type contracts.
 
 | Julia export | Python form | Contract |
 |---|---|---|
-| `getCostMatrix` | `getCostMatrix(L_mu, L_v=None, normalization=np.max)` | Dense normalized squared-distance cost, retaining Rational/BigFloat-like arithmetic; default normalization of an all-zero singleton cost retains Julia's NaN |
+| `getCostMatrix` | `getCostMatrix(L_mu, L_v=None, normalization=np.max)` | Dense normalized squared-distance cost, retaining Rational/BigFloat-like arithmetic; default normalization of an all-zero singleton cost retains Julia's NaN, and empty range domains reach the supplied normalization (the default `np.max` consequently raises) |
 | `pdCostMatrix` | `pdCostMatrix(...)` | Documentation-deprecated real-parameter phase-diversity cost with Julia numeric promotion; no Python-only runtime warning |
-| `mapify` | `mapify(plan, L_mu, L_v)` | Barycentric target-coordinate map; output is Float64 because Julia allocates its destination with `zeros(...)`, and a genuinely complex barycenter raises instead of discarding its imaginary part |
+| `mapify` | `mapify(plan, L_mu, L_v)` | Barycentric target-coordinate map; output is Float64 because Julia allocates its destination with `zeros(...)`, a genuinely complex barycenter raises instead of discarding its imaginary part, and empty source/target ranges retain Julia's empty/zero map results |
 | `hyperSum2` | `hyperSum2(A, origin, sumDim, fixDims)` | Anchored trapezoidal cumulative sum; dimension and origin indices require Julia-compatible signed `Int64` values |
 | `scalarPotentialN` | `scalarPotentialN(vector_field, L, idx=None, dimOrder=None)` | Path-integrated scalar potential, retaining Rational/BigFloat-like arithmetic and exact signed-`Int64` index dispatch; the upstream default anchor is invalid for a singleton axis, though an explicit valid origin works |
 | `normalizeDistribution` | `normalizeDistribution(array)` | Unit-sum magnitude distribution with exact-number preservation; zero total mass retains Julia's NaN result |
-| `otPhase` | `otPhase(input, target, epsilon, **sinkhorn_options)` | Dense Gibbs-Sinkhorn phase; automatic geometry retains Julia's signed-maximum scaling and its invalid two-sample-target denominator; nonpositive/nonfinite epsilon and zero wavelength are not defensively rejected |
+| `otPhase` | `otPhase(input, target, epsilon, **sinkhorn_options)` | Dense Gibbs-Sinkhorn phase, including Decimal/BigFloat-like cache, lattice, and wavelength promotion; automatic geometry retains Julia's signed-maximum scaling and its all-NaN two-sample-target range; `maxiter` and convergence cadence require signed Int64 counterparts, while nonpositive/nonfinite epsilon and zero wavelength are not defensively rejected |
 | `pdotPhase` | `pdotPhase(...)` | Dense phase-diversity OT phase using the same upstream automatic geometry and real-only parameter dispatch; equal alphas propagate invalid division, beta tuples require exactly N entries, and beta lists/1-D arrays may have ignored trailing entries |
-| `pdotBeamEstimate` | `pdotBeamEstimate(..., LFine=None, **options)` | OT beam estimate; the working `LFine=None` path preserves input arithmetic, while non-`None` `LFine` is explicitly unsupported because the upstream implementation fails |
-| `SinkhornConvN` | `SinkhornConvN(U, V, epsilon, max_iter, every=None)` | Experimental convolutional scaling solver; positive non-Float64 targets retain the upstream work-array dispatch failure, while zero/NaN epsilon yields NaNs, negative epsilon executes, and infinite epsilon returns the input marginals |
-| `dualToGradients` | `dualToGradients(u, v, U, L_v, epsilon)` | Convolutional dual-to-gradient map |
-| `otQuickPhase` | `otQuickPhase(..., return_loss=False)` | Documentation-deprecated convolutional phase wrapper; no Python-only runtime warning |
-| `otPhase2` | `otPhase2(input, target, epsilon, iterations, **options)` | Factorized 2-D Sinkhorn phase for square inputs and complex numeric targets; rectangular input is explicitly unsupported, the upstream ineffective target-wavelength check and final `0/0` propagation are retained, `iterations` follows exact 64-bit `Int` dispatch, and arbitrary options are ignored |
+| `pdotBeamEstimate` | `pdotBeamEstimate(..., LFine=None, **options)` | OT beam estimate preserving Decimal/BigFloat-like metadata and valid computation; `LFine=None`, integer `UnitRange`, and signed-integer `StepRange` counterparts work, while the upstream-broken floating/Rational/BigFloat-like `LFine` interpolation path is explicitly unsupported |
+| `SinkhornConvN` | `SinkhornConvN(U, V, epsilon, max_iter, every=None)` | Experimental convolutional scaling solver; positive non-Float64 targets retain the upstream work-array dispatch failure, Decimal/BigFloat-like FFT work is unsupported as in Julia FFTW, while zero/NaN epsilon yields NaNs, negative epsilon executes, and infinite epsilon returns the input marginals |
+| `dualToGradients` | `dualToGradients(u, v, U, L_v, epsilon)` | Convolutional dual-to-gradient map; Decimal/BigFloat-like FFT work retains Julia's unsupported-type failure |
+| `otQuickPhase` | `otQuickPhase(..., return_loss=False)` | Documentation-deprecated homogeneous-element-type convolutional phase wrapper; Decimal/BigFloat-like FFT work retains Julia's failure and there is no Python-only runtime warning |
+| `otPhase2` | `otPhase2(input, target, epsilon, iterations, **options)` | Factorized 2-D Sinkhorn phase for square inputs and complex numeric targets, with Decimal/BigFloat-like real data/axis/wavelength/epsilon promotion; rectangular input is explicitly unsupported, the upstream ineffective target-wavelength check and final `0/0` propagation are retained, `iterations` follows exact 64-bit `Int` dispatch, and arbitrary options are ignored |
 
 The internal helpers are `ot.hyperSum`, `ot._sinkhorn_gibbs`, and
 `ot._sinkhorn_iter_base_inplace`. The latter, `ot.SinkhornIterBase`,
@@ -308,16 +308,18 @@ The internal helpers are `ot.hyperSum`, `ot._sinkhorn_gibbs`, and
 the same `u` object, matching Julia's final expression. They require dense
 arrays, the same real element dtype for `u` and `v`, and the same numeric
 element dtype for the two Fourier kernels; mixed work arrays do not dispatch.
-Integer scalings are valid when both complete updates convert exactly. Updates
-follow Julia's statement order. Consequently, if the later `u` conversion
-fails, the already-completed `v` mutation remains visible.
+Integer scalings are valid when their individual assignments convert exactly.
+Updates follow Julia's column-major element order as well as statement order:
+if conversion fails, earlier elements of that same statement remain mutated;
+if a later `u` statement fails, all earlier `v` mutations remain visible.
 
 For dense `otPhase` and `pdotPhase`, each automatically generated target axis
 uses Julia's exact
 `scale = maximum(source_axis) / maximum(target_axis)`. This preserves all
 working odd, even, equal, and unequal geometries. A two-sample target natural
-axis has maximum zero, so its geometry remains invalid and the public
-calculation fails rather than substituting a radius convention. A two-sample
+axis has maximum zero, so Julia's range broadcast produces an all-NaN axis and
+the public calculation reaches `sinkhorn returned nan` rather than
+substituting a radius convention. A two-sample
 source with a longer target remains on Julia's signed rule, including its
 zero scale. Singleton axes are likewise not redefined as valid. These source
 semantics are shared by both public functions through

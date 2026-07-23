@@ -545,29 +545,45 @@ class DenseSinkhornTests(unittest.TestCase):
         target = slm.LF[slm.Intensity](
             np.asarray([3.0, 2.0, 1.0]), lattice
         )
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            result = slm.pdotBeamEstimate(
-                root,
-                target,
-                0.5,
-                0.1,
-                [0.0],
-                [0.0],
-                0.5,
-                LFine=(range(1, 4),),
-                maxiter=10,
+        cases = (
+            (
+                range(1, 4),
+                np.asarray(
+                    [
+                        0.8296264510647069 + 0.45616814629549507j,
+                        -0.3923927830054344 + 0.6335154170900323j,
+                        -0.6937041984358028 + 0.2590196502702916j,
+                    ]
+                ),
+            ),
+            (
+                range(1, 6, 2),
+                np.asarray(
+                    [
+                        0.053483342049970996 + 0.6780143073667952j,
+                        -0.26481726554780716 + 0.17970189859632224j,
+                        -0.5233174176137313 + 0.7031979724040582j,
+                    ]
+                ),
+            ),
+        )
+        for fine_axis, expected in cases:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                result = slm.pdotBeamEstimate(
+                    root,
+                    target,
+                    0.5,
+                    0.1,
+                    [0.0],
+                    [0.0],
+                    0.5,
+                    LFine=(fine_axis,),
+                    maxiter=10,
+                )
+            np.testing.assert_allclose(
+                result.data, expected, rtol=2e-15, atol=2e-15
             )
-        expected = np.asarray(
-            [
-                0.8296264510647069 + 0.45616814629549507j,
-                -0.3923927830054344 + 0.6335154170900323j,
-                -0.6937041984358028 + 0.2590196502702916j,
-            ]
-        )
-        np.testing.assert_allclose(
-            result.data, expected, rtol=2e-15, atol=2e-15
-        )
 
     def test_pdot_beam_keeps_float16_and_float32_root_arithmetic(self) -> None:
         expected = {
@@ -753,6 +769,43 @@ class ConvolutionalAndSeparableTests(unittest.TestCase):
             np.stack((dx, dy), axis=-1), lattice, dimOrder=(2, 1)
         )
         np.testing.assert_allclose(result.data, expected, rtol=2e-15, atol=2e-15)
+
+    def test_otphase2_decimal_axes_and_data_keep_precision_domain(self) -> None:
+        axis = slm.LatticeAxis(
+            np.asarray(
+                [Decimal(-1), Decimal(0), Decimal(1)],
+                dtype=object,
+            ),
+            step_hint=Decimal(1),
+        )
+        lattice = (axis, axis)
+        values = np.asarray(
+            [Decimal(index) for index in range(1, 10)],
+            dtype=object,
+        ).reshape((3, 3), order="F")
+        source = slm.LF[slm.Intensity](
+            values, lattice, Decimal(2)
+        )
+        target = slm.LF[slm.Intensity](
+            values[::-1], lattice, Decimal(2)
+        )
+        result = slm.otPhase2(source, target, 0.5, 1)
+        self.assertEqual(result.dtype, np.dtype(object))
+        self.assertTrue(
+            all(
+                isinstance(value, Decimal)
+                for value in result.data.flat
+            )
+        )
+        self.assertLessEqual(
+            abs(
+                result.data[0, 1]
+                - Decimal(
+                    "0.0780465522412888734112827139124574876302085931832"
+                )
+            ),
+            Decimal("3e-17"),
+        )
 
     def test_fraction_otphase2_finishes_in_float64(self) -> None:
         lattice = slm.natlat((2, 2))

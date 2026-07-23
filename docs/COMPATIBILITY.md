@@ -96,7 +96,7 @@ replace Julia ranges and `CartesianIndices`.
 | FFTW shifted transforms | pyFFTW's NumPy-compatible FFTW interface with the same shift and normalization order; maintained FFTW builds can select different codelets and differ by a few ULP in low-precision transforms |
 | Interpolations cubic B-spline | Internal separable evaluator with O(n) tridiagonal/cyclic solves, retained logical range steps, bit-checked Float16 coefficients, Float64 coefficients for integral data, Float32/Complex64 promotion, explicit `OnGrid`/`OnCell` placement for Flat/Periodic spline boundaries, independent extrapolation boundaries, and no dense matrices; bare Flat/Periodic spline boundaries reproduce the dependency's missing-placement failure |
 | Interpolations `LinearInterpolation` / `Linear` | Qualified tensor-product constructor supports strictly increasing nonuniform knot vectors; direct boundary tuples are per-dimension and nested tuples express directional pairs, while ordinary tuples remain tuple-valued fills; the locked `Linear()`-as-extrapolation compatibility translation is retained |
-| OptimalTransport Gibbs Sinkhorn | Internal loop with the 0.3.20 initialization, update order, marginal check cadence, and tolerances |
+| OptimalTransport Gibbs Sinkhorn | Internal loop with the 0.3.20 initialization, update order, marginal check cadence, and tolerances; Decimal object arrays retain the active arbitrary-precision context when Julia promotes its cache to BigFloat |
 | ToeplitzMatrices in `wigner_fft` | Direct Toeplitz construction with NumPy |
 | Images/ColorTypes grayscale | Locked Colors.jl Rec.601 arithmetic, including raw fixed-point channel accumulation and Float32 `0.001` before RGB8/RGB16 rounding; alpha is discarded |
 | FreeTypeAbstraction text | Pillow's FreeType binding with the locked baseline/ascender placement and integer-pixel pair kerning; default `"arial bold"` resolves to Arial Rounded MT Bold where the locked catalog font exists, then deterministic documented fallbacks |
@@ -114,7 +114,8 @@ complex fields performs Julia's ordinary approximate conversion; exactness is
 required only when the destination is integral or would discard a genuine
 imaginary component. `decimal.Decimal` covers working BigFloat-like metadata,
 interpolation, centroid/window/error helpers, lattice displacement, OT
-integration, linear fitting/orientation, dualation, analytic template kernels,
+integration, dense `otPhase`, square `otPhase2`, `pdotPhase`, the working
+`pdotBeamEstimate` paths, linear fitting/orientation, dualation, analytic template kernels,
 precision-sized random templates, and phase
 wrapping. Wrapped phases use object scalars with Decimal `real` and
 `imag` components, corresponding to Julia `Complex{BigFloat}`. The template path mirrors
@@ -125,7 +126,9 @@ Float64, and `lfRect` always allocates Float64. The pyFFTW/FFTW, Pillow/NumPy
 image, and NumPy LAPACK backends do not provide arbitrary-precision array kernels, so Decimal/BigFloat
 data arrays are not represented as a general computational dtype outside the
 explicit paths above. This boundary is explicit rather than silently coercing
-exact values to Float64.
+exact values to Float64. In particular, convolutional
+`SinkhornConvN`/`dualToGradients`/`otQuickPhase` reject Decimal work just as
+the Julia calls fail when BigFloat reaches FFTW.
 
 ## Known upstream defects and future work
 
@@ -142,12 +145,12 @@ the port raises a clear `NotImplementedError`, `DomainError`, `ValueError`, or
 | `hermiteBasis(n)` passes a range to `shiftedDFTBasis(::Integer)`, making `FrFTBasis` unreachable too | Both helpers remain bound but raise `NotImplementedError`; no corrected eigensystem is invented |
 | `otPhase2` allocates square `(n,n)` scalings, uses `n` in the y kernel, and compares the source wavelength with itself | Rectangular input is explicitly unsupported; square input retains the source formula and the ineffective target-wavelength check |
 | `otPhase2` computes final `u/a` at zero-support pixels | Ordinary IEEE `0/0` propagation is retained |
-| Dense OT divides by the zero maximum of an automatic two-sample target axis | The invalid Inf/NaN geometry is retained; there is no radius fallback |
+| Dense OT divides by the zero maximum of an automatic two-sample target axis | Julia's range broadcast produces an all-NaN target axis; that exact invalid geometry reaches the public `sinkhorn returned nan` failure, with no radius fallback |
 | Default `scalarPotentialN` requests Julia index zero on a singleton axis | The default singleton call raises; an explicitly supplied valid origin remains usable |
 | `saveBeam` is unusable because required names are not imported; it also uses a Windows-only separator and writes the positive phase twice | Any recognized output request raises `NotImplementedError`; the export remains present for API completeness |
 | Invalid `parseFileName(..., look=...)` tries to construct an undefined Julia `ValueError` | Invalid directions still fail explicitly with Python `ValueError`; no successful behavior is added |
 | Directory loading concatenates the directory and filename strings | Literal concatenation is retained when matching files exist; with no matches Julia performs no load and succeeds with empty results even when the directory string has no trailing separator |
-| `pdotBeamEstimate(..., LFine=...)` reaches obsolete noninteger bracket evaluation | A non-`None` `LFine` raises `NotImplementedError`; the working `LFine=None` path is unchanged |
+| `pdotBeamEstimate(..., LFine=...)` reaches obsolete noninteger bracket evaluation for noninteger target range types | `UnitRange` and signed-integer `StepRange` counterparts execute the working interpolation overload; floating, Rational, and BigFloat-like target ranges raise `NotImplementedError`, matching the probed upstream stack-overflow boundary |
 | `SubImages.padmultiple(..., padall=n)` ignores `n` and recursively reapplies the four directional widths | A positive `padall` repeats each positive directional pad once; with all directional widths zero it is a no-op |
 | Singleton interpolation constructors fail internally | Construction is rejected directly with `ValueError`; no constant-extension algorithm is invented |
 | Nonpositive resampling factors lead to incidental failures or nonsensical grids | They are explicitly unsupported with `DomainError` |
@@ -186,8 +189,10 @@ Julia's final mutating expression. It is reachable with
 the `slmtools.ot` module. Its direct-call dispatch requires dense arrays,
 matching `u`/`v` element types, and matching Fourier-kernel element types;
 integer work arrays are supported when the corresponding assignment converts
-exactly. Mutations follow Julia's statement order: a late failure in the `u`
-assignment leaves the earlier `v` assignment visible.
+exactly. Mutations follow Julia's column-major element order as well as its
+statement order: each converted element is immediately visible, so an
+`InexactError` can leave a partially updated `v` or `u`, and a late failure in
+the `u` statements leaves the earlier `v` mutations visible.
 Likewise, direct `gsIter` and `pdgsIter` calls require the Julia methods'
 concrete ComplexF64/Float64 array types. `otPhase2` has no Python-only early
 stopping or `return_loss` alternate return.

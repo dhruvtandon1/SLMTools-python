@@ -11,7 +11,8 @@ does not modify, import files from, or write outputs into the Julia checkout.
 
 ## Install
 
-Python 3.11 or newer is required.  From this directory:
+Python 3.14 or newer is required.  The publication baseline is CPython 3.14.6.
+From this directory:
 
 ```bash
 python -m pip install -e .
@@ -19,9 +20,12 @@ python -m pip install -e .
 
 NumPy, Pillow, and pyFFTW are the runtime dependencies. pyFFTW supplies the
 same FFTW backend family used by the Julia package; Matplotlib is optional and
-is used only by `slmtools.subimages.imageToHeatmap`.
+is used only by `slmtools.subimages.imageToHeatmap`. Runtime metadata uses the
+current validated releases as minimum versions, so later compatible releases
+remain installable.
 [`requirements-lock.txt`](requirements-lock.txt) records the exact NumPy,
-Pillow, pyFFTW, and pytest versions used by the locked regression environment.
+Pillow, pyFFTW, Matplotlib, pytest, and packaging-tool versions used by the
+locked CPython 3.14.6 regression and publication environment.
 
 The public distribution name is `hoganlab-slmtools` because the unrelated
 PyPI project named `slmtools` predates this port. The import remains

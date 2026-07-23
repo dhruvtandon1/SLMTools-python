@@ -1,5 +1,17 @@
-# Exact environment used for the final Python parity run.
-numpy==2.3.5
-Pillow==12.2.0
+# Exact current-stable environment used for the Python 3.14 parity and
+# publication runs. The interpreter itself is CPython 3.14.6.
+#
+# Runtime dependencies
+numpy==2.5.1
+Pillow==12.3.0
 pyFFTW==0.15.1
+
+# Optional plotting dependency
+matplotlib==3.11.1
+
+# Test and release tooling
 pytest==9.1.1
+setuptools==83.0.0
+build==1.5.0
+wheel==0.47.0
+twine==6.2.0
