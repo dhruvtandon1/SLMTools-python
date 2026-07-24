@@ -9,7 +9,13 @@ Julia implementation traverses ``CartesianIndices``.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from decimal import Decimal
+from decimal import (
+    Decimal,
+    DivisionByZero,
+    InvalidOperation,
+    Overflow as DecimalOverflow,
+    localcontext,
+)
 from fractions import Fraction
 from typing import Any
 import warnings
@@ -22,22 +28,34 @@ from .lattice_field import (
     LatticeField,
     Modulus,
     RealPhase,
+    _DecimalComplex,
     _as_decimal_approx,
     _as_decimal_array,
     _decimal_rtol,
     _axis,
+    _fraction_int64,
+    _fraction_int64_multiply,
+    _julia_abs,
     _julia_add_sum,
     _julia_assignment_values,
     _julia_array_array_operation,
     _julia_array_scalar_operation,
+    _julia_cumsum,
     _julia_literal_array,
     _julia_rtol,
+    _julia_sum,
     _is_real_number,
     _object_contains_decimal,
     as_lattice,
     square,
 )
 from .dual_lattices import isft as _field_isft
+from .misc import (
+    _enable_decimal_nonfinite,
+    _fraction_int64_abs,
+    _fraction_int64_divide,
+    _fraction_int64_sum,
+)
 from .lattice_utils import _step as _exact_step
 from .ift import (
     _quadratic_linear_phase,
@@ -47,8 +65,6 @@ from .ift import (
     _isft_array,
     _ldot,
     _make_field,
-    _is_numeric_data,
-    _is_real_numeric_data,
     _r2,
     _same_lattice,
     _sft_array,
@@ -77,23 +93,157 @@ __all__ = [
 ]
 
 
+def _ot_numeric_domain(value: Any) -> tuple[str, bool] | None:
+    """Recover the Julia numeric element domain represented by an array.
+
+    Native NumPy numeric dtypes already encode a concrete Julia element type.
+    Object dtype does not: an explicit object array containing only machine
+    numbers corresponds to ``Array{Any}`` and must not satisfy a
+    ``T<:Number`` method.  Fraction, Decimal, and Decimal-complex values are
+    the supported exceptions because NumPy has no native dtype for their
+    concrete Julia counterparts.
+
+    The returned Boolean records whether the represented domain is ``<:Real``.
+    """
+
+    array = np.asarray(value)
+    kind = array.dtype.kind
+    if kind in "buif":
+        return f"native:{array.dtype.str}", True
+    if kind == "c":
+        return f"native:{array.dtype.str}", False
+    if kind != "O" or array.size == 0:
+        return None
+
+    items = tuple(array.flat)
+    if not all(
+        _is_real_number(item)
+        or isinstance(
+            item,
+            (_DecimalComplex, complex, np.complexfloating),
+        )
+        for item in items
+    ):
+        return None
+
+    has_decimal_complex = any(
+        isinstance(item, _DecimalComplex) for item in items
+    )
+    has_machine_complex = any(
+        isinstance(item, (complex, np.complexfloating))
+        for item in items
+    )
+    has_decimal = any(isinstance(item, Decimal) for item in items)
+    has_fraction = any(isinstance(item, Fraction) for item in items)
+    if has_decimal_complex:
+        return "complex-bigfloat", False
+    if has_decimal:
+        return (
+            ("complex-bigfloat", False)
+            if has_machine_complex
+            else ("bigfloat", True)
+        )
+    if has_fraction:
+        if has_machine_complex:
+            return "abstract-number", False
+        if any(isinstance(item, (float, np.floating)) for item in items):
+            # Explicit heterogeneous object storage is the Python spelling
+            # used for Julia ``Array{Real}`` in the compatibility contract.
+            return "abstract-real", True
+        return "rational-int64", True
+    # With no exact/arbitrary-precision anchor, object dtype denotes
+    # ``Array{Any}`` even if every runtime value happens to be numeric.
+    return None
+
+
+def _require_ot_numeric_array(
+    value: Any,
+    name: str,
+    *,
+    real: bool = False,
+    dense: bool = False,
+) -> tuple[np.ndarray, str]:
+    """Validate an OT array method's Julia element-type dispatch."""
+
+    if dense:
+        if not isinstance(value, np.ndarray):
+            raise TypeError(f"{name} must be a dense NumPy array")
+        # Julia's concrete ``Array`` methods do not accept a strided
+        # ``SubArray``.  NumPy reshape/view provenance is ambiguous (a
+        # contiguous reshape is still the natural counterpart of Julia
+        # reshape(::Array)), so bind concrete Array to dense C- or
+        # F-contiguous storage and reject clearly strided views.
+        if not (
+            value.flags.c_contiguous or value.flags.f_contiguous
+        ):
+            raise TypeError(
+                f"{name} must be a dense contiguous NumPy array"
+            )
+    if not isinstance(value, (np.ndarray, list, range)):
+        raise TypeError(
+            f"{name} must be a NumPy array, Python list array literal, "
+            "or integer range"
+        )
+    if isinstance(value, range):
+        if dense:
+            # Already handled above, but retain the concrete-Array contract
+            # locally if this helper is refactored.
+            raise TypeError(f"{name} must be a dense NumPy array")
+        int64 = np.iinfo(np.int64)
+        range_values = [value.start, value.step]
+        if len(value):
+            range_values.append(value[-1])
+        if not all(int64.min <= item <= int64.max for item in range_values):
+            raise OverflowError(
+                f"{name} range is outside Julia's platform Int64 domain"
+            )
+        # Python ``range`` is the native UnitRange/StepRange counterpart.
+        # Julia's AbstractArray OT methods accept it and materialize their
+        # returned broadcast, so do the same at this boundary.
+        array = np.fromiter(value, dtype=np.int64, count=len(value))
+    elif isinstance(value, list):
+        literal_shape = np.asarray(value, dtype=object).ndim
+        if literal_shape != 1:
+            raise TypeError(
+                f"{name} nested Python lists do not model a Julia dense array"
+            )
+        array = _julia_literal_array(value)
+    else:
+        array = np.asarray(value)
+    domain = _ot_numeric_domain(array)
+    if domain is None or (real and not domain[1]):
+        requirement = "real numeric" if real else "numeric"
+        raise TypeError(
+            f"{name} must have a concrete Julia {requirement} element type"
+        )
+    return array, domain[0]
+
+
 def _as_lattice(
     lattice: Sequence[Any],
     *,
     allow_empty_axes: bool = False,
+    allow_zero_dimensions: bool = False,
 ) -> tuple[np.ndarray, ...]:
     # Keep LatticeAxis logical-step metadata; singleton axes have no second
     # coordinate from which their valid range step could be reconstructed.
     axes = as_lattice(lattice)
-    if not axes or any(
+    if (not axes and not allow_zero_dimensions) or any(
         axis.ndim != 1 or (axis.size == 0 and not allow_empty_axes)
         for axis in axes
     ):
-        requirement = (
-            "a nonempty tuple of 1-D axes"
-            if allow_empty_axes
-            else "a nonempty tuple of nonempty 1-D axes"
-        )
+        if allow_zero_dimensions:
+            requirement = (
+                "a tuple of 1-D axes"
+                if allow_empty_axes
+                else "a tuple of nonempty 1-D axes"
+            )
+        else:
+            requirement = (
+                "a nonempty tuple of 1-D axes"
+                if allow_empty_axes
+                else "a nonempty tuple of nonempty 1-D axes"
+            )
         raise ValueError(f"a lattice must be {requirement}")
     return axes
 
@@ -196,24 +346,34 @@ def _normalize_cost(
 
     divisor = _normalization_value(matrix, normalization)
     divisor_array = np.asarray(divisor)
-    if divisor_array.ndim == 0:
-        return _julia_array_scalar_operation(
-            matrix, divisor_array.reshape(())[()], np.divide
+
+    def divide() -> np.ndarray:
+        if divisor_array.ndim == 0:
+            return _julia_array_scalar_operation(
+                matrix, divisor_array.reshape(())[()], np.divide
+            )
+        # Julia broadcasting aligns dimension 1 with dimension 1 and appends
+        # singleton trailing dimensions. NumPy aligns from the right, which
+        # would turn a length-m normalization vector into column rather than row
+        # normalization for an m×n cost matrix.
+        ndim = max(matrix.ndim, divisor_array.ndim)
+        matrix_view = matrix.reshape(
+            matrix.shape + (1,) * (ndim - matrix.ndim)
         )
-    # Julia broadcasting aligns dimension 1 with dimension 1 and appends
-    # singleton trailing dimensions. NumPy aligns from the right, which would
-    # turn a length-m normalization vector into column rather than row
-    # normalization for an m×n cost matrix.
-    ndim = max(matrix.ndim, divisor_array.ndim)
-    matrix_view = matrix.reshape(
-        matrix.shape + (1,) * (ndim - matrix.ndim)
-    )
-    divisor_view = divisor_array.reshape(
-        divisor_array.shape + (1,) * (ndim - divisor_array.ndim)
-    )
-    return _julia_array_array_operation(
-        matrix_view, divisor_view, np.divide
-    )
+        divisor_view = divisor_array.reshape(
+            divisor_array.shape + (1,) * (ndim - divisor_array.ndim)
+        )
+        return _julia_array_array_operation(
+            matrix_view, divisor_view, np.divide
+        )
+
+    if _object_contains_decimal(matrix) or _object_contains_decimal(
+        divisor_array
+    ):
+        with localcontext() as context:
+            _enable_decimal_nonfinite(context)
+            return divide()
+    return divide()
 
 
 def getCostMatrix(
@@ -304,10 +464,87 @@ def _julia_matmul(left: Any, right: Any) -> np.ndarray:
     """Matrix multiplication after Julia-compatible scalar promotion."""
 
     first, second = np.asarray(left), np.asarray(right)
-    if _object_contains_decimal(first) or _object_contains_decimal(second):
-        return np.asarray(
-            np.matmul(_as_decimal_array(first), _as_decimal_array(second))
+    fraction_work = (
+        first.dtype.kind == "O"
+        and first.size > 0
+        and all(isinstance(value, Fraction) for value in first.flat)
+    ) or (
+        second.dtype.kind == "O"
+        and second.size > 0
+        and all(isinstance(value, Fraction) for value in second.flat)
+    )
+    decimal_work = _object_contains_decimal(
+        first
+    ) or _object_contains_decimal(second)
+    if fraction_work or decimal_work:
+        if first.ndim == 1:
+            left_matrix = first.reshape(1, first.shape[0])
+            left_vector = True
+        elif first.ndim == 2:
+            left_matrix = first
+            left_vector = False
+        else:
+            raise TypeError(
+                "Exact-number matrix multiplication supports vectors and "
+                "matrices, matching the SLMTools call sites."
+            )
+        if second.ndim == 1:
+            right_matrix = second.reshape(second.shape[0], 1)
+            right_vector = True
+        elif second.ndim == 2:
+            right_matrix = second
+            right_vector = False
+        else:
+            raise TypeError(
+                "Exact-number matrix multiplication supports vectors and "
+                "matrices, matching the SLMTools call sites."
+            )
+        if left_matrix.shape[1] != right_matrix.shape[0]:
+            raise ValueError("matrix multiplication dimension mismatch")
+        output = np.empty(
+            (left_matrix.shape[0], right_matrix.shape[1]), dtype=object
         )
+        for row in range(left_matrix.shape[0]):
+            for column in range(right_matrix.shape[1]):
+                if fraction_work:
+                    products = []
+                    for inner in range(left_matrix.shape[1]):
+                        product = _julia_array_array_operation(
+                            np.asarray(left_matrix[row, inner]),
+                            np.asarray(right_matrix[inner, column]),
+                            np.multiply,
+                        )
+                        products.append(
+                            product.reshape(())[()]
+                            if product.ndim == 0
+                            else product
+                        )
+                    output[row, column] = _julia_sum(
+                        _julia_literal_array(products)
+                    )
+                else:
+                    left_decimal = _as_decimal_array(
+                        left_matrix[row, :]
+                    )
+                    right_decimal = _as_decimal_array(
+                        right_matrix[:, column]
+                    )
+                    with localcontext() as context:
+                        _enable_decimal_nonfinite(context)
+                        products = (
+                            left_decimal[inner] * right_decimal[inner]
+                            for inner in range(left_matrix.shape[1])
+                        )
+                        output[row, column] = _julia_sum(
+                            np.asarray(tuple(products), dtype=object)
+                        )
+        if left_vector and right_vector:
+            return np.asarray(output[0, 0])
+        if left_vector:
+            return output[0, :]
+        if right_vector:
+            return output[:, 0]
+        return output
     if first.dtype.kind == second.dtype.kind == "b":
         # Bool products are Bool, but Julia's dot-product reduction widens
         # their addition to Int64; NumPy otherwise uses Boolean matmul.
@@ -320,11 +557,15 @@ def _julia_matmul(left: Any, right: Any) -> np.ndarray:
 def mapify(plan: Any, Lmu: Sequence[Any], Lv: Sequence[Any]) -> np.ndarray:
     """Convert a transport plan to its target-coordinate barycentric map."""
 
-    source = _as_lattice(Lmu, allow_empty_axes=True)
-    target = _as_lattice(Lv, allow_empty_axes=True)
+    source = _as_lattice(
+        Lmu, allow_empty_axes=True, allow_zero_dimensions=True
+    )
+    target = _as_lattice(
+        Lv, allow_empty_axes=True, allow_zero_dimensions=True
+    )
     if len(source) != len(target):
         raise ValueError("source and target lattices must have the same dimensionality")
-    matrix = np.asarray(plan)
+    matrix, _ = _require_ot_numeric_array(plan, "plan")
     expected = (int(np.prod([len(axis) for axis in source])), int(np.prod([len(axis) for axis in target])))
     if matrix.ndim != 2 or matrix.shape != expected:
         raise ValueError(f"plan must have shape {expected}")
@@ -351,7 +592,11 @@ def mapify(plan: Any, Lmu: Sequence[Any], Lv: Sequence[Any]) -> np.ndarray:
             if axis != dimension
         )
         marginal = (
-            np.sum(reshaped_plan, axis=collapsed_axes, keepdims=True)
+            _julia_sum(
+                reshaped_plan,
+                axis=collapsed_axes,
+                keepdims=True,
+            )
             if collapsed_axes
             else reshaped_plan
         )
@@ -359,7 +604,7 @@ def mapify(plan: Any, Lmu: Sequence[Any], Lv: Sequence[Any]) -> np.ndarray:
             marginal, (matrix.shape[0], len(coordinate)), order="F"
         )
         weighted = _julia_matmul(marginal, np.asarray(coordinate))
-        row_mass = np.sum(marginal, axis=1)
+        row_mass = _julia_sum(marginal, axis=1)
         barycenter = _julia_array_array_operation(
             weighted, _safe_inverse(row_mass), np.multiply
         )
@@ -430,7 +675,7 @@ def _hyper_sum(
     *,
     trapezoid: bool,
 ) -> np.ndarray:
-    array = np.asarray(A)
+    array, _ = _require_ot_numeric_array(A, "A")
     ndim = array.ndim
     axis = _axis_index(sumDim, ndim)
     fixed = tuple(_axis_index(item, ndim) for item in fixDims)
@@ -442,12 +687,59 @@ def _hyper_sum(
         for dimension in range(ndim)
     )
     selected = array[selection]
-    cumulative = np.cumsum(selected, axis=axis)
-    if trapezoid:
-        cumulative = cumulative - selected / 2
+    domain = _ot_numeric_domain(selected)
+    exact_domain = None if domain is None else domain[0]
+    if exact_domain in ("rational-int64", "bigfloat"):
+        moved = np.moveaxis(selected, axis, 0)
+        cumulative_moved = np.empty(moved.shape, dtype=object)
+        for tail_index in np.ndindex(moved.shape[1:]):
+            running: Any | None = None
+            for position in range(moved.shape[0]):
+                value = moved[(position, *tail_index)]
+                running = (
+                    value
+                    if running is None
+                    else _julia_sum(
+                        np.asarray((running, value), dtype=object)
+                    )
+                )
+                cumulative_moved[(position, *tail_index)] = running
+        cumulative = np.moveaxis(cumulative_moved, 0, axis)
+        if trapezoid:
+            correction = np.empty(selected.shape, dtype=object)
+            for index in np.ndindex(selected.shape):
+                if exact_domain == "rational-int64":
+                    correction[index] = _fraction_int64_divide(
+                        selected[index], Fraction(2, 1)
+                    )
+                else:
+                    with localcontext() as context:
+                        _enable_decimal_nonfinite(context)
+                        correction[index] = (
+                            _as_decimal_approx(selected[index]) / Decimal(2)
+                        )
+            cumulative = _julia_array_array_operation(
+                cumulative, correction, np.subtract
+            )
+    else:
+        # Julia traverses Array elements in column-major logical order. NumPy
+        # axis cumsum has the same per-line order for native arrays.
+        cumulative = _julia_cumsum(selected, axis=axis)
+        if trapezoid:
+            cumulative = _julia_array_array_operation(
+                cumulative,
+                _julia_array_scalar_operation(
+                    selected, 2, np.divide
+                ),
+                np.subtract,
+            )
     origin_selection = [slice(None)] * ndim
     origin_selection[axis] = slice(origin[axis], origin[axis] + 1)
-    return cumulative - cumulative[tuple(origin_selection)]
+    return _julia_array_array_operation(
+        cumulative,
+        cumulative[tuple(origin_selection)],
+        np.subtract,
+    )
 
 
 def hyperSum(A: Any, originIdx: Sequence[int], sumDim: int, fixDims: Sequence[int]) -> np.ndarray:
@@ -480,7 +772,7 @@ def scalarPotentialN(
     This deliberately remains invalid for a singleton axis.
     """
 
-    vector_field = np.asarray(A)
+    vector_field, _ = _require_ot_numeric_array(A, "A")
     lattice = _as_lattice(L)
     ndim = len(lattice)
     spatial_shape = tuple(len(axis) for axis in lattice)
@@ -534,9 +826,34 @@ def scalarPotentialN(
 def normalizeDistribution(U: Any) -> np.ndarray:
     """Normalize absolute values to a probability distribution."""
 
-    values = np.abs(np.asarray(U))
+    array, domain = _require_ot_numeric_array(U, "U")
+    if domain == "bigfloat":
+        with localcontext() as context:
+            _enable_decimal_nonfinite(context)
+            decimal_values = _as_decimal_array(array)
+            values = np.empty(array.shape, dtype=object)
+            for index in np.ndindex(array.shape):
+                values[index] = abs(decimal_values[index])
+            total = _julia_sum(values)
+            result = np.empty(array.shape, dtype=object)
+            for index in np.ndindex(array.shape):
+                result[index] = values[index] / total
+            return result
+    if domain == "rational-int64":
+        values = np.empty(array.shape, dtype=object)
+        for index in np.ndindex(array.shape):
+            values[index] = _fraction_int64_abs(array[index])
+        total = _fraction_int64_sum(values.ravel(order="F"))
+        result = np.empty(array.shape, dtype=object)
+        for index in np.ndindex(array.shape):
+            result[index] = _fraction_int64_divide(
+                values[index], total
+            )
+        return result
+    values = _julia_abs(array)
+    total = _julia_sum(values)
     with np.errstate(divide="ignore", invalid="ignore"):
-        return values / np.sum(values)
+        return _julia_array_scalar_operation(values, total, np.divide)
 
 
 def _contains_nan(values: Any) -> bool:
@@ -616,20 +933,49 @@ def _decimal_sinkhorn_gibbs(
         if countdown == 0 or iteration == maxiter:
             countdown = interval
             current = u * Kv
-            norm_current = sum(abs(value) for value in current.flat)
-            error = sum(
-                abs(left - right)
-                for left, right in zip(
-                    source_decimal.flat, current.flat, strict=True
+            current_linear = current.ravel(order="F")
+            source_linear = source_decimal.ravel(order="F")
+            norm_current = _julia_sum(
+                np.asarray(
+                    [abs(value) for value in current_linear],
+                    dtype=object,
                 )
             )
-            source_norm = sum(
-                abs(value) for value in source_decimal.flat
+            error = _julia_sum(
+                np.asarray(
+                    [
+                        abs(left - right)
+                        for left, right in zip(
+                            source_linear,
+                            current_linear,
+                            strict=True,
+                        )
+                    ],
+                    dtype=object,
+                )
             )
-            converged = error < max(
-                atol_decimal,
-                rtol_decimal * max(source_norm, norm_current),
+            source_norm = _julia_sum(
+                np.asarray(
+                    [abs(value) for value in source_linear],
+                    dtype=object,
+                )
             )
+            if any(
+                not value.is_finite()
+                for value in (
+                    error,
+                    source_norm,
+                    norm_current,
+                    atol_decimal,
+                    rtol_decimal,
+                )
+            ):
+                converged = False
+            else:
+                converged = error < max(
+                    atol_decimal,
+                    rtol_decimal * max(source_norm, norm_current),
+                )
             if converged:
                 break
     return kernel * u[:, None] * v[None, :], converged
@@ -650,11 +996,15 @@ def _sinkhorn_gibbs(
 ) -> np.ndarray:
     """OptimalTransport.jl 0.3.20 ``SinkhornGibbs`` for vector marginals."""
 
-    if not _is_real_numeric_data(mu) or not _is_real_numeric_data(nu):
-        raise TypeError("source and target marginals must have real numeric data")
-    source_input = np.asarray(mu)
-    target_input = np.asarray(nu)
-    cost_input = np.asarray(cost)
+    source_input, _ = _require_ot_numeric_array(
+        mu, "source marginal", real=True
+    )
+    target_input, _ = _require_ot_numeric_array(
+        nu, "target marginal", real=True
+    )
+    cost_input, _ = _require_ot_numeric_array(
+        cost, "cost matrix", real=True
+    )
     if (
         source_input.ndim != 1
         or target_input.ndim != 1
@@ -689,8 +1039,8 @@ def _sinkhorn_gibbs(
     # OptimalTransport.checkbalanced applies scalar ``isapprox`` before its
     # solver cache is promoted.  In particular, Float16 normalized marginals
     # use Float16's default tolerance here, not Float64's cache tolerance.
-    source_mass = np.sum(source_input)
-    target_mass = np.sum(target_input)
+    source_mass = _julia_sum(source_input)
+    target_mass = _julia_sum(target_input)
     balance_rtol = _julia_rtol(source_input, target_input)
     if abs(source_mass - target_mass) > balance_rtol * max(
         abs(source_mass), abs(target_mass)
@@ -712,6 +1062,10 @@ def _sinkhorn_gibbs(
         )
     else:
         relative_tolerance = rtol
+    if not _is_real_number(absolute_tolerance) or not _is_real_number(
+        relative_tolerance
+    ):
+        raise TypeError("Sinkhorn tolerances must be real")
     if check_marginal_step is not None:
         warnings.warn(
             "check_marginal_step is deprecated; use check_convergence",
@@ -730,16 +1084,20 @@ def _sinkhorn_gibbs(
     )
 
     if decimal_work:
-        plan, converged = _decimal_sinkhorn_gibbs(
-            source_input,
-            target_input,
-            cost_input,
-            epsilon,
-            absolute_tolerance=absolute_tolerance,
-            relative_tolerance=relative_tolerance,
-            interval=interval,
-            maxiter=maxiter_value,
-        )
+        with localcontext() as decimal_context:
+            decimal_context.traps[DivisionByZero] = False
+            decimal_context.traps[InvalidOperation] = False
+            decimal_context.traps[DecimalOverflow] = False
+            plan, converged = _decimal_sinkhorn_gibbs(
+                source_input,
+                target_input,
+                cost_input,
+                epsilon,
+                absolute_tolerance=absolute_tolerance,
+                relative_tolerance=relative_tolerance,
+                interval=interval,
+                maxiter=maxiter_value,
+            )
         if not converged:
             warnings.warn(
                 f"Sinkhorn algorithm ({maxiter_value}/{maxiter_value}): not converged",
@@ -767,12 +1125,32 @@ def _sinkhorn_gibbs(
         if countdown == 0 or iteration == maxiter_value:
             countdown = interval
             current = u * Kv
-            norm_current = float(np.sum(np.abs(current)))
-            error = float(np.sum(np.abs(source - current)))
-            converged = error < max(
-                absolute_tolerance,
-                relative_tolerance * max(float(np.sum(np.abs(source))), norm_current),
-            )
+            norm_current = float(_julia_sum(np.abs(current)))
+            error = float(_julia_sum(np.abs(source - current)))
+            source_norm = float(_julia_sum(np.abs(source)))
+            if isinstance(
+                absolute_tolerance, Decimal
+            ) or isinstance(relative_tolerance, Decimal):
+                error_value = Decimal.from_float(error)
+                norm_value = Decimal.from_float(norm_current)
+                source_norm_value = Decimal.from_float(source_norm)
+                atol_value = _as_decimal_approx(
+                    absolute_tolerance
+                )
+                rtol_value = _as_decimal_approx(
+                    relative_tolerance
+                )
+                converged = error_value < max(
+                    atol_value,
+                    rtol_value
+                    * max(source_norm_value, norm_value),
+                )
+            else:
+                converged = error < max(
+                    absolute_tolerance,
+                    relative_tolerance
+                    * max(source_norm, norm_current),
+                )
             if converged:
                 break
     if not converged:
@@ -827,34 +1205,40 @@ def _validate_ot_fields(
 ) -> None:
     if getattr(U, "field_type", None) is not Intensity or getattr(V, "field_type", None) is not Intensity:
         raise TypeError("OT inputs must be Intensity LatticeFields")
-    if not _is_real_numeric_data(U.data):
-        raise TypeError("OT source must have real numeric data")
-    target_ok = (
-        _is_real_numeric_data(V.data)
-        if target_real
-        else _is_numeric_data(V.data)
+    _require_ot_numeric_array(U.data, "OT source", real=True, dense=True)
+    _require_ot_numeric_array(
+        V.data, "OT target", real=target_real, dense=True
     )
-    if not target_ok:
-        kind = "real numeric" if target_real else "numeric"
-        raise TypeError(f"OT target must have {kind} data")
     if np.ndim(U.data) != np.ndim(V.data) or len(U.L) != len(V.L):
         raise ValueError("OT inputs must have equal dimensionality")
     if U.flambda != V.flambda:
         raise ValueError("Unequal flambdas.")
 
 
-def _beta_values(values: Sequence[float]) -> tuple[Any, ...]:
+def _beta_values(
+    values: Sequence[float], name: str = "beta vector"
+) -> tuple[Any, ...]:
     """Return beta scalars with Julia tuple/vector construction semantics."""
 
     if isinstance(values, tuple):
         return values
-    array = (
-        _julia_literal_array(values)
-        if isinstance(values, list)
-        else np.asarray(values)
-    )
+    if isinstance(values, list):
+        array = _julia_literal_array(values)
+    elif isinstance(values, np.ndarray):
+        if not (
+            values.flags.c_contiguous or values.flags.f_contiguous
+        ):
+            raise TypeError(
+                f"{name} must be a dense contiguous NumPy vector"
+            )
+        array = np.asarray(values)
+    else:
+        raise TypeError(
+            f"{name} must be a tuple, list vector literal, or dense "
+            "NumPy vector"
+        )
     if array.ndim != 1:
-        raise TypeError("beta vectors must be one-dimensional")
+        raise TypeError(f"{name} must be one-dimensional")
     return tuple(array)
 
 
@@ -930,11 +1314,13 @@ def pdotPhase(
             raise TypeError(f"{name} must be real")
     _validate_ot_fields(G2Root, G2Target, target_real=True)
     ndim = np.ndim(G2Root.data)
-    for name, values in (
-        ("betaRoot", betaRoot),
-        ("betaTarget", betaTarget),
+    root_beta_values = _beta_values(betaRoot, "betaRoot")
+    target_beta_values = _beta_values(betaTarget, "betaTarget")
+    for name, original, values in (
+        ("betaRoot", betaRoot, root_beta_values),
+        ("betaTarget", betaTarget, target_beta_values),
     ):
-        if isinstance(values, tuple):
+        if isinstance(original, tuple):
             if len(values) != ndim:
                 raise ValueError(
                     f"{name} NTuple must match the image dimensionality"
@@ -943,9 +1329,9 @@ def pdotPhase(
             raise ValueError(
                 f"{name} Vector must have at least the image dimensionality"
             )
-    if not all(_is_real_number(value) for value in betaRoot):
+    if not all(_is_real_number(value) for value in root_beta_values):
         raise TypeError("betaRoot values must be real")
-    if not all(_is_real_number(value) for value in betaTarget):
+    if not all(_is_real_number(value) for value in target_beta_values):
         raise TypeError("betaTarget values must be real")
     delta_alpha = _scalar_operation(alphaRoot, alphaTarget, np.subtract)
     source, target = normalizeDistribution(G2Root.data), normalizeDistribution(G2Target.data)
@@ -968,8 +1354,6 @@ def pdotPhase(
     # Preserve heterogeneous NTuple elements through the elementwise
     # subtraction.  NumPy's eager common-dtype inference is not Julia's
     # scalar promotion rule (notably for Int64/Float32 pairs).
-    root_beta_values = _beta_values(betaRoot)
-    target_beta_values = _beta_values(betaTarget)
     delta_beta = tuple(
         _scalar_operation(root, target, np.subtract)
         for root, target in zip(
@@ -1030,17 +1414,27 @@ def pdotBeamEstimate(
                 "LFine must match the image dimensionality"
             )
         # Interpolations.jl 0.16.2's obsolete ``Linear()`` extrapolation
-        # route succeeds for integer AbstractRanges, but recurses until stack
-        # overflow for the probed Float, Rational, and BigFloat ranges.  Keep
-        # the working source overload without silently repairing the broken
-        # upstream range families.
+        # route succeeds for signed-integer ranges and unsigned
+        # ``StepRangeLen`` values made by ``range(start, step=..., length=...)``.
+        # Unsigned ``UnitRange``/``StepRange`` families instead reach a
+        # dimension mismatch. On the locked Julia 1.11.6 baseline, floating
+        # ranges leak nondeterministic uninitialized interpolation output,
+        # while Rational and BigFloat ranges recurse until stack overflow.
+        # ``LatticeAxis`` retains the range family so these upstream dispatch
+        # boundaries are observable.
         if any(
-            np.asarray(axis).dtype.kind not in "iu"
+            not (
+                np.asarray(axis).dtype.kind == "i"
+                or (
+                    np.asarray(axis).dtype.kind == "u"
+                    and getattr(axis, "_range_kind", None) == "srl"
+                )
+            )
             for axis in fine_lattice
         ):
             raise NotImplementedError(
                 "the audited Julia pdotBeamEstimate LFine path fails for "
-                "non-integer target ranges"
+                "this target range family"
             )
         from .resampling import Linear, upsample
 
@@ -1053,7 +1447,7 @@ def pdotBeamEstimate(
         camera_field = amplitude_field * phase
     camera_lattice = tuple(camera_field.L)
     beam_lattice = _dual_shift_lattice(camera_lattice, G2Root.flambda)
-    beta_root_values = _beta_values(betaRoot)
+    beta_root_values = _beta_values(betaRoot, "betaRoot")
     diversity = _quadratic_linear_phase(
         beam_lattice,
         alphaRoot,
@@ -1085,7 +1479,7 @@ def _assign_julia_linear(
             linear_index, destination.shape, order="F"
         )
         converted = _julia_assignment_values(
-            np.asarray(source[index]), destination.dtype
+            np.asarray(source[index]), destination
         )
         destination[index] = np.asarray(converted).reshape(())[()]
 
@@ -1104,47 +1498,79 @@ def _sinkhorn_iter_base_inplace(
         isinstance(value, np.ndarray) for value in (u, v, U, V, FAu, FAv)
     ):
         raise TypeError("SinkhornIterBase! requires dense NumPy arrays")
-    if any(not _is_real_numeric_data(value) for value in (u, v, U, V)):
-        raise TypeError("u, v, U, and V must have real numeric data")
-    if not _is_numeric_data(FAu) or not _is_numeric_data(FAv):
-        raise TypeError("FAu and FAv must have numeric data")
-    if u.dtype != v.dtype:
+    u_array, u_domain = _require_ot_numeric_array(
+        u, "u", real=True, dense=True
+    )
+    v_array, v_domain = _require_ot_numeric_array(
+        v, "v", real=True, dense=True
+    )
+    U_array, _ = _require_ot_numeric_array(
+        U, "U", real=True, dense=True
+    )
+    V_array, _ = _require_ot_numeric_array(
+        V, "V", real=True, dense=True
+    )
+    FAu_array, FAu_domain = _require_ot_numeric_array(
+        FAu, "FAu", dense=True
+    )
+    FAv_array, FAv_domain = _require_ot_numeric_array(
+        FAv, "FAv", dense=True
+    )
+    if u_domain != v_domain:
         raise TypeError("u and v must have the same Julia element type")
-    if np.asarray(FAu).dtype != np.asarray(FAv).dtype:
+    if FAu_domain != FAv_domain:
         raise TypeError("FAu and FAv must have the same Julia element type")
-    U_array, V_array = np.asarray(U), np.asarray(V)
-    if not (u.shape == v.shape == U_array.shape == V_array.shape == np.shape(FAu) == np.shape(FAv)):
+    if not (
+        u_array.shape
+        == v_array.shape
+        == U_array.shape
+        == V_array.shape
+        == FAu_array.shape
+        == FAv_array.shape
+    ):
         raise ValueError("all Sinkhorn arrays must have the same shape")
     # Preserve both statement order and each broadcast's element-by-element
-    # conversion/mutation order.
-    row_sum = np.real(_isft_array(_sft_array(u) * np.asarray(FAu)))
-    _assign_julia_linear(
-        v,
-        _julia_array_array_operation(
-            V_array, _safe_inverse(row_sum), np.multiply
-        ),
-    )
-    _assign_julia_linear(
-        v,
-        _julia_array_scalar_operation(
-            v, _safe_inverse(np.sum(v)).reshape(())[()], np.multiply
-        ),
-    )
-    column_sum = np.real(
-        _isft_array(_sft_array(v) * np.asarray(FAv))
-    )
-    _assign_julia_linear(
-        u,
-        _julia_array_array_operation(
-            U_array, _safe_inverse(column_sum), np.multiply
-        ),
-    )
-    _assign_julia_linear(
-        u,
-        _julia_array_scalar_operation(
-            u, _safe_inverse(np.sum(u)).reshape(())[()], np.multiply
-        ),
-    )
+    # conversion/mutation order. Julia's IEEE operations do not emit Python
+    # RuntimeWarnings for Inf*0 or 0/0; the values and mutation sequence still
+    # propagate exactly through the checked assignments below.
+    with np.errstate(
+        over="ignore",
+        under="ignore",
+        invalid="ignore",
+        divide="ignore",
+    ):
+        row_sum = np.real(_isft_array(_sft_array(u_array) * FAu_array))
+        _assign_julia_linear(
+            v,
+            _julia_array_array_operation(
+                V_array, _safe_inverse(row_sum), np.multiply
+            ),
+        )
+        _assign_julia_linear(
+            v,
+            _julia_array_scalar_operation(
+                v,
+                _safe_inverse(_julia_sum(v)).reshape(())[()],
+                np.multiply,
+            ),
+        )
+        column_sum = np.real(
+            _isft_array(_sft_array(v_array) * FAv_array)
+        )
+        _assign_julia_linear(
+            u,
+            _julia_array_array_operation(
+                U_array, _safe_inverse(column_sum), np.multiply
+            ),
+        )
+        _assign_julia_linear(
+            u,
+            _julia_array_scalar_operation(
+                u,
+                _safe_inverse(_julia_sum(u)).reshape(())[()],
+                np.multiply,
+            ),
+        )
     # Julia's final ``u .*= ...`` expression returns ``u``; ``v`` is mutated
     # as a side effect but is not part of the return value.
     return u
@@ -1177,8 +1603,12 @@ def SinkhornConvN(
 ) -> tuple[np.ndarray, np.ndarray, list[float]]:
     """Run the experimental circular-convolution Sinkhorn iteration."""
 
-    if not _is_real_numeric_data(U) or not _is_real_numeric_data(V):
-        raise TypeError("U and V must have real numeric data")
+    source, _ = _require_ot_numeric_array(
+        U, "U", real=True, dense=True
+    )
+    target, _ = _require_ot_numeric_array(
+        V, "V", real=True, dense=True
+    )
     if (
         isinstance(epsilon, Decimal)
         or _object_contains_decimal(U)
@@ -1188,7 +1618,6 @@ def SinkhornConvN(
     # Julia creates ``u`` as Float64 but creates ``v`` with the target's
     # element type. Preserve that dispatch boundary: a positive iteration with
     # a non-Float64 target reaches the same-type Sinkhorn helper and fails.
-    source, target = np.asarray(U), np.asarray(V)
     if source.shape != target.shape or source.ndim == 0:
         raise ValueError("U and V must be same-shaped arrays")
     if not isinstance(max_iter, (int, np.integer)):
@@ -1226,10 +1655,16 @@ def dualToGradients(u: Any, v: Any, U: Any, LV: Sequence[Any], epsilon: float) -
 
     if not all(isinstance(value, np.ndarray) for value in (u, v, U)):
         raise TypeError("u, v, and U must be dense NumPy arrays")
-    if any(not _is_real_numeric_data(value) for value in (u, v, U)):
-        raise TypeError("u, v, and U must have real numeric data")
-    u_array, v_array, source = np.asarray(u), np.asarray(v), np.asarray(U)
-    if u_array.dtype != v_array.dtype:
+    u_array, u_domain = _require_ot_numeric_array(
+        u, "u", real=True, dense=True
+    )
+    v_array, v_domain = _require_ot_numeric_array(
+        v, "v", real=True, dense=True
+    )
+    source, _ = _require_ot_numeric_array(
+        U, "U", real=True, dense=True
+    )
+    if u_domain != v_domain:
         raise TypeError("u and v must have the same Julia element type")
     lattice = _as_lattice(LV)
     if u_array.shape != v_array.shape or u_array.shape != source.shape or u_array.shape != tuple(len(axis) for axis in lattice):
@@ -1281,7 +1716,13 @@ def otQuickPhase(
     """Experimental convolutional OT phase (retained, but deprecated)."""
 
     _validate_ot_fields(g2, G2, target_real=True)
-    if np.asarray(g2.data).dtype != np.asarray(G2.data).dtype:
+    _, source_domain = _require_ot_numeric_array(
+        g2.data, "otQuickPhase source", real=True, dense=True
+    )
+    _, target_domain = _require_ot_numeric_array(
+        G2.data, "otQuickPhase target", real=True, dense=True
+    )
+    if source_domain != target_domain:
         raise TypeError(
             "otQuickPhase inputs must have the same Julia element type"
         )
@@ -1349,20 +1790,34 @@ def otPhase2(
     input_tag = getattr(inputField, "field_type", None)
     target_tag = getattr(targetField, "field_type", None)
     if input_tag is Modulus and target_tag is Modulus:
-        if not _is_real_numeric_data(inputField.data):
-            raise TypeError("otPhase2 Modulus source must have real numeric data")
-        if not _is_numeric_data(targetField.data):
-            raise TypeError("otPhase2 Modulus target must have numeric data")
+        _require_ot_numeric_array(
+            inputField.data,
+            "otPhase2 Modulus source",
+            real=True,
+            dense=True,
+        )
+        _require_ot_numeric_array(
+            targetField.data,
+            "otPhase2 Modulus target",
+            dense=True,
+        )
         # Route through the same abs2 implementation as Julia's Modulus
         # overload.  Besides avoiding duplicated semantics, this preserves
         # Bool storage (NumPy's ``abs(bool_array) ** 2`` becomes Int8).
         source_data = np.asarray(square(inputField).data)
         target_data = np.asarray(square(targetField).data)
     elif input_tag is Intensity and target_tag is Intensity:
-        if not _is_real_numeric_data(inputField.data):
-            raise TypeError("otPhase2 Intensity source must have real numeric data")
-        if not _is_numeric_data(targetField.data):
-            raise TypeError("otPhase2 Intensity target must have numeric data")
+        _require_ot_numeric_array(
+            inputField.data,
+            "otPhase2 Intensity source",
+            real=True,
+            dense=True,
+        )
+        _require_ot_numeric_array(
+            targetField.data,
+            "otPhase2 Intensity target",
+            dense=True,
+        )
         source_data = np.asarray(inputField.data)
         target_data = np.asarray(targetField.data)
     else:
@@ -1387,9 +1842,14 @@ def otPhase2(
 
     # Unlike ``normalizeDistribution``, Julia's factorized implementation uses
     # the raw (possibly complex) Intensity arrays and divides by their sums.
-    with np.errstate(divide="ignore", invalid="ignore"):
-        a = source_data / np.sum(source_data)
-        b = target_data / np.sum(target_data)
+    source_total = _julia_sum(source_data)
+    target_total = _julia_sum(target_data)
+    a = _julia_array_scalar_operation(
+        source_data, source_total, np.divide
+    )
+    b = _julia_array_scalar_operation(
+        target_data, target_total, np.divide
+    )
     # Julia keeps Rational normalization exact, then promotes it to Float64
     # as soon as it interacts with the Float64 Sinkhorn scalings.  NumPy keeps
     # Python Fraction arithmetic in an object array instead, even after those

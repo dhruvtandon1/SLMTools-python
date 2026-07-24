@@ -7,16 +7,19 @@ name = "hoganlab-slmtools"
 version = "0.3.0"
 description = "Python port of SLMTools.jl"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{name = "SLMTools contributors"}]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
+  "gmpy2>=2.3.1",
   "numpy>=2.5.1",
   "Pillow>=12.3.0",
   "pyFFTW>=0.15.1",
@@ -25,6 +28,12 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=9.1.1"]
 plot = ["matplotlib>=3.11.1"]
+
+[project.urls]
+Repository = "https://github.com/dhruvtandon1/SLMTools-python"
+Issues = "https://github.com/dhruvtandon1/SLMTools-python/issues"
+Upstream = "https://github.com/hoganphysics/SLMTools"
+"Audited source" = "https://github.com/hoganphysics/SLMTools/tree/ea1c1c9c06b4b2dc46372ac7ee031301b604a007"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

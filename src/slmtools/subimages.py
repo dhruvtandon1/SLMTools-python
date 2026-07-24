@@ -23,6 +23,7 @@ from typing import Iterable, Sequence
 import numpy as np
 from PIL import Image
 
+from .lattice_field import _require_dense_ndarray
 from .lattice_utils import _julia_assignment_values
 
 
@@ -96,6 +97,9 @@ def imageToHeatmap(image: np.ndarray, **options: object) -> object:
     an optional notebook utility rather than part of the loaded Julia module.
     """
 
+    matrix = _require_dense_ndarray(image, "imageToHeatmap image")
+    if matrix.ndim != 2:
+        raise TypeError("imageToHeatmap expects a two-dimensional matrix")
     try:
         import matplotlib.pyplot as plt
     except ImportError as exc:  # pragma: no cover - environment dependent
@@ -103,7 +107,7 @@ def imageToHeatmap(image: np.ndarray, **options: object) -> object:
             "imageToHeatmap requires the optional 'matplotlib' dependency"
         ) from exc
     _, axis = plt.subplots()
-    return axis.imshow(np.asarray(image, dtype=float), **options)
+    return axis.imshow(np.asarray(matrix, dtype=float), **options)
 
 
 def grayAnnotation(
@@ -156,11 +160,20 @@ def _rgb(image: np.ndarray) -> np.ndarray:
 def _object_grid(images: object) -> np.ndarray:
     """Return a 1-D/2-D object array without stacking differently-sized data."""
 
-    if isinstance(images, np.ndarray) and images.dtype == object:
-        return images.copy()
-    if isinstance(images, np.ndarray) and images.ndim in (2, 3):
+    if isinstance(images, np.ndarray):
+        dense_images = _require_dense_ndarray(images, "SubImages image grid")
+    else:
+        dense_images = None
+    if dense_images is not None and dense_images.dtype == object:
+        result = dense_images.copy()
+        for index in np.ndindex(result.shape):
+            item = result[index]
+            if isinstance(item, np.ndarray):
+                _require_dense_ndarray(item, "SubImages grid image")
+        return result
+    if dense_images is not None and dense_images.ndim in (2, 3):
         result = np.empty(1, dtype=object)
-        result[0] = images
+        result[0] = dense_images
         return result
     rows = list(images)  # type: ignore[arg-type]
     if not rows:
@@ -173,11 +186,19 @@ def _object_grid(images: object) -> np.ndarray:
         result = np.empty((len(rows), width), dtype=object)
         for row_index, row in enumerate(rows):
             for column_index, value in enumerate(row):
-                result[row_index, column_index] = np.asarray(value)
+                result[row_index, column_index] = (
+                    _require_dense_ndarray(value, "SubImages grid image")
+                    if isinstance(value, np.ndarray)
+                    else np.asarray(value)
+                )
         return result
     result = np.empty(len(rows), dtype=object)
     for index, value in enumerate(rows):
-        result[index] = np.asarray(value)
+        result[index] = (
+            _require_dense_ndarray(value, "SubImages grid image")
+            if isinstance(value, np.ndarray)
+            else np.asarray(value)
+        )
     return result
 
 
@@ -201,7 +222,7 @@ def padout(
 ) -> np.ndarray:
     """Embed an image in the requested canvas, centered by default."""
 
-    matrix = np.asarray(image)
+    matrix = _require_dense_ndarray(image, "SubImages.padout image")
     size = _subimage_pair(size, "padding size")
     if matrix.ndim not in (2, 3):
         raise ValueError("padout expects a grayscale or color image")
@@ -224,7 +245,7 @@ def padout(
 def padadd(image: np.ndarray, amount: int, side: str, fillval: object = 0) -> np.ndarray:
     """Add rows or columns on one side of an image."""
 
-    matrix = np.asarray(image)
+    matrix = _require_dense_ndarray(image, "SubImages.padadd image")
     amount = _subimage_int(amount, "padding amount")
     if amount < 0:
         raise ValueError("padding must be nonnegative")
@@ -274,7 +295,7 @@ def _pad_one(
     repeat = 2 if padall > 0 else 1
     left, right = repeat * padleft, repeat * padright
     top, bottom = repeat * padtop, repeat * padbottom
-    matrix = np.asarray(image)
+    matrix = _require_dense_ndarray(image, "SubImages.padmultiple image")
     if left == right == top == bottom == 0:
         return matrix.copy()
     pads = ((top, bottom), (left, right))
@@ -363,7 +384,7 @@ def _gray(image: np.ndarray) -> np.ndarray:
 def trimWhitespace(image: np.ndarray) -> np.ndarray:
     """Crop rows and columns whose pixels are all white (value one)."""
 
-    matrix = np.asarray(image)
+    matrix = _require_dense_ndarray(image, "trimWhitespace image")
     gray = _gray(matrix)
     white = gray == 1
     rows = np.flatnonzero(~np.all(white, axis=1))
@@ -384,7 +405,9 @@ def arrange(layout: tuple[int, int], *images: np.ndarray) -> np.ndarray:
         raise ValueError("number of images does not match layout")
     output = np.empty(layout, dtype=object)
     for index, image in enumerate(images):
-        output[np.unravel_index(index, layout, order="F")] = np.asarray(image)
+        output[np.unravel_index(index, layout, order="F")] = (
+            _require_dense_ndarray(image, "arrange image")
+        )
     return output
 
 
@@ -508,7 +531,9 @@ def handAnnotate(
     if isinstance(images, np.ndarray) and images.dtype != object and images.ndim in (2, 3):
         if not isinstance(labels, str):
             raise TypeError("a single image requires a string label")
-        output = np.asarray(images).copy()
+        output = _require_dense_ndarray(
+            images, "handAnnotate image"
+        ).copy()
         annotation = grayAnnotation(labels, pixelsize, padto, **options)
         if inverta:
             annotation = 1 - annotation

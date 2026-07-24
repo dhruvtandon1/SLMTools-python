@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from fractions import Fraction
 import os
 from pathlib import Path
@@ -279,7 +279,7 @@ def test_linear_fit_orientation_and_exact_node_dualation() -> None:
         [Decimal(0), Decimal(1), Decimal(2)],
         [Decimal(1), Decimal(3), Decimal(5)],
     )
-    assert decimal_slope == Decimal(2)
+    assert abs(decimal_slope - Decimal(2)) <= Decimal("1e-27")
     assert abs(decimal_intercept - Decimal(1)) <= Decimal("1e-27")
 
     # Julia's backslash polyalgorithm uses LU for the square two-sample
@@ -317,6 +317,64 @@ def test_linear_fit_orientation_and_exact_node_dualation() -> None:
     for invalid_xs in ((1, 2), range(1, 3), ["1", "2"]):
         with pytest.raises(TypeError):
             linearFit(invalid_xs, [3, 5])
+    # Explicit object storage for machine numbers models Julia Vector{Any},
+    # not a concrete Vector{<:Number}; the latter has no matching method.
+    for values in (
+        np.asarray([1, 2], dtype=object),
+        np.asarray([1.0, 2.0], dtype=object),
+        np.asarray([1 + 0j, 2 + 0j], dtype=object),
+    ):
+        with pytest.raises(TypeError, match="object arrays"):
+            linearFit(values, np.asarray([3, 5]))
+        with pytest.raises(TypeError, match="object arrays"):
+            linearFit(np.asarray([1, 2]), values)
+
+    # Fraction/Decimal are the two concrete Julia numeric domains that need
+    # NumPy object storage in this port and therefore remain valid.
+    assert linearFit(
+        np.asarray([Fraction(0), Fraction(1)], dtype=object),
+        np.asarray([Fraction(1), Fraction(3)], dtype=object),
+    ) == pytest.approx((2.0, 1.0))
+    decimal_object_fit = linearFit(
+        np.asarray([Decimal(0), Decimal(1)], dtype=object),
+        np.asarray([Decimal(1), Decimal(3)], dtype=object),
+    )
+    assert decimal_object_fit == (Decimal(2), Decimal(1))
+
+    # Julia 1.11's generic BigFloat backslash path is binary, unblocked
+    # pivoted QR.  Its final ulp is visible for a one-row wide system, and its
+    # lack of rank estimation is dramatically visible for a dependent tall
+    # design.  These are exact 256-bit Julia 1.11.6 authority results.
+    with localcontext() as context:
+        context.prec = 77  # maps to a 256-bit binary significand
+        assert linearFit(
+            [Decimal(1)], [Decimal(2)]
+        ) == (
+            Decimal("1.0"),
+            Decimal(
+                "1.000000000000000000000000000000000000000000000000000000000000000000000000000017"
+            ),
+        )
+        assert linearFit(
+            [Decimal(0), Decimal(1), Decimal(2)],
+            [Decimal(1), Decimal(3), Decimal(5)],
+        ) == (
+            Decimal("2.0"),
+            Decimal(
+                "0.9999999999999999999999999999999999999999999999999999999999999999999999999999395"
+            ),
+        )
+        assert linearFit(
+            [Decimal(1), Decimal(1), Decimal(1)],
+            [Decimal(2), Decimal(3), Decimal(4)],
+        ) == (
+            Decimal(
+                "5.0139445418395255283694704271811692336355250894665672355503583528635147053499e76"
+            ),
+            Decimal(
+                "-5.01394454183952552836947042718116923363552508946656723555035835286351470534955e76"
+            ),
+        )
 
     lattice = (np.asarray([8.0, 10.0, 12.0]), np.asarray([19.0, 20.0, 21.0]))
     fields = []
@@ -422,7 +480,7 @@ def test_linear_fit_orientation_and_exact_node_dualation() -> None:
     data = np.arange(9, dtype=float).reshape(3, 3)
     source = LatticeField(data, source_lattice, 4, field_type=RealPhase)
     result = dualate(source, target_lattice, [0, 0], 0)
-    np.testing.assert_allclose(result.data, data, atol=1e-13)
+    np.testing.assert_allclose(result.data.copy(), data, atol=1e-13)
     assert result.field_type is RealPhase and result.flambda == 1
     natural = dualate(source, target_lattice, [0, 0], 0, naturalize=True)
     assert natural.flambda == 1
@@ -430,14 +488,59 @@ def test_linear_fit_orientation_and_exact_node_dualation() -> None:
         np.testing.assert_allclose(actual, expected_axis)
 
 
+def test_linear_fit_empty_dispatch_and_bigfloat_nonfinite_parity() -> None:
+    # Julia's untyped ``[]`` is Vector{Any} and does not dispatch, whereas an
+    # explicitly typed empty Vector{Float64} is valid and solves to zero.
+    with pytest.raises(TypeError, match="no concrete numeric element type"):
+        linearFit([], [])
+    assert linearFit(
+        np.empty(0, dtype=np.float64),
+        np.empty(0, dtype=np.float64),
+    ) == pytest.approx((0.0, 0.0))
+
+    # Exact Julia 1.11.6 BigFloat backslash behavior: rectangular generic QR
+    # propagates non-finite inputs to NaNs.
+    one_row = linearFit([Decimal("Infinity")], [Decimal(2)])
+    assert all(value.is_nan() for value in one_row)
+    tall = linearFit(
+        [Decimal(0), Decimal(1), Decimal(2)],
+        [Decimal(2), Decimal("Infinity"), Decimal(6)],
+    )
+    assert all(value.is_nan() for value in tall)
+
+    # The square generic-LU path checks the design matrix, but a non-finite
+    # right-hand side participates in element-by-element arithmetic.
+    slope, intercept = linearFit(
+        [Decimal(0), Decimal(1)],
+        [Decimal(2), Decimal("Infinity")],
+    )
+    assert slope == Decimal("Infinity")
+    assert intercept == Decimal(2)
+    slope, intercept = linearFit(
+        [Decimal(0), Decimal(1)],
+        [Decimal("Infinity"), Decimal(2)],
+    )
+    assert slope.is_nan()
+    assert intercept == Decimal("Infinity")
+    with pytest.raises(ValueError, match="contains Infs or NaNs"):
+        linearFit(
+            [Decimal(0), Decimal("Infinity")],
+            [Decimal(2), Decimal(3)],
+        )
+
+
 def test_template_overloads_standard_output_and_normalization() -> None:
     lattice = (np.asarray([-1.0, 0.0, 1.0]), np.asarray([-2.0, 0.0, 2.0]))
     parabola = lfParabola(RealPhase, lattice, 2.0, (1.0, -1.0), flambda=3)
     x, y = np.meshgrid(*lattice, indexing="ij")
-    np.testing.assert_allclose(parabola.data, x**2 + y**2 + x - y)
+    np.testing.assert_allclose(
+        parabola.data.copy(), x**2 + y**2 + x - y
+    )
     inherited = lfParabola(parabola, np.eye(2), center=(1, 0))
     assert inherited.field_type is RealPhase and inherited.flambda == 3
-    np.testing.assert_allclose(inherited.data, ((x - 1) ** 2 + y**2) / 2)
+    np.testing.assert_allclose(
+        inherited.data.copy(), ((x - 1) ** 2 + y**2) / 2
+    )
 
     wrapped = lfParabola(ComplexPhase, lattice, 1.0)
     np.testing.assert_allclose(np.abs(wrapped.data), 1)
@@ -453,7 +556,8 @@ def test_template_overloads_standard_output_and_normalization() -> None:
     np.testing.assert_array_equal(lfCap(Intensity, lattice, 2.0, 1.0).data, np.maximum(1 - x**2 - y**2, 0))
     rectangle = lfRect(Intensity, lattice, (2.0, 2.0), 4.0)
     np.testing.assert_array_equal(
-        rectangle.data, 4.0 * ((np.abs(x) <= 1) & (np.abs(y) <= 1))
+        rectangle.data.copy(),
+        4.0 * ((np.abs(x) <= 1) & (np.abs(y) <= 1)),
     )
     assert np.max(rectangle.data) == 4
 

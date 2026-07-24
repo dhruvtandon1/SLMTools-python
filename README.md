@@ -1,144 +1,131 @@
 # SLMTools for Python
 
-This is a local Python port of Hogan Lab's Julia `SLMTools` package.  It keeps
-the Julia package's public names, phase convention, lattice metadata, shifted
-FFT convention, field-tag rules, and numerical algorithms.  The port targets
-the audited Julia source at commit `ea1c1c9c06b4b2dc46372ac7ee031301b604a007`
-(`SLMTools` 0.3.0).
+`slmtools` is a Python translation of Hogan Lab's Julia
+[`SLMTools`](https://github.com/hoganphysics/SLMTools) package. The current
+release tracks Julia `SLMTools` 0.3.0 at
+[`ea1c1c9`](https://github.com/hoganphysics/SLMTools/commit/ea1c1c9c06b4b2dc46372ac7ee031301b604a007).
+It preserves the original public names, field tags, lattice metadata, phase
+and FFT conventions, numerical algorithms, and column-major point ordering.
 
-The port is deliberately a plain local folder.  It has no Git repository and
-does not modify, import files from, or write outputs into the Julia checkout.
+The Python translation is maintained as its own Git repository. The audited
+Julia checkout is the reference used for parity tests.
 
 ## Install
 
-Python 3.14 or newer is required.  The publication baseline is CPython 3.14.6.
-From this directory:
+Python 3.12 or newer is supported. From a source checkout:
 
 ```bash
-python -m pip install -e .
+python -m pip install .
 ```
 
-NumPy, Pillow, and pyFFTW are the runtime dependencies. pyFFTW supplies the
-same FFTW backend family used by the Julia package; Matplotlib is optional and
-is used only by `slmtools.subimages.imageToHeatmap`. Runtime metadata uses the
-current validated releases as minimum versions, so later compatible releases
-remain installable.
-[`requirements-lock.txt`](requirements-lock.txt) records the exact NumPy,
-Pillow, pyFFTW, Matplotlib, pytest, and packaging-tool versions used by the
-locked CPython 3.14.6 regression and publication environment.
+For development:
 
-The public distribution name is `hoganlab-slmtools` because the unrelated
-PyPI project named `slmtools` predates this port. The import remains
-`import slmtools`, preserving the Julia package name in Python code.
+```bash
+python -m pip install -e ".[test,plot]"
+python -m pytest -p no:cacheprovider -W error
+```
+
+The distribution name is `hoganlab-slmtools`; the Python import is
+`slmtools`. The older PyPI distribution named `slmtools` is unrelated to this
+project.
 
 ## Example
 
-The original workflow translates directly; public functions retain their
-Julia camel-case names:
+Public functions retain their Julia names, so an original workflow translates
+directly:
 
 ```python
 import numpy as np
 from slmtools import (
-    Intensity, natlat, dualShiftLattice, lfGaussian, lfRing,
-    otPhase, otPhase2, gs, sft, square, look,
+    Intensity,
+    dualShiftLattice,
+    gs,
+    lfGaussian,
+    lfRing,
+    look,
+    natlat,
+    otPhase,
+    otPhase2,
+    sft,
+    square,
 )
 
-N = 128
-L0 = natlat((N, N))
-dL0 = dualShiftLattice(L0)
+# Dense OT constructs a matrix over all lattice points.  Keep this quick-start
+# deliberately small; 16×16 needs a 256×256 cost matrix.
+size = 16
+input_lattice = natlat((size, size))
+target_lattice = dualShiftLattice(input_lattice)
 
-inputBeam = lfGaussian(Intensity, L0, 1.0)
-targetBeam = lfRing(Intensity, dL0, 2.5, 0.5)
+input_beam = lfGaussian(Intensity, input_lattice, 1.0)
+target_beam = lfRing(Intensity, target_lattice, 2.5, 0.5)
 
-phiOT = otPhase(inputBeam, targetBeam, 0.001)
-phiOT2 = otPhase2(inputBeam, targetBeam, 0.0002, 200)
-phiGS = gs(inputBeam, targetBeam, 100, phiOT)
+phase_ot = otPhase(input_beam, target_beam, 0.002)
+phase_ot2 = otPhase2(input_beam, target_beam, 0.0002, 200)
+phase_gs = gs(input_beam, target_beam, 100, phase_ot)
 
-outputOT = square(sft(np.sqrt(inputBeam) * phiOT))
-outputOT2 = square(sft(np.sqrt(inputBeam) * phiOT2))
-outputGS = square(sft(np.sqrt(inputBeam) * phiGS))
-image = look(targetBeam, outputOT, outputOT2, outputGS)
+output_ot = square(sft(np.sqrt(input_beam) * phase_ot))
+output_ot2 = square(sft(np.sqrt(input_beam) * phase_ot2))
+output_gs = square(sft(np.sqrt(input_beam) * phase_gs))
+image = look(target_beam, output_ot, output_ot2, output_gs)
 ```
 
-`image` is one horizontally concatenated, display-ready grayscale NumPy
-array.  As in Julia, `look` does not create or show a plotting window.
+`image` is a horizontally concatenated, display-ready grayscale NumPy array.
+As in Julia, `look` returns image data and does not open a plotting window.
 
 ## Core model
 
-`LatticeField` (`LF`) stores four pieces of information:
+`LatticeField` (`LF`) combines:
 
-- `data`: an N-dimensional NumPy array;
-- `L`: an N-tuple of regular, one-dimensional coordinate arrays;
-- `flambda`: wavelength times focal length, defaulting to `1.0`;
-- `field_type`: one of the semantic tags such as `Intensity`, `RealPhase`, or
+- an N-dimensional checked NumPy-compatible `data` façade;
+- an N-tuple of regular coordinate axes in `L`;
+- wavelength times focal length in `flambda`;
+- a semantic `field_type`, such as `Intensity`, `RealPhase`, or
   `ComplexAmplitude`.
-
-Both ordinary Python and Julia-shaped construction are supported:
 
 ```python
 import numpy as np
-from slmtools import LF, Intensity, natlat
+from slmtools import Intensity, LF, natlat
 
-L = natlat((32, 32))
-a = LF([[1.0] * 32] * 32, L, field_type=Intensity)
-b = LF[Intensity]([[1.0] * 32] * 32, L)
-# Julia's fully parameterized LF{S,T,N} constructor is also available. It
-# requires exact dtype/dimension and deliberately bypasses partial clipping:
-c = LF[Intensity, np.float32, 2](np.ones((32, 32), dtype=np.float32), L)
+lattice = natlat((32, 32))
+field = LF[Intensity](np.ones((32, 32)), lattice)
 ```
 
-Real phase values are measured in **cycles**, not radians.  `wrap(phi)` uses
-`exp(2πi*phi)`.  `sft` and `isft` mean exactly
-`fftshift(fft(ifftshift(x)))` and `fftshift(ifft(ifftshift(x)))` over every
-axis; no physical sampling factor is applied to the values.
+Real phase is measured in cycles, not radians. `wrap(phi)` uses
+`exp(2πi*phi)`. `sft` and `isft` use the original shifted FFT definitions
+without adding a physical sampling factor to the values.
 
-NumPy indexing is necessarily zero-based and half-open.  A single scalar index
-on an `LF` follows Julia's column-major linear order, Boolean selectors are
-rejected, and omitted trailing selectors are accepted only for singleton
-dimensions where Julia's dense indexing accepts them. Assignment accepts only
-one linear integer or exactly one integer per field dimension. Every
-reshape/flatten operation inside the OT algorithms uses Fortran order to
-preserve Julia point enumeration.
+Python indexing is zero-based. Operations that flatten or reshape lattice
+data use Fortran order so that Julia's column-major point enumeration remains
+unchanged.
 
-`LatticeField` arithmetic is Python-native: `+` and `*` are eager, binary,
-non-mutating, and value-semantic. Thus `a+b+c` is the left fold `(a+b)+c` and
-matches Julia's explicitly parenthesized binary expression. Intermediates
-contain no hidden operands, and the port does not inspect source/bytecode or
-add alternate `julia_add`/`julia_mul` helpers. An internal algorithm that
-requires aggregate-before-construction semantics validates its fields and
-performs that reduction locally before constructing one result.
+Direct Boolean and advanced indexing through `field.data` follows Julia's
+column-major indexing rules. When passing field values to a NumPy consumer
+that assumes NumPy's row-major advanced-index semantics (including
+`numpy.testing`), use `field.data.copy()` to obtain a current ordinary ndarray
+snapshot.
 
-Dense `otPhase` and `pdotPhase` retain Julia's signed-maximum automatic-axis
-scaling exactly. This includes the upstream zero denominator for a two-sample
-target axis and the resulting invalid Inf/NaN geometry; the port does not
-invent a replacement radius convention.
+Python evaluates chained operators from left to right, whereas Julia can
+dispatch an unparenthesized field expression as one variadic call. Python
+field operators are deliberately eager, binary, non-mutating, and
+value-semantic, so `a + b + c` means `(a + b) + c`. When translating or
+comparing such a chain, use the equivalently parenthesized binary Julia
+expression. Algorithms that genuinely require aggregate-before-construction
+semantics perform that reduction internally and construct one final field;
+they do not retain hidden operands or change Python's operator behavior.
 
-Broken or unfinished Julia paths are not silently completed in Python. They
-remain failing or explicitly unsupported, and are listed as future work in
-the compatibility document. This keeps the published port auditable as a
-language translation rather than an unreviewed algorithm fork.
+## Port contract
 
-## Documentation and tests
+[`PORTING.md`](https://github.com/dhruvtandon1/SLMTools-python/blob/main/PORTING.md)
+is the single maintenance reference for the source baseline, module map,
+translation rules, and parity checks. Function-level API details live with
+the implementation docstrings, and the exact Julia export surface is
+`slmtools.JULIA_EXPORTS`.
 
-- [`docs/API.md`](docs/API.md) maps every Julia export and the supported
-  package-qualified helpers.
-- [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) records conventions,
-  dependency substitutions, and known upstream defects/future work.
-- [`docs/TESTING.md`](docs/TESTING.md) describes the correctness and
-  differential-parity strategy.
-- [`examples/workflows.py`](examples/workflows.py) contains deterministic,
-  scaled translations of all four publication-scale Julia notebooks.
-
-Run the test suite with:
-
-```bash
-python -m pytest
-```
-
-The tests create all outputs in temporary directories.  Optional integration
-checks can read the original large image fixtures by setting
-`SLMTOOLS_JULIA_REPO`, but they never write to that repository.
+The repository also contains deterministic translations of the original
+notebook workflows in
+[`examples/workflows.py`](https://github.com/dhruvtandon1/SLMTools-python/blob/main/examples/workflows.py).
 
 ## License
 
-MIT, matching the Julia project.  See [`LICENSE`](LICENSE).
+MIT, matching the Julia project. See
+[`LICENSE`](https://github.com/dhruvtandon1/SLMTools-python/blob/main/LICENSE).

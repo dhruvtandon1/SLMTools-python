@@ -2,8 +2,16 @@
 
 from __future__ import annotations
 
-from decimal import Decimal, getcontext, localcontext
+from decimal import (
+    Decimal,
+    DivisionByZero,
+    InvalidOperation,
+    Overflow,
+    getcontext,
+    localcontext,
+)
 from fractions import Fraction
+from math import ceil, isqrt, log2
 from numbers import Number
 from os import PathLike
 from pathlib import Path
@@ -32,6 +40,7 @@ from .lattice_field import (
     _object_contains_decimal,
     _object_destination_element_type,
     _is_real_number,
+    _require_dense_ndarray,
     as_lattice,
 )
 from .lattice_utils import _step, natlat
@@ -335,9 +344,31 @@ def linearFit(xs: Sequence[Any], ys: Sequence[Any]) -> tuple[Any, Any]:
         # a freshly allocated Vector literal; tuples and ranges retain their
         # distinct container semantics and therefore do not dispatch.
         if isinstance(value, list):
+            # Julia spells ``[]`` as ``Vector{Any}``, which does not satisfy
+            # ``Vector{<:Number}``.  An explicitly typed empty NumPy vector
+            # remains valid (for example, ``np.empty(0, dtype=np.float64)``).
+            if not value:
+                raise TypeError(
+                    f"linearFit {name} empty list has no concrete numeric "
+                    "element type"
+                )
             result = _julia_literal_array(value)
         elif isinstance(value, np.ndarray):
-            result = np.asarray(value)
+            result = _require_dense_ndarray(value, f"linearFit {name}")
+            # A deliberately object-typed ndarray of ordinary machine
+            # numbers is the Python counterpart of ``Vector{Any}``, which
+            # does not satisfy Julia's ``Vector{<:Number}`` method. Object
+            # storage remains necessary for the concrete numeric domains
+            # NumPy lacks: Rational and BigFloat are represented by Fraction
+            # and Decimal, respectively.
+            if result.dtype.kind == "O" and not any(
+                isinstance(item, (Fraction, Decimal))
+                for item in result.flat
+            ):
+                raise TypeError(
+                    f"linearFit {name} object arrays must represent a "
+                    "Fraction or Decimal numeric vector"
+                )
         else:
             raise TypeError(f"linearFit {name} must be a vector")
         if result.ndim != 1:
@@ -397,71 +428,316 @@ def linearFit(xs: Sequence[Any], ys: Sequence[Any]) -> tuple[Any, Any]:
     return slope, intercept
 
 
-def _decimal_reflector_inplace(
-    matrix: list[list[Decimal]], column: int, row: int
-) -> Decimal:
-    """Apply Julia's generic `reflector!` storage convention to one column."""
+class _BinaryBigFloat:
+    """Finite MPFR-style arithmetic used by Julia's generic BigFloat QR.
 
-    norm = sum(
-        (matrix[index][column] * matrix[index][column]
-         for index in range(row, len(matrix))),
-        Decimal(0),
-    ).sqrt()
+    ``Decimal`` is the public arbitrary-precision scalar in this port, but
+    Julia's ``BigFloat`` rounds every elementary operation in base two.  A
+    rank-deficient QR exposes those otherwise invisible rounding decisions.
+    Keeping exact dyadic fractions and rounding after each operation gives us
+    Julia 1.11's operation order without adding an external MPFR dependency.
+    """
+
+    def __init__(self, precision: int):
+        self.precision = precision
+
+    @staticmethod
+    def _floor_log2(value: Fraction) -> int:
+        value = abs(value)
+        numerator = value.numerator
+        denominator = value.denominator
+        exponent = numerator.bit_length() - denominator.bit_length()
+        if exponent >= 0:
+            if numerator < denominator << exponent:
+                exponent -= 1
+        elif numerator << -exponent < denominator:
+            exponent -= 1
+        return exponent
+
+    @staticmethod
+    def _round_integer_ratio(numerator: int, denominator: int) -> int:
+        quotient, remainder = divmod(numerator, denominator)
+        comparison = 2 * remainder - denominator
+        if comparison > 0 or (comparison == 0 and quotient % 2):
+            quotient += 1
+        return quotient
+
+    def round(self, value: Fraction | int) -> Fraction:
+        value = Fraction(value)
+        if value == 0:
+            return value
+        sign = -1 if value < 0 else 1
+        value = abs(value)
+        shift = self._floor_log2(value) - (self.precision - 1)
+        if shift >= 0:
+            significand = self._round_integer_ratio(
+                value.numerator, value.denominator << shift
+            )
+        else:
+            significand = self._round_integer_ratio(
+                value.numerator << -shift, value.denominator
+            )
+        if significand == 1 << self.precision:
+            significand >>= 1
+            shift += 1
+        rounded = (
+            Fraction(significand << shift)
+            if shift >= 0
+            else Fraction(significand, 1 << -shift)
+        )
+        return sign * rounded
+
+    def from_decimal(self, value: Decimal) -> Fraction:
+        if not value.is_finite():
+            raise ValueError("binary BigFloat emulation requires finite values")
+        return self.round(Fraction(value))
+
+    def to_decimal(self, value: Fraction) -> Decimal:
+        # A p-bit significand can require ceil(p*log10(2)) significant
+        # decimal digits to expose its final binary ulp.  Decimal's nominal
+        # context may be one digit shorter (77 digits maps to 256 bits), so
+        # convert with that representation width instead of erasing the
+        # low-order bit on the way back to the public scalar.
+        representation_digits = ceil(1 + self.precision / log2(10))
+        with localcontext() as conversion:
+            conversion.prec = representation_digits
+            return Decimal(value.numerator) / Decimal(value.denominator)
+
+    def add(self, left: Fraction, right: Fraction) -> Fraction:
+        return self.round(left + right)
+
+    def subtract(self, left: Fraction, right: Fraction) -> Fraction:
+        return self.round(left - right)
+
+    def multiply(self, left: Fraction, right: Fraction) -> Fraction:
+        return self.round(left * right)
+
+    def divide(self, numerator: Fraction, denominator: Fraction) -> Fraction:
+        return self.round(numerator / denominator)
+
+    def inverse(self, value: Fraction) -> Fraction:
+        return self.divide(Fraction(1), value)
+
+    def sqrt(self, value: Fraction) -> Fraction:
+        if value == 0:
+            return value
+        if value < 0:
+            raise ValueError("cannot take the square root of a negative value")
+
+        # Round sqrt(value) directly to a p-bit dyadic.  Comparing the exact
+        # rational square against (k + 1/2)^2 implements MPFR's nearest-even
+        # tie rule without a guard-precision approximation.
+        shift = self._floor_log2(value) // 2 - (self.precision - 1)
+        squared_scale = 2 * shift
+        scaled = (
+            value / Fraction(1 << squared_scale)
+            if squared_scale >= 0
+            else value * Fraction(1 << -squared_scale)
+        )
+        numerator = scaled.numerator
+        denominator = scaled.denominator
+        floor_root = isqrt(numerator // denominator)
+        midpoint_comparison = (
+            4 * numerator
+            - denominator * (2 * floor_root + 1) ** 2
+        )
+        significand = floor_root
+        if midpoint_comparison > 0 or (
+            midpoint_comparison == 0 and floor_root % 2
+        ):
+            significand += 1
+        if significand == 1 << self.precision:
+            significand >>= 1
+            shift += 1
+        return (
+            Fraction(significand << shift)
+            if shift >= 0
+            else Fraction(significand, 1 << -shift)
+        )
+
+    def norm(self, values: Sequence[Fraction]) -> Fraction:
+        # These finite, two-column regression systems use Julia's unscaled
+        # generic_norm2 branch.  Its accumulator starts with the first square.
+        total = self.multiply(values[0], values[0])
+        for value in values[1:]:
+            total = self.add(total, self.multiply(value, value))
+        return self.sqrt(total)
+
+    def dot(self, left: Sequence[Fraction], right: Sequence[Fraction]) -> Fraction:
+        # Julia's generic dot starts from a typed zero and accumulates in
+        # iteration order.
+        total = Fraction(0)
+        for left_value, right_value in zip(left, right):
+            total = self.add(
+                total, self.multiply(left_value, right_value)
+            )
+        return total
+
+
+def _decimal_bigfloat_precision() -> int:
+    """Map Decimal significant digits to an equally capable binary precision."""
+
+    return max(2, ceil(getcontext().prec * log2(10)))
+
+
+def _bigfloat_reflector_inplace(
+    arithmetic: _BinaryBigFloat,
+    matrix: list[list[Fraction]],
+    column: int,
+    row: int,
+) -> Fraction:
+    """Apply Julia 1.11's generic ``reflector!`` storage convention."""
+
+    norm = arithmetic.norm(
+        [matrix[index][column] for index in range(row, len(matrix))]
+    )
     first = matrix[row][column]
     if norm == 0:
-        return Decimal(0)
-    signed_norm = norm.copy_sign(first)
-    leading = first + signed_norm
+        return Fraction(0)
+    signed_norm = norm if first >= 0 else -norm
+    leading = arithmetic.add(first, signed_norm)
     matrix[row][column] = -signed_norm
     for index in range(row + 1, len(matrix)):
-        matrix[index][column] /= leading
-    return leading / signed_norm
+        matrix[index][column] = arithmetic.divide(
+            matrix[index][column], leading
+        )
+    return arithmetic.divide(leading, signed_norm)
 
 
 def _decimal_linear_fit(
     xs: list[Decimal], ys: list[Decimal]
 ) -> tuple[Decimal, Decimal]:
-    """Two-column counterpart of Julia's BigFloat left-division algorithm."""
+    """Two-column counterpart of Julia 1.11's BigFloat left division."""
 
     rows = len(xs)
-    if rows == 2:
-        determinant = xs[0] - xs[1]
-        if determinant == 0:
-            raise np.linalg.LinAlgError(
-                "linearFit design matrix is singular at pivot 2"
-            )
-        # Solve [x₁ 1; x₂ 1] * [slope; intercept] by the same square-system
-        # contract as Julia's LU branch.
-        slope = (ys[0] - ys[1]) / determinant
-        intercept = ys[0] - xs[0] * slope
-        return slope, intercept
+    if not all(value.is_finite() for value in (*xs, *ys)):
+        # Julia's square BigFloat path checks the *matrix* for non-finite
+        # entries before generic LU, but does not reject a non-finite RHS.
+        # Rectangular generic QR instead propagates non-finite arithmetic to a
+        # pair of NaNs.  Decimal traps these operations by default, so model
+        # the two Julia branches explicitly.
+        if rows != 2:
+            nan = Decimal("NaN")
+            return nan, nan
+        if not all(value.is_finite() for value in xs):
+            raise ValueError("linearFit design matrix contains Infs or NaNs")
+
+        # This is Julia 1.11's two-by-two generic row-pivoted LU operation
+        # order, evaluated with Decimal's IEEE non-finite propagation enabled.
+        with localcontext() as context:
+            context.traps[InvalidOperation] = False
+            context.traps[DivisionByZero] = False
+            context.traps[Overflow] = False
+            # The generic backslash polyalgorithm recognizes an already
+            # upper-triangular two-column design before attempting LU.
+            if xs[1] == 0:
+                if xs[0] == 0:
+                    raise np.linalg.LinAlgError(
+                        "linearFit design matrix is singular at pivot 1"
+                    )
+                second = ys[1]
+                first = (ys[0] - second) / xs[0]
+                return first, second
+
+            matrix = [
+                [xs[0], Decimal(1)],
+                [xs[1], Decimal(1)],
+            ]
+            rhs = list(ys)
+            if abs(matrix[1][0]) > abs(matrix[0][0]):
+                matrix[0], matrix[1] = matrix[1], matrix[0]
+                rhs[0], rhs[1] = rhs[1], rhs[0]
+            if matrix[0][0] == 0:
+                raise np.linalg.LinAlgError(
+                    "linearFit design matrix is singular at pivot 1"
+                )
+            lower = matrix[1][0] * (Decimal(1) / matrix[0][0])
+            second_pivot = matrix[1][1] - lower * matrix[0][1]
+            if second_pivot == 0:
+                raise np.linalg.LinAlgError(
+                    "linearFit design matrix is singular at pivot 2"
+                )
+
+            # LinearAlgebra.ldiv! dynamically routes a numerically diagonal
+            # UnitLowerTriangular factor through its upper-triangular kernel.
+            # That kernel still evaluates the structural-zero product, which
+            # is observable for an infinite RHS (0*Inf -> NaN).
+            if lower == 0:
+                rhs[0] = rhs[0] - Decimal(0) * rhs[1]
+            else:
+                rhs[1] = rhs[1] - lower * rhs[0]
+            second = rhs[1] / second_pivot
+            first = (rhs[0] - matrix[0][1] * second) / matrix[0][0]
+            return first, second
+
+    arithmetic = _BinaryBigFloat(_decimal_bigfloat_precision())
+    x_values = [arithmetic.from_decimal(value) for value in xs]
+    y_values = [arithmetic.from_decimal(value) for value in ys]
 
     if rows == 0:
         return Decimal(0), Decimal(0)
-    if rows == 1:
-        # Julia's wide pivoted-QR solve returns the minimum-norm solution.
-        denominator = xs[0] * xs[0] + Decimal(1)
-        return xs[0] * ys[0] / denominator, ys[0] / denominator
 
-    # Julia 1.12's generic (non-BLAS) column-pivoted QR deliberately uses the
-    # unblocked reflector path and then triangular substitution. Reproducing
-    # that order matters for rank-deficient BigFloat-like inputs: replacing it
-    # with normal equations either raises too eagerly or invents a different
-    # minimum-norm result.
-    matrix = [[value, Decimal(1)] for value in xs]
+    if rows == 2:
+        # Square BigFloat designs use Julia's generic row-pivoted LU.  Preserve
+        # the separate inverse/multiply operations used by generic_lufact!,
+        # followed by its unit-lower and upper triangular substitutions.
+        matrix = [
+            [x_values[0], arithmetic.round(1)],
+            [x_values[1], arithmetic.round(1)],
+        ]
+        rhs = list(y_values)
+        if abs(matrix[1][0]) > abs(matrix[0][0]):
+            matrix[0], matrix[1] = matrix[1], matrix[0]
+            rhs[0], rhs[1] = rhs[1], rhs[0]
+        if matrix[0][0] == 0:
+            raise np.linalg.LinAlgError(
+                "linearFit design matrix is singular at pivot 1"
+            )
+        lower = arithmetic.multiply(
+            matrix[1][0], arithmetic.inverse(matrix[0][0])
+        )
+        matrix[1][0] = lower
+        matrix[1][1] = arithmetic.subtract(
+            matrix[1][1],
+            arithmetic.multiply(lower, matrix[0][1]),
+        )
+        if matrix[1][1] == 0:
+            raise np.linalg.LinAlgError(
+                "linearFit design matrix is singular at pivot 2"
+            )
+        rhs[1] = arithmetic.subtract(
+            rhs[1], arithmetic.multiply(lower, rhs[0])
+        )
+        second = arithmetic.divide(rhs[1], matrix[1][1])
+        first = arithmetic.divide(
+            arithmetic.subtract(
+                rhs[0], arithmetic.multiply(matrix[0][1], second)
+            ),
+            matrix[0][0],
+        )
+        return (
+            arithmetic.to_decimal(first),
+            arithmetic.to_decimal(second),
+        )
+
+    # Rectangular designs use Julia 1.11's generic unblocked, column-pivoted
+    # QR.  This intentionally does not estimate rank: an exactly dependent
+    # column can leave a one-ulp pivot whose division is observable.
+    matrix = [
+        [value, arithmetic.round(1)] for value in x_values
+    ]
     permutation = [0, 1]
-    taus: list[Decimal] = []
-    for column in range(2):
+    taus: list[Fraction] = []
+    for column in range(min(rows, 2)):
         norms = []
         for candidate in range(column, 2):
             norms.append(
-                sum(
-                    (
-                        matrix[row][candidate] * matrix[row][candidate]
+                arithmetic.norm(
+                    [
+                        matrix[row][candidate]
                         for row in range(column, rows)
-                    ),
-                    Decimal(0),
-                ).sqrt()
+                    ]
+                )
             )
         pivot = column + (1 if len(norms) == 2 and norms[1] > norms[0] else 0)
         if pivot != column:
@@ -474,44 +750,118 @@ def _decimal_linear_fit(
                     matrix[row][column],
                     matrix[row][pivot],
                 )
-        tau = _decimal_reflector_inplace(matrix, column, column)
+        tau = _bigfloat_reflector_inplace(
+            arithmetic, matrix, column, column
+        )
         taus.append(tau)
         for target_column in range(column + 1, 2):
-            projection = matrix[column][target_column]
+            projection = arithmetic.add(
+                matrix[column][target_column],
+                arithmetic.dot(
+                    [
+                        matrix[row][column]
+                        for row in range(column + 1, rows)
+                    ],
+                    [
+                        matrix[row][target_column]
+                        for row in range(column + 1, rows)
+                    ],
+                ),
+            )
+            projection = arithmetic.multiply(tau, projection)
+            matrix[column][target_column] = arithmetic.subtract(
+                matrix[column][target_column], projection
+            )
             for row in range(column + 1, rows):
-                projection += (
-                    matrix[row][column] * matrix[row][target_column]
-                )
-            projection *= tau
-            matrix[column][target_column] -= projection
-            for row in range(column + 1, rows):
-                matrix[row][target_column] -= (
-                    projection * matrix[row][column]
+                matrix[row][target_column] = arithmetic.subtract(
+                    matrix[row][target_column],
+                    arithmetic.multiply(
+                        projection, matrix[row][column]
+                    ),
                 )
 
-    transformed = list(ys)
+    transformed = list(y_values)
+    if rows < 2:
+        transformed.append(Fraction(0))
     for column, tau in enumerate(taus):
-        projection = transformed[column]
-        for row in range(column + 1, rows):
-            projection += matrix[row][column] * transformed[row]
-        projection *= tau
-        transformed[column] -= projection
-        for row in range(column + 1, rows):
-            transformed[row] -= projection * matrix[row][column]
-
-    if matrix[1][1] == 0:
-        raise np.linalg.LinAlgError(
-            "linearFit design matrix is singular at pivot 2"
+        projection = arithmetic.add(
+            transformed[column],
+            arithmetic.dot(
+                [
+                    matrix[row][column]
+                    for row in range(column + 1, rows)
+                ],
+                [
+                    transformed[row]
+                    for row in range(column + 1, rows)
+                ],
+            ),
         )
-    second = transformed[1] / matrix[1][1]
-    first = (
-        transformed[0] - matrix[0][1] * second
-    ) / matrix[0][0]
-    solution = [first, second]
+        projection = arithmetic.multiply(tau, projection)
+        transformed[column] = arithmetic.subtract(
+            transformed[column], projection
+        )
+        for row in range(column + 1, rows):
+            transformed[row] = arithmetic.subtract(
+                transformed[row],
+                arithmetic.multiply(matrix[row][column], projection),
+            )
+
+    if rows == 1:
+        # Julia's _wide_qr_ldiv! converts the 1×2 trapezoid to triangular
+        # form with a second reflector, solves the leading system, pads with
+        # zero, and then applies that reflector to the minimum-norm solution.
+        wide_matrix = [[matrix[0][0], matrix[0][1]]]
+        wide_norm = arithmetic.norm(wide_matrix[0])
+        wide_first = wide_matrix[0][0]
+        wide_signed_norm = (
+            wide_norm if wide_first >= 0 else -wide_norm
+        )
+        wide_leading = arithmetic.add(
+            wide_first, wide_signed_norm
+        )
+        wide_matrix[0][0] = -wide_signed_norm
+        wide_matrix[0][1] = arithmetic.divide(
+            wide_matrix[0][1], wide_leading
+        )
+        wide_tau = arithmetic.divide(
+            wide_leading, wide_signed_norm
+        )
+        transformed[0] = arithmetic.divide(
+            transformed[0], wide_matrix[0][0]
+        )
+        transformed[1] = Fraction(0)
+        projection = arithmetic.multiply(wide_tau, transformed[0])
+        transformed[0] = arithmetic.subtract(
+            transformed[0], projection
+        )
+        transformed[1] = arithmetic.subtract(
+            transformed[1],
+            arithmetic.multiply(wide_matrix[0][1], projection),
+        )
+        solution = transformed
+    else:
+        if matrix[1][1] == 0:
+            raise np.linalg.LinAlgError(
+                "linearFit design matrix is singular at pivot 2"
+            )
+        second = arithmetic.divide(transformed[1], matrix[1][1])
+        first = arithmetic.divide(
+            arithmetic.subtract(
+                transformed[0],
+                arithmetic.multiply(matrix[0][1], second),
+            ),
+            matrix[0][0],
+        )
+        solution = [first, second]
+
     inverse = [0, 0]
     for index, original in enumerate(permutation):
         inverse[original] = index
-    return solution[inverse[0]], solution[inverse[1]]
+    return (
+        arithmetic.to_decimal(solution[inverse[0]]),
+        arithmetic.to_decimal(solution[inverse[1]]),
+    )
 
 
 def _decimal_atan(value: Decimal) -> Decimal:
@@ -610,8 +960,11 @@ def getOrientation(
     centers = _julia_literal_array(
         [value for row in center_rows for value in row]
     ).reshape((len(center_rows), center_width))
-    xs, xi = linearFit(idxs, centers[:, 0])
-    ys, yi = linearFit(idxs, centers[:, 1])
+    # Julia's ordinary ``cs[:, i]`` indexing allocates a concrete Vector;
+    # NumPy returns a strided view for the analogous column selection.
+    # Materialize here before entering linearFit's concrete-Vector boundary.
+    xs, xi = linearFit(idxs, centers[:, 0].copy())
+    ys, yi = linearFit(idxs, centers[:, 1].copy())
     if isinstance(xs, Decimal) or isinstance(ys, Decimal):
         theta = _decimal_atan2(ys, xs)
         return np.asarray([xi, yi], dtype=object), theta

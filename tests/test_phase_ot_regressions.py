@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from fractions import Fraction
 import unittest
 import warnings
 
@@ -315,6 +316,81 @@ class HomogeneousDispatchTests(unittest.TestCase):
 
 
 class OptimalTransportContractTests(unittest.TestCase):
+    def test_concrete_array_ot_helpers_reject_strided_subarray_views(
+        self,
+    ) -> None:
+        dense = np.full((2, 2), 0.25, dtype=np.float64)
+        strided = np.full((2, 4), 0.25, dtype=np.float64)[:, ::2]
+        transform = np.ones((2, 2), dtype=np.complex128)
+        strided_transform = np.ones(
+            (2, 4), dtype=np.complex128
+        )[:, ::2]
+
+        for position in range(6):
+            arguments = [
+                dense.copy(),
+                dense.copy(),
+                dense.copy(),
+                dense.copy(),
+                transform.copy(),
+                transform.copy(),
+            ]
+            arguments[position] = (
+                strided_transform
+                if position >= 4
+                else strided
+            )
+            with self.assertRaisesRegex(
+                TypeError, "dense contiguous"
+            ):
+                getattr(slm, "SinkhornIterBase!")(*arguments)
+
+        for source, target in (
+            (strided, dense),
+            (dense, strided),
+        ):
+            with self.assertRaisesRegex(
+                TypeError, "dense contiguous"
+            ):
+                slm.SinkhornConvN(source, target, 0.2, 0)
+
+        lattice = slm.natlat((2, 2))
+        for u, v, source in (
+            (strided, dense, dense),
+            (dense, strided, dense),
+            (dense, dense, strided),
+        ):
+            with self.assertRaisesRegex(
+                TypeError, "dense contiguous"
+            ):
+                slm.dualToGradients(u, v, source, lattice, 0.2)
+
+        field = slm.LF[slm.Intensity](dense, lattice)
+        beta_view = np.arange(4.0)[::2]
+        for helper in (slm.pdotPhase, slm.pdotBeamEstimate):
+            with self.assertRaisesRegex(
+                TypeError, "dense contiguous"
+            ):
+                helper(
+                    field,
+                    field,
+                    1.0,
+                    0.0,
+                    beta_view,
+                    np.zeros(2),
+                    0.2,
+                )
+
+        # A contiguous reshape is the Python counterpart of
+        # reshape(::Array), even though NumPy records a non-owning base.
+        reshaped = np.full(4, 0.25).reshape(2, 2)
+        u, v, loss = slm.SinkhornConvN(
+            reshaped, reshaped.copy(), 0.2, 0
+        )
+        self.assertEqual(u.shape, (2, 2))
+        self.assertEqual(v.shape, (2, 2))
+        self.assertEqual(loss, [])
+
     def test_sinkhorn_mutating_helper_returns_u_identity(self) -> None:
         source = np.asarray([[0.2, 0.3], [0.1, 0.4]])
         target = np.asarray([[0.1, 0.4], [0.2, 0.3]])
@@ -335,6 +411,31 @@ class OptimalTransportContractTests(unittest.TestCase):
             self.assertAlmostEqual(float(np.sum(u)), 1.0)
             self.assertAlmostEqual(float(np.sum(v)), 1.0)
         self.assertFalse(hasattr(slm, "SinkhornIterBase"))
+
+    def test_sinkhorn_mutating_helper_preserves_rational_domain_across_calls(
+        self,
+    ) -> None:
+        source = np.asarray(
+            [Fraction(1, 2), Fraction(1, 2)], dtype=object
+        )
+        target = source.copy()
+        u = source.copy()
+        v = source.copy()
+        transform = np.ones(2, dtype=np.complex128)
+
+        for _ in range(2):
+            returned = getattr(slm, "SinkhornIterBase!")(
+                u, v, source, target, transform, transform
+            )
+            self.assertIs(returned, u)
+            self.assertTrue(
+                all(isinstance(value, Fraction) for value in u)
+            )
+            self.assertTrue(
+                all(isinstance(value, Fraction) for value in v)
+            )
+            np.testing.assert_equal(u, source)
+            np.testing.assert_equal(v, target)
 
     def test_sinkhorn_mutating_helper_requires_matching_scaling_types(self) -> None:
         source = np.full((2, 2), 0.25, dtype=np.float32)
@@ -524,7 +625,7 @@ class OptimalTransportContractTests(unittest.TestCase):
         target = slm.LF[slm.Intensity](np.ones((2, 2)), lattice)
 
         negative = slm.otPhase2(source, target, -0.2, 0)
-        # Live Julia 1.12.6/locked-project result.  These values depend on
+        # Exact Julia 1.11.6/locked-project result. These values depend on
         # natrange(2)'s TwicePrecision coordinates, not merely ±sqrt(1/2).
         np.testing.assert_allclose(
             negative.data,
@@ -635,7 +736,9 @@ class OptimalTransportContractTests(unittest.TestCase):
         )
         self.assertIs(result.field_type, slm.RealPhase)
         self.assertTrue(np.iscomplexobj(result.data))
-        np.testing.assert_allclose(result.data, expected, rtol=3e-15, atol=3e-15)
+        np.testing.assert_allclose(
+            result.data.copy(), expected, rtol=3e-15, atol=3e-15
+        )
 
     def test_otphase2_iteration_division_exposes_tiny_kernel_failure(self) -> None:
         lattice = slm.natlat((2, 2))
@@ -712,7 +815,7 @@ class OptimalTransportContractTests(unittest.TestCase):
     def test_sinkhorn_every_uses_julia_integer_and_modulo_semantics(self) -> None:
         source = np.arange(1, 10, dtype=float).reshape(3, 3)
         source /= np.sum(source)
-        target = np.flip(source)
+        target = np.flip(source).copy()
 
         _, _, empty = slm.SinkhornConvN(
             source, target, 0.2, 0, every=0
@@ -764,7 +867,7 @@ class OptimalTransportContractTests(unittest.TestCase):
         # misses SinkhornIterBase!'s same-type dispatch on the first update.
         source = np.arange(1, 10, dtype=np.float32).reshape(3, 3, order="F")
         source /= np.sum(source)
-        target = np.flip(source)
+        target = np.flip(source).copy()
         with self.assertRaisesRegex(TypeError, "same Julia element type"):
             slm.SinkhornConvN(source, target, 0.2, 2, every=1)
 

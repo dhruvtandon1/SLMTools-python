@@ -2,20 +2,350 @@ from __future__ import annotations
 
 from decimal import Decimal, localcontext
 from fractions import Fraction
+from pathlib import Path
+import tomllib
 
 import numpy as np
 from PIL import Image
 import pytest
 
 import slmtools as slm
+from slmtools._bigfloat import _MPFR, _to_mpfr
 from slmtools.lattice_utils import _step
 from slmtools.subimages import (
+    arrange as subimage_arrange,
+    imageToHeatmap,
+    mergeStrict as subimage_merge_strict,
     padadd as subimage_padadd,
     padmultiple as subimage_padmultiple,
     padout as subimage_padout,
     plotToImage,
     trimWhitespace,
 )
+
+
+def test_concrete_array_bindings_reject_strided_non_ot_views() -> None:
+    dense_image = np.arange(1.0, 10.0).reshape(3, 3)
+    assert not dense_image.flags.owndata
+    assert dense_image.flags.c_contiguous
+    fortran_image = np.asfortranarray(dense_image)
+    strided_image = np.arange(1.0, 19.0).reshape(3, 6)[:, ::2]
+    assert not strided_image.flags.c_contiguous
+    assert not strided_image.flags.f_contiguous
+
+    # A reshape view and Fortran-contiguous storage both map concrete Julia
+    # Array. A stepped view maps SubArray and has no matching method.
+    assert slm.padout(dense_image, 1).shape == (5, 5)
+    np.testing.assert_allclose(
+        slm.centroid(fortran_image), [2.4, 2.1333333333333333]
+    )
+    assert slm.window(dense_image, 1)[0].shape == (1, 1)
+    for call in (
+        lambda: slm.padout(strided_image, 1),
+        lambda: slm.centroid(strided_image),
+        lambda: slm.window(strided_image, 1),
+    ):
+        with pytest.raises(TypeError, match="C- or Fortran-contiguous"):
+            call()
+
+    lattice = slm.natlat(2, 2)
+    dense_guess = np.asfortranarray(
+        np.ones((2, 2), dtype=np.complex128)
+    )
+    dense_real = np.asfortranarray(np.ones((2, 2), dtype=np.float64))
+    assert slm.gsIter(dense_guess, dense_real, dense_real).shape == (2, 2)
+    assert slm.pdgsIter(
+        dense_guess, (dense_guess,), (dense_real,)
+    ).shape == (2, 2)
+
+    strided_guess = np.ones((2, 4), dtype=np.complex128)[:, ::2]
+    strided_real = np.ones((2, 4), dtype=np.float64)[:, ::2]
+    for arguments in (
+        (strided_guess, dense_real, dense_real),
+        (dense_guess, strided_real, dense_real),
+        (dense_guess, dense_real, strided_real),
+    ):
+        with pytest.raises(TypeError, match="C- or Fortran-contiguous"):
+            slm.gsIter(*arguments)
+    for guess, phases, moduli in (
+        (strided_guess, (dense_guess,), (dense_real,)),
+        (dense_guess, (strided_guess,), (dense_real,)),
+        (dense_guess, (dense_guess,), (strided_real,)),
+    ):
+        with pytest.raises(TypeError, match="C- or Fortran-contiguous"):
+            slm.pdgsIter(guess, phases, moduli)
+
+    with pytest.raises(TypeError, match="C- or Fortran-contiguous"):
+        slm.lfStandardOutputFormat(
+            slm.RealPhase,
+            strided_real,
+            lattice,
+            1.0,
+        )
+    standard = slm.lfStandardOutputFormat(
+        slm.RealPhase,
+        np.asfortranarray(np.ones((2, 2))),
+        lattice,
+        1.0,
+    )
+    assert standard.shape == (2, 2)
+
+
+def test_concrete_vector_bindings_keep_literals_and_reject_strided_views() -> None:
+    contiguous = np.arange(3.0).reshape(3, 1).reshape(3)
+    assert not contiguous.flags.owndata
+    assert contiguous.flags.c_contiguous
+    strided = np.arange(6.0)[::2]
+    assert not strided.flags.c_contiguous
+    assert not strided.flags.f_contiguous
+
+    assert slm.linearFit(contiguous, [1.0, 3.0, 5.0]) == pytest.approx(
+        (2.0, 1.0)
+    )
+    with pytest.raises(TypeError, match="C- or Fortran-contiguous"):
+        slm.linearFit(strided, [1.0, 3.0, 5.0])
+    with pytest.raises(TypeError, match="C- or Fortran-contiguous"):
+        slm.linearFit([0.0, 1.0, 2.0], strided)
+
+    assert slm.wigner_fft([1.0, 0.0]).shape == (2, 4)
+    assert slm.wigner_fft(contiguous).shape == (3, 6)
+    with pytest.raises(TypeError, match="C- or Fortran-contiguous"):
+        slm.wigner_fft(strided)
+
+    lattice = slm.natlat(2, 2)
+    np.testing.assert_array_equal(
+        slm.ldot([1.0, 2.0], lattice),
+        slm.ldot((1.0, 2.0), lattice),
+    )
+    assert slm.ldot(contiguous[:2].copy(), lattice).shape == (2, 2)
+    with pytest.raises(TypeError, match="C- or Fortran-contiguous"):
+        slm.ldot(np.arange(4.0)[::2], lattice)
+    with pytest.raises(TypeError, match="list, dense NumPy vector, or real tuple"):
+        slm.ldot(range(2), lattice)
+
+
+def test_exact_julia_111_unavailable_integer_range_boundaries() -> None:
+    int64 = np.iinfo(np.int64)
+    unavailable: list[tuple[np.int64, object]] = [
+        (np.int64(int64.min), np.bool_(True)),
+        (np.int64(int64.min), np.int8(1)),
+        (np.int64(int64.min), np.uint8(1)),
+        (np.int64(int64.min), np.uint8(np.iinfo(np.uint8).max)),
+        (np.int64(int64.min), np.int16(1)),
+        (np.int64(int64.min), np.uint16(1)),
+        (np.int64(int64.min), np.uint16(np.iinfo(np.uint16).max)),
+        (np.int64(int64.min), np.int32(1)),
+        (np.int64(int64.min), np.uint32(1)),
+        (np.int64(int64.min), np.uint32(np.iinfo(np.uint32).max)),
+        (np.int64(int64.min), np.int64(1)),
+        (
+            np.int64(int64.min + 1),
+            np.uint8(np.iinfo(np.uint8).max),
+        ),
+        (
+            np.int64(int64.min + 1),
+            np.uint16(np.iinfo(np.uint16).max),
+        ),
+        (
+            np.int64(int64.min + 1),
+            np.uint32(np.iinfo(np.uint32).max),
+        ),
+    ]
+    for start in (np.int64(int64.max - 1), np.int64(int64.max)):
+        unavailable.extend(
+            (
+                (start, np.int8(np.iinfo(np.int8).min)),
+                (start, np.int16(np.iinfo(np.int16).min)),
+                (start, np.int32(np.iinfo(np.int32).min)),
+            )
+        )
+
+    # Bool's one and typemax entries are identical, so these 20 distinct
+    # typed scalar calls account for 21 rows in the 3,888-case matrix.
+    assert len(unavailable) == 20
+    for start, step in unavailable:
+        with pytest.raises(
+            NotImplementedError,
+            match=r"exact Julia 1\.11\.6",
+        ):
+            slm.LatticeAxis.from_start_step(start, step, 0)
+
+    # Adjacent audited matrix entries remain available.
+    assert len(
+        slm.LatticeAxis.from_start_step(
+            np.int64(int64.min + 1), np.uint8(1), 0
+        )
+    ) == 0
+    assert len(
+        slm.LatticeAxis.from_start_step(
+            np.int64(int64.max - 1), np.int8(1), 0
+        )
+    ) == 0
+    assert len(
+        slm.LatticeAxis.from_start_step(
+            np.int64(int64.min), np.uint64(1), 0
+        )
+    ) == 0
+    assert len(
+        slm.LatticeAxis.from_start_step(
+            np.int64(int64.min), np.bool_(True), 1
+        )
+    ) == 1
+
+
+def test_exact_julia_111_lazy_integer_range_representation_limits() -> None:
+    int64_minimum = np.iinfo(np.int64).min
+    for start in (
+        np.int64(int64_minimum),
+        np.int64(int64_minimum + 1),
+    ):
+        for step_type in (np.int8, np.int16, np.int32):
+            with pytest.raises(MemoryError):
+                slm.LatticeAxis.from_start_step(
+                    start,
+                    step_type(np.iinfo(step_type).max),
+                    0,
+                )
+
+
+def test_julia_reducedim_tree_order_and_empty_orientations() -> None:
+    authorities = {
+        np.float32: {
+            8: 4,
+            15: 8,
+            16: 0,
+            17: 9,
+            18: 0,
+            32: 22,
+        },
+        np.float64: {
+            8: 0,
+            15: 11,
+            16: 0,
+            17: 7,
+            18: 8,
+            32: 6,
+        },
+    }
+    for dtype, expected_by_length in authorities.items():
+        large = dtype(1e20 if dtype is np.float32 else 1e300)
+        for length, expected in expected_by_length.items():
+            values = np.ones((length, 1), dtype=dtype, order="F")
+            values[0, 0] = large
+            values[length // 2 - 1, 0] = -large
+            np.testing.assert_array_equal(
+                slm.collapse(values, 2),
+                np.asarray([expected], dtype=dtype),
+            )
+
+    nonleading = np.ones((1, 16), dtype=np.float64, order="F")
+    nonleading[0, 0] = 1e300
+    nonleading[0, 7] = -1e300
+    np.testing.assert_array_equal(slm.collapse(nonleading, 1), [8.0])
+
+    np.testing.assert_array_equal(
+        slm.collapse(np.empty((0, 3)), 1), np.empty(0)
+    )
+    np.testing.assert_array_equal(
+        slm.collapse(np.empty((0, 3)), 2), np.zeros(3)
+    )
+    np.testing.assert_array_equal(
+        slm.collapse(np.empty((3, 0)), 1), np.zeros(3)
+    )
+    np.testing.assert_array_equal(
+        slm.collapse(np.empty((3, 0)), 2), np.empty(0)
+    )
+    np.testing.assert_array_equal(
+        slm.collapse(np.empty((0, 3)), 3), [0.0]
+    )
+
+    maximum = int(np.iinfo(np.int64).max)
+    rational = np.asarray(
+        [Fraction(maximum, 1), Fraction(1, 1)], dtype=object
+    )
+    with pytest.raises(OverflowError):
+        slm.collapse(rational, 0)
+    decimal = np.asarray(
+        [Decimal("Infinity"), Decimal("-Infinity")], dtype=object
+    )
+    assert slm.collapse(decimal, 0)[0].is_nan()
+
+
+def test_optional_subimages_concrete_arrays_reject_strided_views() -> None:
+    image = np.asfortranarray(
+        np.asarray(
+            [
+                [1.0, 1.0, 1.0],
+                [1.0, 0.0, 1.0],
+                [1.0, 1.0, 1.0],
+            ]
+        )
+    )
+    strided = np.ones((3, 6))[:, ::2]
+    assert subimage_padout(image, (5, 5)).shape == (5, 5)
+    assert subimage_padadd(image, 1, "left").shape == (3, 4)
+    assert subimage_padmultiple(image, padleft=1).shape == (3, 4)
+    assert trimWhitespace(image).shape == (1, 1)
+
+    for call in (
+        lambda: subimage_padout(strided, (5, 5)),
+        lambda: subimage_padadd(strided, 1, "left"),
+        lambda: subimage_padmultiple(strided, padleft=1),
+        lambda: trimWhitespace(strided),
+        lambda: imageToHeatmap(strided),
+        lambda: subimage_arrange((1, 1), strided),
+    ):
+        with pytest.raises(TypeError, match="C- or Fortran-contiguous"):
+            call()
+
+    storage = np.empty(4, dtype=object)
+    for index in range(4):
+        storage[index] = np.ones((2, 2))
+    object_subarray = storage[::2]
+    assert not object_subarray.flags.c_contiguous
+    assert subimage_merge_strict(storage[:2].copy()).shape == (4, 2)
+    with pytest.raises(TypeError, match="C- or Fortran-contiguous"):
+        subimage_merge_strict(object_subarray)
+
+
+def test_publication_metadata_has_tested_minimums_and_matching_version() -> None:
+    root = Path(__file__).resolve().parents[1]
+    project = tomllib.loads((root / "pyproject.toml").read_text())
+
+    assert project["project"]["version"] == slm.__version__
+    assert project["project"]["requires-python"] == ">=3.12"
+    assert project["build-system"]["requires"] == ["setuptools>=83.0.0"]
+    assert project["project"]["dependencies"] == [
+        "gmpy2>=2.3.1",
+        "numpy>=2.5.1",
+        "Pillow>=12.3.0",
+        "pyFFTW>=0.15.1",
+    ]
+    assert project["project"]["optional-dependencies"] == {
+        "test": ["pytest>=9.1.1"],
+        "plot": ["matplotlib>=3.11.1"],
+    }
+
+    lock = {
+        line.strip()
+        for line in (
+            root / "requirements-validation.txt"
+        ).read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    assert {
+        "gmpy2==2.3.1",
+        "numpy==2.5.1",
+        "Pillow==12.3.0",
+        "pyFFTW==0.15.1",
+        "matplotlib==3.11.1",
+        "pytest==9.1.1",
+        "pip==26.1.2",
+        "setuptools==83.0.0",
+        "build==1.5.0",
+        "wheel==0.47.0",
+        "twine==6.2.0",
+    } <= lock
 
 
 class _PngPlot:
@@ -330,7 +660,7 @@ def test_assignment_requires_platform_int_and_getindex_rejects_vectors() -> None
     ):
         with pytest.raises(TypeError):
             field[key] = 9
-    np.testing.assert_array_equal(field.data, original)
+    np.testing.assert_array_equal(field.data.copy(), original)
 
     for selector in ([0, 1], np.asarray([0, 1], dtype=np.int64)):
         with pytest.raises(TypeError, match="no vector-index method"):
@@ -657,7 +987,9 @@ def test_dualate_promotes_heterogeneous_axis_queries_without_downcast() -> None:
         ]
     )
     assert result.dtype == np.dtype(np.float64)
-    np.testing.assert_allclose(result.data, expected, rtol=0, atol=1e-8)
+    np.testing.assert_allclose(
+        result.data.copy(), expected, rtol=0, atol=1e-8
+    )
     assert result.L[0].dtype == np.dtype(np.float32)
     assert result.L[1].dtype == np.dtype(np.float64)
 
@@ -682,7 +1014,9 @@ def test_dualate_scalar_interpolator_collects_before_dtype_selection() -> None:
         0.0,
         interpolation=scalar_factory,
     )
-    np.testing.assert_array_equal(result.data, [[0.0, 0.0], [0.5, 0.5]])
+    np.testing.assert_array_equal(
+        result.data.copy(), [[0.0, 0.0], [0.5, 0.5]]
+    )
 
 
 @pytest.mark.parametrize(
@@ -733,7 +1067,7 @@ def test_dualate_uses_julia_integer_rational_trig_promotion(
     )
 
     assert result.dtype == np.dtype(np.float64)
-    np.testing.assert_array_equal(result.data, expected)
+    np.testing.assert_array_equal(result.data.copy(), expected)
 
 
 def test_dualate_default_boundary_uses_concrete_object_zero() -> None:
@@ -1022,11 +1356,11 @@ def test_template_rational_and_bigfloat_counterparts_match_julia() -> None:
             Decimal.from_float(0.4),
         )
         assert complex_template.dtype == np.dtype(object)
-        assert complex_template.data[1].real == Decimal(1)
-        assert complex_template.data[1].imag == Decimal(0)
+        assert complex_template.data[1].real == _to_mpfr(Decimal(1))
+        assert complex_template.data[1].imag == _to_mpfr(Decimal(0))
         assert all(
-            isinstance(value.real, Decimal)
-            and isinstance(value.imag, Decimal)
+            isinstance(value.real, _MPFR)
+            and isinstance(value.imag, _MPFR)
             for value in complex_template.data.flat
         )
 
@@ -1168,11 +1502,52 @@ def test_field_add_and_multiply_chains_match_julia_binary_parenthesization() -> 
         np.testing.assert_array_equal(field.data, before)
 
 
-def test_no_julia_vararg_arithmetic_helpers_are_exposed() -> None:
+def test_python_field_arithmetic_is_an_eager_binary_left_fold() -> None:
+    lattice = (range(1),)
+    intensities = (
+        slm.LF[slm.Intensity, np.float64, 1](
+            np.asarray([-10.0]), lattice
+        ),
+        slm.LF[slm.Intensity, np.float64, 1](
+            np.asarray([5.0]), lattice
+        ),
+        slm.LF[slm.Intensity, np.float64, 1](
+            np.asarray([6.0]), lattice
+        ),
+    )
+
+    # Compare against Julia's explicitly parenthesized binary expression:
+    # ``(a + b) + c`` clips the visible first intermediate before adding c.
+    chained = intensities[0] + intensities[1] + intensities[2]
+    parenthesized = (intensities[0] + intensities[1]) + intensities[2]
+    np.testing.assert_array_equal(chained.data, [6.0])
+    np.testing.assert_array_equal(chained.data, parenthesized.data)
+
+    phases = tuple(
+        slm.LF[slm.RealPhase](np.asarray([value]), lattice)
+        for value in (0.1, 0.2, 0.3)
+    )
+    phase_chain = phases[0] + phases[1] + phases[2]
+    phase_parenthesized = (phases[0] + phases[1]) + phases[2]
+    np.testing.assert_array_equal(
+        phase_chain.data, phase_parenthesized.data
+    )
+
+    modulus = slm.LF[slm.Modulus](np.asarray([2.0]), lattice)
+    real_phase = slm.LF[slm.RealPhase](np.asarray([0.25]), lattice)
+    complex_phase = slm.LF[slm.ComplexPhase](
+        np.asarray([1.0j]), lattice
+    )
+    binary = modulus * real_phase
+    assert binary.field_type is slm.ComplexAmplitude
+    chained_product = modulus * real_phase * complex_phase
+    parenthesized_product = (modulus * real_phase) * complex_phase
+    np.testing.assert_array_equal(
+        chained_product.data, parenthesized_product.data
+    )
+
     assert not hasattr(slm, "julia_add")
     assert not hasattr(slm, "julia_mul")
-    assert "julia_add" not in slm.__all__
-    assert "julia_mul" not in slm.__all__
 
 
 def test_centroid_and_schroff_error_match_julia_dispatch_boundaries() -> None:

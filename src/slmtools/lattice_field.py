@@ -16,14 +16,172 @@ the bracket constructor preserves that behavior.
 
 from __future__ import annotations
 
+import inspect
 import math
+import os
 from dataclasses import dataclass
-from decimal import Decimal, getcontext, localcontext
+from decimal import (
+    Decimal,
+    DivisionByZero,
+    InvalidOperation,
+    Overflow as DecimalOverflow,
+    getcontext,
+    localcontext,
+)
 from fractions import Fraction
 from numbers import Complex, Integral, Real
 from typing import Any, Iterator, TypeAlias
+import weakref
 
+import gmpy2
 import numpy as np
+
+from ._bigfloat import (
+    _MPFR,
+    _MPFRComplex as _DecimalComplex,
+    _bigfloat_context,
+    _is_bigfloat_input,
+    _is_mpfr,
+    _mpfr_object_operation,
+    _mpfr_pi,
+    _mpfr_sincos,
+    _mpfr_sqrt,
+    _to_mpfr,
+    _to_mpfr_array,
+)
+
+_NUMPY_NO_VALUE = object()
+_NDARRAY_OUT_POSITION_CACHE: dict[str, int | None] = {}
+_NDARRAY_OUT_POSITION_FALLBACK: dict[str, int] = {
+    "all": 1,
+    "any": 1,
+    "argmax": 1,
+    "argmin": 1,
+    "choose": 1,
+    "clip": 2,
+    "compress": 2,
+    "cumprod": 2,
+    "cumsum": 2,
+    "dot": 1,
+    "max": 1,
+    "mean": 2,
+    "min": 1,
+    "prod": 2,
+    "ptp": 1,
+    "round": 1,
+    "std": 2,
+    "sum": 2,
+    "take": 2,
+    "trace": 4,
+    "var": 2,
+}
+_ARRAY_FUNCTION_OUT_POSITION_CACHE: dict[Any, int | None] = {}
+_ARRAY_FUNCTION_OUT_POSITION_FALLBACK: dict[Any, int] = {
+    np.all: 2,
+    np.amax: 2,
+    np.amin: 2,
+    np.any: 2,
+    np.argmax: 2,
+    np.argmin: 2,
+    np.around: 2,
+    np.choose: 2,
+    np.concatenate: 2,
+    np.concat: 2,
+    np.clip: 3,
+    np.compress: 3,
+    np.cumprod: 3,
+    np.cumsum: 3,
+    np.dot: 2,
+    np.max: 2,
+    np.median: 2,
+    np.mean: 3,
+    np.min: 2,
+    np.nanmax: 2,
+    np.nanmean: 3,
+    np.nanmedian: 2,
+    np.nanmin: 2,
+    np.nanpercentile: 3,
+    np.nanprod: 3,
+    np.nanquantile: 3,
+    np.nanstd: 3,
+    np.nansum: 3,
+    np.nanvar: 3,
+    np.percentile: 3,
+    np.prod: 3,
+    np.ptp: 2,
+    np.quantile: 3,
+    np.round: 2,
+    np.stack: 2,
+    np.std: 3,
+    np.sum: 3,
+    np.take: 3,
+    np.trace: 5,
+    np.var: 3,
+}
+
+
+def _ndarray_method_out_position(name: str) -> int | None:
+    """Return ``out``'s positional index after ``self`` for an ndarray method."""
+
+    if name in _NDARRAY_OUT_POSITION_CACHE:
+        return _NDARRAY_OUT_POSITION_CACHE[name]
+    position: int | None = None
+    try:
+        parameters = tuple(
+            inspect.signature(getattr(np.ndarray, name)).parameters.values()
+        )
+    except (TypeError, ValueError):
+        parameters = ()
+    user_position = 0
+    for parameter in parameters:
+        if parameter.name == "self":
+            continue
+        if parameter.name == "out":
+            if parameter.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ):
+                position = user_position
+            break
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            user_position += 1
+    if position is None:
+        position = _NDARRAY_OUT_POSITION_FALLBACK.get(name)
+    _NDARRAY_OUT_POSITION_CACHE[name] = position
+    return position
+
+
+def _array_function_out_position(function: Any) -> int | None:
+    """Return a NumPy function's positional ``out`` index."""
+
+    if function in _ARRAY_FUNCTION_OUT_POSITION_CACHE:
+        return _ARRAY_FUNCTION_OUT_POSITION_CACHE[function]
+    position: int | None = None
+    try:
+        parameters = tuple(inspect.signature(function).parameters.values())
+    except (TypeError, ValueError):
+        parameters = ()
+    positional_index = 0
+    for parameter in parameters:
+        if parameter.name == "out":
+            if parameter.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ):
+                position = positional_index
+            break
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional_index += 1
+    if position is None:
+        position = _ARRAY_FUNCTION_OUT_POSITION_FALLBACK.get(function)
+    _ARRAY_FUNCTION_OUT_POSITION_CACHE[function] = position
+    return position
 
 
 class DimensionMismatch(ValueError):
@@ -32,6 +190,43 @@ class DimensionMismatch(ValueError):
 
 class DomainError(ValueError):
     """Python counterpart of Julia's ``DomainError``."""
+
+
+def _is_dense_ndarray(value: Any) -> bool:
+    """Return whether *value* maps to a concrete Julia ``Array``.
+
+    C- and Fortran-contiguous NumPy arrays both own or address one dense
+    strided memory block, so either is the Python counterpart of Julia's
+    concrete ``Array``.  A non-contiguous view instead corresponds to an
+    ``AbstractArray`` wrapper such as ``SubArray`` and must not satisfy
+    methods declared specifically for ``Array``/``Vector``.
+    """
+
+    if not isinstance(value, np.ndarray):
+        return False
+    array = (
+        value._storage()
+        if isinstance(value, _CheckedFieldArray)
+        else value
+    )
+    return bool(array.flags.c_contiguous or array.flags.f_contiguous)
+
+
+def _require_dense_ndarray(value: Any, name: str) -> np.ndarray:
+    """Validate and return a concrete-``Array`` Python argument."""
+
+    if not isinstance(value, np.ndarray):
+        raise TypeError(f"{name} must be a dense NumPy array")
+    if not _is_dense_ndarray(value):
+        raise TypeError(
+            f"{name} must be C- or Fortran-contiguous; non-contiguous "
+            "views correspond to Julia SubArray, not Array"
+        )
+    return (
+        value._storage()
+        if isinstance(value, _CheckedFieldArray)
+        else np.asarray(value)
+    )
 
 
 class FieldVal:
@@ -82,100 +277,6 @@ class ComplexAmplitude(Amplitude):
 
 
 ComplexAmp = ComplexAmplitude
-
-
-@dataclass(frozen=True, slots=True)
-class _DecimalComplex:
-    """Small object-number counterpart of Julia ``Complex{BigFloat}``."""
-
-    real: Decimal
-    imag: Decimal = Decimal(0)
-
-    @staticmethod
-    def _coerce(value: Any) -> "_DecimalComplex" | Any:
-        if isinstance(value, _DecimalComplex):
-            return value
-        if isinstance(value, Decimal):
-            return _DecimalComplex(value)
-        if isinstance(value, Fraction):
-            return _DecimalComplex(
-                Decimal(value.numerator) / Decimal(value.denominator)
-            )
-        if isinstance(value, (bool, int, np.integer)):
-            return _DecimalComplex(Decimal(int(value)))
-        if isinstance(value, (float, np.floating)):
-            return _DecimalComplex(Decimal.from_float(float(value)))
-        if isinstance(value, (complex, np.complexfloating)):
-            scalar = complex(value)
-            return _DecimalComplex(
-                Decimal.from_float(scalar.real),
-                Decimal.from_float(scalar.imag),
-            )
-        return NotImplemented
-
-    def __complex__(self) -> complex:
-        return complex(float(self.real), float(self.imag))
-
-    def __abs__(self) -> Decimal:
-        return (self.real * self.real + self.imag * self.imag).sqrt()
-
-    def conjugate(self) -> "_DecimalComplex":
-        return _DecimalComplex(self.real, -self.imag)
-
-    def __neg__(self) -> "_DecimalComplex":
-        return _DecimalComplex(-self.real, -self.imag)
-
-    def __add__(self, other: Any) -> "_DecimalComplex" | Any:
-        converted = self._coerce(other)
-        if converted is NotImplemented:
-            return NotImplemented
-        return _DecimalComplex(self.real + converted.real, self.imag + converted.imag)
-
-    __radd__ = __add__
-
-    def __sub__(self, other: Any) -> "_DecimalComplex" | Any:
-        converted = self._coerce(other)
-        if converted is NotImplemented:
-            return NotImplemented
-        return _DecimalComplex(self.real - converted.real, self.imag - converted.imag)
-
-    def __rsub__(self, other: Any) -> "_DecimalComplex" | Any:
-        converted = self._coerce(other)
-        if converted is NotImplemented:
-            return NotImplemented
-        return converted - self
-
-    def __mul__(self, other: Any) -> "_DecimalComplex" | Any:
-        converted = self._coerce(other)
-        if converted is NotImplemented:
-            return NotImplemented
-        return _DecimalComplex(
-            self.real * converted.real - self.imag * converted.imag,
-            self.real * converted.imag + self.imag * converted.real,
-        )
-
-    __rmul__ = __mul__
-
-    def __truediv__(self, other: Any) -> "_DecimalComplex" | Any:
-        converted = self._coerce(other)
-        if converted is NotImplemented:
-            return NotImplemented
-        denominator = converted.real**2 + converted.imag**2
-        return _DecimalComplex(
-            (self.real * converted.real + self.imag * converted.imag) / denominator,
-            (self.imag * converted.real - self.real * converted.imag) / denominator,
-        )
-
-    def __rtruediv__(self, other: Any) -> "_DecimalComplex" | Any:
-        converted = self._coerce(other)
-        if converted is NotImplemented:
-            return NotImplemented
-        return converted / self
-
-    def __pow__(self, exponent: Any) -> "_DecimalComplex" | Any:
-        if isinstance(exponent, Decimal):
-            return _decimal_complex_power(self, exponent)
-        return NotImplemented
 
 
 def _julia_float_rat(value: Any, dtype: np.dtype[Any]) -> tuple[int, int]:
@@ -474,6 +575,7 @@ def _materialize_range(
     """Materialize a retained Julia range without changing its arithmetic."""
 
     dtype = np.dtype(dtype)
+    _require_materializable_axis_length(length, dtype)
     values = np.empty(length, dtype=dtype)
     with np.errstate(over="ignore", invalid="ignore"):
         if isinstance(reference, _TwicePrecision):
@@ -504,7 +606,84 @@ def _materialize_range(
                         np.add,
                     ).reshape(())[()]
                 )
-    return values
+        return values
+
+
+def _require_materializable_axis_length(
+    length: int,
+    dtype: np.dtype[Any],
+) -> None:
+    """Reject genuine platform or host-capacity allocation failures.
+
+    Julia may keep enormous ranges lazy, while ``LatticeAxis`` deliberately
+    exposes a NumPy array and therefore must materialize them.  Checking only
+    ``intp`` is unsafe on overcommitting operating systems: ``np.empty`` may
+    appear to succeed and the subsequent fill can make the kernel kill the
+    process.  Derive the ceiling from this host's available/physical memory
+    instead of imposing a project-specific element-count cap.
+    """
+
+    if length < 0 or length > np.iinfo(np.intp).max:
+        raise MemoryError("LatticeAxis length is not representable.")
+    itemsize = max(1, int(np.dtype(dtype).itemsize))
+    required_bytes = length * itemsize
+    page_size: int | None = None
+    for name in ("SC_PAGE_SIZE", "SC_PAGESIZE"):
+        try:
+            page_size = int(os.sysconf(name))
+            break
+        except (AttributeError, OSError, ValueError):
+            continue
+    memory_budget: int | None = None
+    if page_size is not None:
+        try:
+            available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        except (AttributeError, OSError, ValueError):
+            available_pages = 0
+        if available_pages > 0:
+            memory_budget = available_pages * page_size
+        else:
+            try:
+                physical_pages = int(os.sysconf("SC_PHYS_PAGES"))
+            except (AttributeError, OSError, ValueError):
+                physical_pages = 0
+            if physical_pages > 0:
+                # Without an available-memory counter, retain half of physical
+                # RAM for the interpreter, source operands, and the OS.
+                memory_budget = physical_pages * page_size // 2
+    if memory_budget is None and os.name == "nt":
+        # ``os.sysconf`` is unavailable on Windows. Query the standard Win32
+        # available-physical-memory counter without adding a psutil runtime
+        # dependency.
+        try:
+            import ctypes
+
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = (
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                )
+
+            status = _MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(
+                ctypes.byref(status)
+            ):
+                memory_budget = int(status.ullAvailPhys)
+        except (AttributeError, OSError):
+            memory_budget = None
+    if memory_budget is not None and required_bytes > memory_budget:
+        raise MemoryError(
+            "LatticeAxis cannot eagerly materialize this Julia lazy range "
+            f"({required_bytes} bytes exceed the host allocation budget)."
+        )
 
 
 def _julia_integer_binary(left: Any, right: Any, operation: np.ufunc) -> Any:
@@ -549,6 +728,69 @@ def _julia_integer_remainder(left: Any, right: Any) -> Any:
     if (left_value < 0) != (right_value < 0):
         quotient = -quotient
     return left_value - quotient * right_value
+
+
+def _julia_111_integer_range_unavailable(
+    start: Any,
+    step: Any,
+    length_dtype: np.dtype,
+    length_value: int,
+) -> bool:
+    """Identify the exact unavailable Base 1.11.6 range boundaries.
+
+    These predicates are the 20 distinct typed scalar inputs corresponding
+    to 21 entries in the audited matrix (``one(Bool)`` and
+    ``typemax(Bool)`` are the same value). Keep the check intentionally
+    enumerated: adjacent starts, steps, length values, and length types retain
+    their independently verified behavior.
+    """
+
+    start_dtype = np.asarray(start).dtype
+    step_dtype = np.asarray(step).dtype
+    if (
+        start_dtype != np.dtype(np.int64)
+        or length_dtype != np.dtype(np.int64)
+        or length_value != 0
+    ):
+        return False
+
+    start_value = int(start)
+    step_value = int(step)
+    int64_info = np.iinfo(np.int64)
+
+    if start_value == int64_info.min:
+        if step_dtype == np.dtype(np.bool_):
+            return bool(step)
+        if step_dtype in (
+            np.dtype(np.int8),
+            np.dtype(np.int16),
+            np.dtype(np.int32),
+            np.dtype(np.int64),
+        ):
+            return step_value == 1
+        if step_dtype in (
+            np.dtype(np.uint8),
+            np.dtype(np.uint16),
+            np.dtype(np.uint32),
+        ):
+            return step_value in (1, int(np.iinfo(step_dtype).max))
+        return False
+
+    if start_value == int64_info.min + 1 and step_dtype in (
+        np.dtype(np.uint8),
+        np.dtype(np.uint16),
+        np.dtype(np.uint32),
+    ):
+        return step_value == int(np.iinfo(step_dtype).max)
+
+    if start_value in (int64_info.max - 1, int64_info.max) and step_dtype in (
+        np.dtype(np.int8),
+        np.dtype(np.int16),
+        np.dtype(np.int32),
+    ):
+        return step_value == int(np.iinfo(step_dtype).min)
+
+    return False
 
 
 def _materialize_julia_step_range(
@@ -675,30 +917,61 @@ def _materialize_julia_step_range(
     if count <= 0:
         return np.empty(0, dtype=dtype)
 
-    # NumPy arrays are materialized while Julia ranges are lazy.  Reject an
-    # allocation that cannot be represented (or would be unreasonably large
-    # for this eager public type) before entering the iteration loop.
-    if count > min(np.iinfo(np.intp).max, 10_000_000):
+    # NumPy arrays are materialized while Julia ranges are lazy. Reject only
+    # lengths that the platform index type cannot represent; otherwise let
+    # NumPy report a genuine allocation failure rather than imposing an
+    # arbitrary project-level sample cap.
+    if count > np.iinfo(np.intp).max:
         raise MemoryError("LatticeAxis is too large to materialize.")
 
-    # A LatticeAxis is necessarily materialized.  Iterate the same wrapped
-    # machine arithmetic as StepRange and stop on Base's normalized last
-    # element.  The cap turns an otherwise impossible allocation into the
-    # same practical failure boundary as any other materialized Python axis.
-    output: list[Any] = []
+    # Allocate before iteration so impossible lazy Julia ranges fail promptly
+    # at the real eager-storage boundary instead of growing a Python list.
+    _require_materializable_axis_length(count, dtype)
+    output = np.empty(count, dtype=dtype)
+    mathematical_last = int(start_value) + (count - 1) * int(step)
+    if mathematical_last == int(last):
+        # Ordinary non-wrapping StepRanges can be filled in bounded vector
+        # chunks. Keep the scalar translation below for Base's signed-wrap
+        # boundary cases. The bounded temporary also avoids doubling a large
+        # axis allocation.
+        absolute_step = abs(int(step))
+        safe_width = (
+            1_000_000
+            if absolute_step == 0
+            else min(
+                1_000_000,
+                int(np.iinfo(dtype).max) // absolute_step + 1,
+            )
+        )
+        if safe_width >= 2:
+            with np.errstate(over="ignore", invalid="ignore"):
+                for block_start in range(0, count, safe_width):
+                    width = min(safe_width, count - block_start)
+                    base = int(start_value) + block_start * int(step)
+                    offsets = np.arange(width, dtype=dtype)
+                    output[block_start : block_start + width] = np.add(
+                        np.asarray(base, dtype=dtype),
+                        np.multiply(
+                            offsets,
+                            np.asarray(step, dtype=dtype),
+                            dtype=dtype,
+                        ),
+                        dtype=dtype,
+                    )
+            if int(output[-1]) != int(last):
+                raise OverflowError(
+                    "StepRange iteration did not reach its endpoint."
+                )
+            return output
     current = start_value
-    seen: set[int] = set()
-    while True:
-        output.append(current)
-        if current == last:
-            break
-        marker = int(current)
-        if marker in seen:
-            raise OverflowError("StepRange iteration did not reach its endpoint.")
-        seen.add(marker)
-        current = _julia_integer_binary(current, step, np.add)
-        current = np.asarray(current, dtype=dtype).reshape(())[()]
-    return np.asarray(output, dtype=dtype)
+    for index in range(count):
+        output[index] = current
+        if index + 1 < count:
+            current = _julia_integer_binary(current, step, np.add)
+            current = np.asarray(current, dtype=dtype).reshape(())[()]
+    if output[-1] != last:
+        raise OverflowError("StepRange iteration did not reach its endpoint.")
+    return output
 
 
 class LatticeAxis(np.ndarray):
@@ -777,24 +1050,36 @@ class LatticeAxis(np.ndarray):
     ) -> "LatticeAxis":
         """Construct Julia's logical integer or machine-float range."""
 
-        if isinstance(length, (bool, np.bool_)) or not isinstance(
-            length, (int, np.integer)
-        ):
-            raise TypeError("length must be a signed machine integer.")
+        if not isinstance(length, (int, np.integer, bool, np.bool_)):
+            raise TypeError("length must be a Julia machine integer.")
+        length_dtype = _julia_scalar_dtype(length)
+        if length_dtype.kind not in "biu":
+            raise TypeError("length must be a Julia machine integer.")
+        length_scalar = np.asarray(length, dtype=length_dtype)[()]
         length_value = int(length)
-        if length_value < 0:
-            raise ValueError("length must be nonnegative.")
-        if not np.iinfo(np.int64).min <= length_value <= np.iinfo(np.int64).max:
-            raise OverflowError("length does not fit Julia Int64.")
+        one_length = np.ones((), dtype=length_dtype)[()]
+        length_factor = _julia_integer_binary(
+            length_scalar, one_length, np.subtract
+        )
 
         start_dtype = _julia_scalar_dtype(start)
         step_dtype = _julia_scalar_dtype(step)
         if start_dtype.kind in "biu" and step_dtype.kind in "biu":
             start_value = np.asarray(start, dtype=start_dtype)[()]
             step_value = np.asarray(step, dtype=step_dtype)[()]
+            if _julia_111_integer_range_unavailable(
+                start_value,
+                step_value,
+                length_dtype,
+                length_value,
+            ):
+                raise NotImplementedError(
+                    "this exact Julia 1.11.6 machine-integer range "
+                    "boundary is unavailable"
+                )
             stop_delta = _julia_array_scalar_operation(
                 np.asarray(step_value),
-                np.int64(length_value - 1),
+                length_factor,
                 np.multiply,
             ).reshape(())[()]
             stop = _julia_array_scalar_operation(
@@ -820,6 +1105,12 @@ class LatticeAxis(np.ndarray):
                 # original reference and step types in StepRangeLen.
                 reference = start_value
                 range_kind = "srl"
+                if length_value < 0:
+                    raise ValueError(
+                        f"length cannot be negative, got {length_value}"
+                    )
+                if length_value > np.iinfo(np.intp).max:
+                    raise MemoryError("LatticeAxis is too large to materialize.")
                 values = _materialize_range(
                     dtype,
                     reference,
@@ -847,6 +1138,10 @@ class LatticeAxis(np.ndarray):
             )
         start_value = np.asarray(start, dtype=dtype)[()]
         step_value = np.asarray(step, dtype=dtype)[()]
+        if length_value < 0:
+            raise ValueError(f"length cannot be negative, got {length_value}")
+        if length_value > np.iinfo(np.intp).max:
+            raise MemoryError("LatticeAxis is too large to materialize.")
 
         metadata = _infer_float_range_metadata(
             start_value, step_value, length_value, dtype
@@ -1077,7 +1372,8 @@ class LatticeAxis(np.ndarray):
                 and old_offset is not None
                 and kind is not None
             ):
-                if kind == "ordinal":
+                output_kind = kind
+                if kind in ("ordinal", "unit"):
                     output_offset = 0
                     reference_shift = _julia_array_scalar_operation(
                         np.asarray(logical_step),
@@ -1094,6 +1390,8 @@ class LatticeAxis(np.ndarray):
                         np.int64(stride),
                         np.multiply,
                     ).reshape(())[()]
+                    if kind == "unit" and stride != 1:
+                        output_kind = "ordinal"
                 elif kind == "tp":
                     assert isinstance(reference, _TwicePrecision)
                     assert isinstance(logical_step, _TwicePrecision)
@@ -1173,7 +1471,7 @@ class LatticeAxis(np.ndarray):
                     _logical_ref=new_reference,
                     _logical_step=new_step,
                     _logical_offset=output_offset,
-                    _range_kind=kind,
+                    _range_kind=output_kind,
                 )
             hint = self._step_hint
             result._step_hint = None if hint is None else hint * stride
@@ -1244,10 +1542,23 @@ def _axis(
             _range_kind=_range_kind,
         )
     if isinstance(values, range):
-        return LatticeAxis.from_start_step(
+        axis = LatticeAxis.from_start_step(
             np.int64(values.start),
             np.int64(values.step),
             len(values),
+        )
+        if values.step != 1 or axis._range_kind != "ordinal":
+            return axis
+        # Python has one ``range`` type. A unit-step instance is the public
+        # spelling corresponding to Julia's UnitRange, whose scalar-broadcast
+        # overloads differ from an explicit ``start:1:stop`` StepRange.
+        return LatticeAxis(
+            np.asarray(axis),
+            step_hint=axis._step_hint,
+            _logical_ref=axis._logical_ref,
+            _logical_step=axis._logical_step,
+            _logical_offset=axis._logical_offset,
+            _range_kind="unit",
         )
     return LatticeAxis(
         values,
@@ -1308,12 +1619,27 @@ def _validate_regular_axis(axis: LatticeAxis) -> None:
                     first + index * step for index in range(len(values))
                 ]
             if values.dtype.kind == "O":
-                regular = all(
-                    actual == expected
-                    for actual, expected in zip(
-                        values.tolist(), expected_values, strict=True
-                    )
+                pairs = tuple(
+                    zip(values.tolist(), expected_values, strict=True)
                 )
+                if any(
+                    isinstance(actual, Decimal)
+                    or isinstance(expected, Decimal)
+                    for actual, expected in pairs
+                ):
+                    # BigFloat StepRangeLen materialization rounds each
+                    # coordinate at the active precision. Reconstructing an
+                    # endpoint as ``first + i*step`` can therefore differ in
+                    # the final few BigFloat bits even though the retained
+                    # logical range is valid.
+                    regular = all(
+                        _isapprox_scalar(actual, expected)
+                        for actual, expected in pairs
+                    )
+                else:
+                    regular = all(
+                        actual == expected for actual, expected in pairs
+                    )
             elif values.dtype.kind in "buif":
                 expected = np.asarray(expected_values, dtype=values.dtype)
                 if values.dtype.kind == "f":
@@ -1332,11 +1658,15 @@ def _validate_regular_axis(axis: LatticeAxis) -> None:
                         | (np.isposinf(values) & np.isposinf(expected))
                         | (np.isneginf(values) & np.isneginf(expected))
                     )
-                    matching_finite = (
-                        np.isfinite(values)
-                        & np.isfinite(expected)
-                        & (np.abs(values - expected) <= 8 * epsilon * scale)
-                    )
+                    with np.errstate(invalid="ignore", over="ignore"):
+                        matching_finite = (
+                            np.isfinite(values)
+                            & np.isfinite(expected)
+                            & (
+                                np.abs(values - expected)
+                                <= 8 * epsilon * scale
+                            )
+                        )
                     regular = np.all(matching_nonfinite | matching_finite)
                 else:
                     regular = np.array_equal(values, expected)
@@ -1532,31 +1862,829 @@ def _julia_literal_array(value: Any) -> np.ndarray:
     return np.asarray(converted, dtype=promoted)
 
 
+def _julia_sum_widened(value: Any) -> np.ndarray:
+    """Apply Base.add_sum's scalar accumulator widening."""
+
+    array = np.asarray(value)
+    if array.dtype.kind == "b":
+        return array.astype(np.int64)
+    if array.dtype.kind == "i" and array.dtype.itemsize < 8:
+        return array.astype(np.int64)
+    if array.dtype.kind == "u" and array.dtype.itemsize < 8:
+        return array.astype(np.uint64)
+    return array
+
+
+def _julia_float_vector_reduce(
+    vector: np.ndarray,
+    dtype: np.dtype[Any],
+) -> Any:
+    """Reproduce LLVM's arm64 vector.reduce.fadd lane tree."""
+
+    scalar_type = dtype.type
+    # LLVM floating additions quietly propagate IEEE infinities/NaNs. NumPy
+    # reports the same arithmetic as RuntimeWarning, which is observably
+    # different under ``-W error`` even when the result bits agree.
+    with np.errstate(
+        over="ignore",
+        under="ignore",
+        invalid="ignore",
+        divide="ignore",
+    ):
+        if len(vector) == 2:
+            return scalar_type(vector[0] + vector[1])
+        level = np.asarray(vector, dtype=dtype)
+        while len(level) > 1:
+            level = np.asarray(
+                [
+                    scalar_type(level[index] + level[index + 1])
+                    for index in range(0, len(level), 2)
+                ],
+                dtype=dtype,
+            )
+        return level[0]
+
+
+def _julia_sum_zero(array: np.ndarray) -> Any:
+    """Return the typed additive identity used by Julia's ``sum``."""
+
+    if array.dtype.kind != "O":
+        zero = np.zeros((), dtype=array.dtype)
+        return _julia_sum_widened(zero).reshape(())[()]
+    if array.size:
+        sample = array.ravel(order="F")[0]
+        if isinstance(sample, _DecimalComplex):
+            return _DecimalComplex(Decimal(0), Decimal(0))
+        if isinstance(sample, Decimal):
+            return Decimal(0)
+        if isinstance(sample, Fraction):
+            return Fraction(0, 1)
+        try:
+            return type(sample)(0)
+        except (TypeError, ValueError):
+            pass
+    # Python object arrays do not retain their concrete Julia element type
+    # when empty.  ``Int`` is the only honest neutral fallback for that
+    # representation.
+    return np.int64(0)
+
+
+def _julia_accumulate_value(left: Any, right: Any) -> Any:
+    """Apply Julia's checked/nontrapping ``add_sum`` scalar operation."""
+
+    result = _julia_array_array_operation(
+        np.asarray(left), np.asarray(right), np.add
+    )
+    return (
+        result.reshape(())[()]
+        if np.asarray(result).ndim == 0
+        else result
+    )
+
+
+def _julia_hypot_float64(x: float, y: float) -> float:
+    """Julia 1.11's FMA-corrected ``hypot(Float64, Float64)``."""
+
+    ax = abs(float(x))
+    ay = abs(float(y))
+    if math.isinf(ax) or math.isinf(ay):
+        return math.inf
+    if ay > ax:
+        ax, ay = ay, ax
+    info = np.finfo(np.float64)
+    if ay <= ax * math.sqrt(info.eps / 2):
+        return ax
+    scale = info.eps * math.sqrt(info.tiny)
+    if ax > math.sqrt(info.max / 2):
+        ax *= scale
+        ay *= scale
+        scale = 1.0 / scale
+    elif ay < math.sqrt(info.tiny):
+        ax /= scale
+        ay /= scale
+    else:
+        scale = 1.0
+    h = math.sqrt(math.fma(ax, ax, ay * ay))
+    h_squared = h * h
+    ax_squared = ax * ax
+    correction = (
+        math.fma(-ay, ay, h_squared - ax_squared)
+        + math.fma(h, h, -h_squared)
+        - math.fma(ax, ax, -ax_squared)
+    ) / (2 * h)
+    return (h - correction) * scale
+
+
+def _julia_abs(values: Any) -> np.ndarray:
+    """Elementwise ``abs`` using Julia's complex ``hypot`` kernels."""
+
+    array = np.asarray(values)
+    if array.dtype.kind != "c":
+        return np.asarray(np.abs(array))
+    component_dtype = array.real.dtype
+    output = np.empty(array.shape, dtype=component_dtype)
+    if component_dtype == np.dtype(np.float32):
+        for index in np.ndindex(array.shape):
+            value = array[index]
+            real = float(value.real)
+            imag = float(value.imag)
+            output[index] = (
+                np.float32(np.inf)
+                if math.isinf(real) or math.isinf(imag)
+                else np.float32(
+                    math.sqrt(math.fma(real, real, imag * imag))
+                )
+            )
+        return output
+    if component_dtype == np.dtype(np.float64):
+        for index in np.ndindex(array.shape):
+            value = array[index]
+            output[index] = _julia_hypot_float64(
+                float(value.real), float(value.imag)
+            )
+        return output
+    return np.asarray(np.abs(array))
+
+
+def _julia_complex_divide_array(
+    numerator: Any,
+    denominator: Any,
+    result_dtype: Any,
+    *,
+    real_denominator: bool,
+) -> np.ndarray:
+    """Elementwise complex division using Julia Base's native kernels.
+
+    NumPy evaluates ``ComplexF32 / Real`` through its complex-division
+    kernel. Julia instead divides the two Float32 components independently.
+    That one operation-order difference is enough to move normalized values
+    by an ULP. Complex/complex division likewise has explicit Julia kernels:
+    Float32 widens the calculation to Float64 and Float64 uses the robust
+    scaled Borges algorithm from ``Base.complex.jl``.
+    """
+
+    dtype = np.dtype(result_dtype)
+    if dtype.kind != "c":
+        raise TypeError("complex division requires a complex result dtype")
+    first, second = np.broadcast_arrays(
+        np.asarray(numerator), np.asarray(denominator)
+    )
+    converted_first = first.astype(dtype, copy=False)
+    component_dtype = np.empty((), dtype=dtype).real.dtype
+
+    with np.errstate(
+        over="ignore",
+        under="ignore",
+        invalid="ignore",
+        divide="ignore",
+    ):
+        if real_denominator:
+            converted_second = second.astype(component_dtype, copy=False)
+            output = np.empty(first.shape, dtype=dtype)
+            output.real = np.divide(
+                converted_first.real,
+                converted_second,
+                dtype=component_dtype,
+            )
+            output.imag = np.divide(
+                converted_first.imag,
+                converted_second,
+                dtype=component_dtype,
+            )
+            return output
+
+        converted_second = second.astype(dtype, copy=False)
+        output = np.empty(first.shape, dtype=dtype)
+        float_info = np.finfo(np.float64)
+
+        def float32_divide(z: complex, w: complex) -> complex:
+            # ``widen`` maps ComplexF32 to ComplexF64 before the fused
+            # multiply-add calculation.
+            a = float(z.real)
+            b = float(z.imag)
+            c = float(w.real)
+            d = float(w.imag)
+            if math.isinf(c) or math.isinf(d):
+                if math.isfinite(a) and math.isfinite(b):
+                    real = (
+                        np.float64(0.0)
+                        * np.sign(np.float64(a))
+                        * np.sign(np.float64(c))
+                    )
+                    imag = (
+                        np.float64(-0.0)
+                        * np.sign(np.float64(b))
+                        * np.sign(np.float64(d))
+                    )
+                    return complex(float(real), float(imag))
+                return complex(math.nan, math.nan)
+            magnitude = np.divide(
+                np.float64(1.0),
+                np.float64(math.fma(c, c, d * d)),
+            )
+            real = np.float64(math.fma(a, c, b * d)) * magnitude
+            imag = np.float64(math.fma(b, c, -(a * d))) * magnitude
+            return complex(float(real), float(imag))
+
+        def robust_part(
+            a: np.float64,
+            b: np.float64,
+            c: np.float64,
+            d: np.float64,
+            ratio: np.float64,
+            reciprocal: np.float64,
+        ) -> np.float64:
+            if ratio != 0:
+                product = b * ratio
+                if product != 0:
+                    return (a + product) * reciprocal
+                return a * reciprocal + (b * reciprocal) * ratio
+            return (a + d * np.divide(b, c)) * reciprocal
+
+        def robust_divide(
+            a: np.float64,
+            b: np.float64,
+            c: np.float64,
+            d: np.float64,
+        ) -> tuple[np.float64, np.float64]:
+            if abs(d) <= abs(c):
+                ratio = np.divide(d, c)
+                reciprocal = np.divide(
+                    np.float64(1.0), c + d * ratio
+                )
+                return (
+                    robust_part(a, b, c, d, ratio, reciprocal),
+                    robust_part(b, -a, c, d, ratio, reciprocal),
+                )
+            ratio = np.divide(c, d)
+            reciprocal = np.divide(np.float64(1.0), d + c * ratio)
+            real = robust_part(b, a, d, c, ratio, reciprocal)
+            imag = -robust_part(a, -b, d, c, ratio, reciprocal)
+            return real, imag
+
+        def float64_divide(z: complex, w: complex) -> complex:
+            a = np.float64(z.real)
+            b = np.float64(z.imag)
+            c = np.float64(w.real)
+            d = np.float64(w.imag)
+            abs_a = abs(a)
+            abs_b = abs(b)
+            largest_numerator = abs_a if abs_a >= abs_b else abs_b
+            abs_c = abs(c)
+            abs_d = abs(d)
+            largest_denominator = abs_c if abs_c >= abs_d else abs_d
+            if np.isinf(c) or np.isinf(d):
+                if np.isfinite(a) and np.isfinite(b):
+                    real = (
+                        np.float64(0.0) * np.sign(a) * np.sign(c)
+                    )
+                    imag = (
+                        np.float64(-0.0) * np.sign(b) * np.sign(d)
+                    )
+                    return complex(float(real), float(imag))
+                return complex(math.nan, math.nan)
+
+            half_overflow = np.float64(0.5 * float_info.max)
+            twice_under_epsilon = np.float64(
+                float_info.tiny * 2.0 / float_info.eps
+            )
+            scale = np.float64(1.0)
+            if (
+                largest_numerator >= half_overflow
+                or largest_numerator <= twice_under_epsilon
+                or largest_denominator >= half_overflow
+                or largest_denominator <= twice_under_epsilon
+            ):
+                big_scale = np.float64(
+                    2.0 / (float_info.eps * float_info.eps)
+                )
+                if largest_numerator >= half_overflow:
+                    a *= np.float64(0.5)
+                    b *= np.float64(0.5)
+                    scale *= np.float64(2.0)
+                elif largest_numerator <= twice_under_epsilon:
+                    a *= big_scale
+                    b *= big_scale
+                    scale /= big_scale
+                if largest_denominator >= half_overflow:
+                    c *= np.float64(0.5)
+                    d *= np.float64(0.5)
+                    scale *= np.float64(0.5)
+                elif largest_denominator <= twice_under_epsilon:
+                    c *= big_scale
+                    d *= big_scale
+                    scale *= big_scale
+            real, imag = robust_divide(a, b, c, d)
+            return complex(float(real * scale), float(imag * scale))
+
+        for index in np.ndindex(first.shape):
+            left_value = converted_first[index]
+            right_value = converted_second[index]
+            if dtype == np.dtype(np.complex64):
+                output[index] = float32_divide(
+                    complex(left_value), complex(right_value)
+                )
+            else:
+                output[index] = float64_divide(
+                    complex(left_value), complex(right_value)
+                )
+        return output
+
+
+def _julia_simd_accumulate(
+    initial: Any,
+    values: np.ndarray,
+    dtype: np.dtype[Any],
+) -> Any:
+    """Reproduce a reducedim ``@simd`` loop with an existing accumulator."""
+
+    length = len(values)
+    lanes = {
+        np.dtype(np.float16): 8,
+        np.dtype(np.float32): 4,
+        np.dtype(np.float64): 2,
+    }[dtype]
+    chunk = 4 * lanes
+    vector_length = length - (length % chunk)
+    if not vector_length:
+        result = initial
+        for value in values:
+            result = _julia_accumulate_value(result, value)
+        return result
+
+    with np.errstate(
+        over="ignore",
+        under="ignore",
+        invalid="ignore",
+        divide="ignore",
+    ):
+        negative_zero = dtype.type(-0.0)
+        accumulators = [
+            np.full(lanes, negative_zero, dtype=dtype)
+            for _ in range(4)
+        ]
+        accumulators[0][0] = dtype.type(initial)
+        cursor = 0
+        while cursor < vector_length:
+            for accumulator_index in range(4):
+                segment = np.asarray(
+                    values[
+                        cursor
+                        + accumulator_index * lanes :
+                        cursor
+                        + (accumulator_index + 1) * lanes
+                    ],
+                    dtype=dtype,
+                )
+                accumulators[accumulator_index] = np.add(
+                    accumulators[accumulator_index],
+                    segment,
+                    dtype=dtype,
+                )
+            cursor += chunk
+        combined = np.add(accumulators[1], accumulators[0], dtype=dtype)
+        combined = np.add(accumulators[2], combined, dtype=dtype)
+        combined = np.add(accumulators[3], combined, dtype=dtype)
+        result = _julia_float_vector_reduce(combined, dtype)
+        for value in values[vector_length:]:
+            result = dtype.type(result + value)
+        return result
+
+
+def _julia_sum_sequence(
+    values: Any,
+    start: int,
+    stop: int,
+    *,
+    native_dtype: np.dtype[Any] | None,
+    top_level: bool,
+) -> Any:
+    """Exact Julia 1.11.6 Base/LLVM add_sum tree on audited arm64."""
+
+    length = stop - start
+    if length == 0:
+        if isinstance(values, np.ndarray):
+            return _julia_sum_zero(values)
+        if native_dtype is None:
+            return np.int64(0)
+        return _julia_sum_zero(np.empty(0, dtype=native_dtype))
+    if length == 1:
+        only = _julia_sum_widened(values[start])
+        return only.reshape(())[()] if only.ndim == 0 else only
+
+    # ``sum`` uses a scalar left fold below 16 elements. Longer inputs enter
+    # mapreduce_impl, which recursively halves blocks larger than 1024.
+    if top_level and length >= 16:
+        return _julia_sum_sequence(
+            values,
+            start,
+            stop,
+            native_dtype=native_dtype,
+            top_level=False,
+        )
+    if not top_level and length > 1024:
+        left_length = (length - 1) // 2 + 1
+        left = _julia_sum_sequence(
+            values,
+            start,
+            start + left_length,
+            native_dtype=native_dtype,
+            top_level=False,
+        )
+        right = _julia_sum_sequence(
+            values,
+            start + left_length,
+            stop,
+            native_dtype=native_dtype,
+            top_level=False,
+        )
+        combined = _julia_array_array_operation(
+            np.asarray(left), np.asarray(right), np.add
+        )
+        return (
+            combined.reshape(())[()]
+            if combined.ndim == 0
+            else combined
+        )
+
+    first = _julia_sum_widened(values[start])
+    second = _julia_sum_widened(values[start + 1])
+    first_result = _julia_array_array_operation(
+        first, second, np.add
+    )
+    result = (
+        first_result.reshape(())[()]
+        if first_result.ndim == 0
+        else first_result
+    )
+
+    use_llvm_block = not top_level or length >= 16
+    if (
+        use_llvm_block
+        and native_dtype
+        in (
+            np.dtype(np.float16),
+            np.dtype(np.float32),
+            np.dtype(np.float64),
+        )
+        and np.asarray(result).ndim == 0
+        and np.asarray(values[start]).ndim == 0
+    ):
+        dtype = np.dtype(native_dtype)
+        lanes = {
+            np.dtype(np.float16): 8,
+            np.dtype(np.float32): 4,
+            np.dtype(np.float64): 2,
+        }[dtype]
+        chunk = 4 * lanes
+        remaining = length - 2
+        vector_length = remaining - (remaining % chunk)
+        if vector_length:
+            with np.errstate(
+                over="ignore",
+                under="ignore",
+                invalid="ignore",
+                divide="ignore",
+            ):
+                negative_zero = dtype.type(-0.0)
+                accumulators = [
+                    np.full(lanes, negative_zero, dtype=dtype)
+                    for _ in range(4)
+                ]
+                accumulators[0][0] = dtype.type(result)
+                cursor = start + 2
+                vector_stop = cursor + vector_length
+                while cursor < vector_stop:
+                    for accumulator_index in range(4):
+                        segment = np.asarray(
+                            values[
+                                cursor
+                                + accumulator_index * lanes :
+                                cursor
+                                + (accumulator_index + 1) * lanes
+                            ],
+                            dtype=dtype,
+                        )
+                        accumulators[accumulator_index] = np.add(
+                            accumulators[accumulator_index],
+                            segment,
+                            dtype=dtype,
+                        )
+                    cursor += chunk
+                combined = np.add(
+                    accumulators[1], accumulators[0], dtype=dtype
+                )
+                combined = np.add(
+                    accumulators[2], combined, dtype=dtype
+                )
+                combined = np.add(
+                    accumulators[3], combined, dtype=dtype
+                )
+            result = _julia_float_vector_reduce(combined, dtype)
+            tail_start = vector_stop
+        else:
+            tail_start = start + 2
+    else:
+        tail_start = start + 2
+
+    # Complex{Float32/64} is LLVM-unrolled four elements at a time but remains
+    # a component-wise left fold, so this scalar loop is bit-equivalent.
+    for index in range(tail_start, stop):
+        next_result = _julia_array_array_operation(
+            np.asarray(result),
+            _julia_sum_widened(values[index]),
+            np.add,
+        )
+        result = (
+            next_result.reshape(())[()]
+            if next_result.ndim == 0
+            else next_result
+        )
+    return result
+
+
 def _julia_add_sum(values: Any) -> Any:
-    """Reduce values with Julia's ``Base.add_sum`` accumulator widening."""
+    """Reduce an explicit sequence with Julia's Base.add_sum semantics."""
 
     terms = tuple(values)
-    if not terms:
-        return np.int64(0)
+    native_dtype: np.dtype[Any] | None = None
+    if terms:
+        dtypes = [np.asarray(term).dtype for term in terms]
+        if all(dtype == dtypes[0] for dtype in dtypes):
+            native_dtype = dtypes[0]
+    return _julia_sum_sequence(
+        terms,
+        0,
+        len(terms),
+        native_dtype=native_dtype,
+        top_level=True,
+    )
 
-    def widened(value: Any) -> np.ndarray:
-        array = np.asarray(value)
-        if array.dtype.kind == "b":
-            return array.astype(np.int64)
-        if array.dtype.kind == "i" and array.dtype.itemsize < 8:
-            return array.astype(np.int64)
-        if array.dtype.kind == "u" and array.dtype.itemsize < 8:
-            return array.astype(np.uint64)
-        return array
 
-    result = widened(terms[0])
-    for term in terms[1:]:
-        result = _julia_array_array_operation(
-            result, widened(term), np.add
+def _julia_sum(
+    values: Any,
+    axis: Any = None,
+    *,
+    keepdims: bool = False,
+) -> Any:
+    """Sum an Array in Julia/F-order with the audited Base/LLVM tree."""
+
+    array = (
+        np.asarray(values._storage())
+        if isinstance(values, _CheckedFieldArray)
+        else np.asarray(values)
+    )
+    if axis is None:
+        flattened = np.asarray(array).ravel(order="F")
+        if (
+            array.dtype.kind == "O"
+            and array.size
+            and all(isinstance(value, Decimal) for value in flattened)
+        ):
+            # Base/mpfr.jl specializes plain ``sum(Array{BigFloat})`` as a
+            # strict MPFR fold from typed zero. Axis reductions continue to
+            # use the generic reducedim tree below.
+            result: Any = Decimal(0)
+            for value in flattened:
+                result = _julia_accumulate_value(result, value)
+            return result
+        return _julia_sum_sequence(
+            flattened,
+            0,
+            len(flattened),
+            native_dtype=array.dtype,
+            top_level=True,
         )
-    if result.ndim == 0:
-        return result.reshape(())[()]
+
+    raw_axes = (axis,) if isinstance(axis, (int, np.integer)) else tuple(axis)
+    normalized_axes: set[int] = set()
+    for item in raw_axes:
+        normalized = int(item)
+        if normalized < 0:
+            normalized += array.ndim
+        if normalized < 0:
+            raise np.exceptions.AxisError(axis, ndim=array.ndim)
+        # Julia permits positive ``dims`` beyond ``ndims(A)`` and simply
+        # leaves the input dimensions unreduced.
+        if normalized < array.ndim:
+            normalized_axes.add(normalized)
+    axes = tuple(sorted(normalized_axes))
+    if array.ndim == 0:
+        return _julia_accumulate_value(
+            _julia_sum_zero(array), array.reshape(())[()]
+        )
+
+    # ``sum(A; dims=...)`` in Julia initializes a keep-dimensions result with
+    # the widened typed zero, then calls Base._mapreducedim!.  That routine is
+    # observably different from independently applying the global sum tree to
+    # each NumPy slice, especially for cancellation-sensitive Float32/64
+    # inputs.  Mirror its two execution paths below.
+    output_shape = tuple(
+        1 if dimension in axes else size
+        for dimension, size in enumerate(array.shape)
+    )
+    zero = _julia_sum_zero(array)
+    output_dtype = (
+        np.dtype(object)
+        if array.dtype.kind == "O"
+        else np.asarray(zero).dtype
+    )
+    output = np.empty(output_shape, dtype=output_dtype, order="F")
+    output[...] = zero
+    if not array.size:
+        result = output
+    else:
+        # Base.check_reducedims returns the physical length of a contiguous
+        # leading reduced slice, or zero when a later reduced dimension
+        # follows a retained non-singleton one.
+        leading_size = 1
+        had_nonreduced = False
+        for size, result_size in zip(
+            array.shape, output_shape, strict=True
+        ):
+            if result_size == 1:
+                if size > 1:
+                    if had_nonreduced:
+                        leading_size = 0
+                    else:
+                        leading_size *= size
+            else:
+                had_nonreduced = True
+
+        if leading_size > 16:
+            flattened = array.ravel(order="F")
+            flat_output = output.ravel(order="F")
+            for output_index in range(flat_output.size):
+                start = output_index * leading_size
+                reduced = _julia_sum_sequence(
+                    flattened,
+                    start,
+                    start + leading_size,
+                    native_dtype=array.dtype,
+                    top_level=False,
+                )
+                flat_output[output_index] = _julia_accumulate_value(
+                    flat_output[output_index], reduced
+                )
+        else:
+            tail_shape = array.shape[1:]
+            tail_count = math.prod(tail_shape)
+            reduced_first_dimension = output_shape[0] == 1
+            native_simd_dtype = (
+                array.dtype
+                if array.dtype
+                in (
+                    np.dtype(np.float16),
+                    np.dtype(np.float32),
+                    np.dtype(np.float64),
+                )
+                else None
+            )
+            for tail_linear in range(tail_count):
+                tail_position = np.unravel_index(
+                    tail_linear, tail_shape, order="F"
+                )
+                output_tail = tuple(
+                    0 if dimension in axes else coordinate
+                    for dimension, coordinate in enumerate(
+                        tail_position, start=1
+                    )
+                )
+                if reduced_first_dimension:
+                    destination = (0,) + output_tail
+                    current = output[destination]
+                    line = np.asarray(
+                        array[(slice(None),) + tail_position]
+                    )
+                    if native_simd_dtype is not None:
+                        current = _julia_simd_accumulate(
+                            current, line, native_simd_dtype
+                        )
+                    else:
+                        for value in line:
+                            current = _julia_accumulate_value(
+                                current, value
+                            )
+                    output[destination] = current
+                else:
+                    for first_index in range(array.shape[0]):
+                        destination = (first_index,) + output_tail
+                        output[destination] = _julia_accumulate_value(
+                            output[destination],
+                            array[(first_index,) + tail_position],
+                        )
+        result = output
+
+    if not keepdims and axes:
+        result = np.squeeze(result, axis=axes)
+    if np.asarray(result).ndim == 0:
+        return np.asarray(result).reshape(())[()]
     return result
+
+
+def _julia_cumsum(values: Any, axis: int | None = None) -> np.ndarray:
+    """Cumulative ``add_sum`` with Julia ordering and object arithmetic."""
+
+    array = (
+        np.asarray(values._storage())
+        if isinstance(values, _CheckedFieldArray)
+        else np.asarray(values)
+    )
+    normalized_axis: int | None = None
+    if axis is not None:
+        normalized_axis = int(axis)
+        if normalized_axis < 0:
+            normalized_axis += array.ndim
+        if normalized_axis < 0 or normalized_axis >= array.ndim:
+            raise np.exceptions.AxisError(axis, ndim=array.ndim)
+
+    if axis is None or array.ndim == 1:
+        source = array.ravel(order="F")
+        output_shape = source.shape
+    else:
+        assert normalized_axis is not None
+        output_shape = array.shape
+        moved = np.moveaxis(array, normalized_axis, 0)
+        output_moved = np.empty(
+            moved.shape,
+            dtype=(
+                object
+                if array.dtype.kind == "O"
+                else _julia_sum_widened(
+                    np.zeros((), dtype=array.dtype)
+                ).dtype
+            ),
+            order="F",
+        )
+        tail_shape = moved.shape[1:]
+        for tail_linear in range(math.prod(tail_shape)):
+            tail = np.unravel_index(tail_linear, tail_shape, order="F")
+            source_line = moved[(slice(None),) + tail]
+            if len(source_line):
+                current = _julia_sum_widened(source_line[0]).reshape(())[()]
+                output_moved[(0,) + tail] = current
+                for index in range(1, len(source_line)):
+                    current = _julia_accumulate_value(
+                        current, source_line[index]
+                    )
+                    output_moved[(index,) + tail] = current
+        return np.moveaxis(output_moved, 0, normalized_axis)
+
+    output = np.empty(
+        output_shape,
+        dtype=(
+            object
+            if array.dtype.kind == "O"
+            else _julia_sum_widened(
+                np.zeros((), dtype=array.dtype)
+            ).dtype
+        ),
+    )
+    if source.size:
+        first = _julia_sum_widened(source[0])
+        output[0] = (
+            first.reshape(())[()] if first.ndim == 0 else first
+        )
+
+        # Julia dispatches vector cumsum for floating, complex, and
+        # arithmetic-unknown element types through accumulate_pairwise!.
+        # Machine integers use the ordinary strict accumulate! path. The
+        # recursive local-sum tree starts only once 127 values remain after
+        # the first element. Multidimensional cumsum also uses the strict
+        # per-axis accumulate! path handled above.
+        def accumulate_pairwise(
+            seed: Any,
+            start: int,
+            length: int,
+        ) -> Any:
+            if length < 128:
+                local = source[start]
+                output[start] = _julia_accumulate_value(seed, local)
+                for index in range(start + 1, start + length):
+                    local = _julia_accumulate_value(local, source[index])
+                    output[index] = _julia_accumulate_value(seed, local)
+                return local
+            left_length = length >> 1
+            left = accumulate_pairwise(seed, start, left_length)
+            right_seed = _julia_accumulate_value(seed, left)
+            right = accumulate_pairwise(
+                right_seed,
+                start + left_length,
+                length - left_length,
+            )
+            return _julia_accumulate_value(left, right)
+
+        if len(source) > 1:
+            if array.dtype.kind in "fcO":
+                accumulate_pairwise(output[0], 1, len(source) - 1)
+            else:
+                current = output[0]
+                for index in range(1, len(source)):
+                    current = _julia_accumulate_value(
+                        current, source[index]
+                    )
+                    output[index] = current
+    return output
 
 
 def _julia_array_scalar_operation(
@@ -1618,16 +2746,31 @@ def _julia_array_scalar_operation(
         # Object ufuncs dispatch to the underlying Python numeric operators,
         # preserving Fraction/Decimal arithmetic exactly.  Keep this gate
         # wholly separate from the machine-dtype promotion path below.
-        if _object_contains_decimal(values) or _object_contains_decimal(
-            scalar_array
-        ):
+        decimal_complex = _object_contains_decimal_complex(
+            values
+        ) or _object_contains_decimal_complex(scalar_array)
+        decimal_real = _object_contains_decimal(
+            values
+        ) or _object_contains_decimal(scalar_array)
+        if decimal_complex:
+            converted_values = values.astype(object, copy=False)
+            converted_scalar = scalar_array.item()
+        elif decimal_real:
             converted_values = _as_decimal_array(values)
             converted_scalar = _as_decimal_approx(scalar_array.item())
         else:
             converted_values = values.astype(object, copy=False)
             converted_scalar = scalar_array.item()
         if reflected:
+            if decimal_complex or decimal_real:
+                return _decimal_object_operation(
+                    operation, converted_scalar, converted_values
+                )
             return np.asarray(operation(converted_scalar, converted_values))
+        if decimal_complex or decimal_real:
+            return _decimal_object_operation(
+                operation, converted_values, converted_scalar
+            )
         return np.asarray(operation(converted_values, converted_scalar))
     scalar_dtype = _julia_scalar_dtype(scalar)
     result_dtype = _julia_promote_numeric_dtypes(
@@ -1636,11 +2779,29 @@ def _julia_array_scalar_operation(
         division=operation is np.divide,
         operation=operation,
     )
+    if operation is np.divide and result_dtype.kind == "c":
+        numerator = scalar_array if reflected else values
+        denominator = values if reflected else scalar_array
+        return _julia_complex_divide_array(
+            numerator,
+            denominator,
+            result_dtype,
+            real_denominator=(
+                np.asarray(numerator).dtype.kind == "c"
+                and np.asarray(denominator).dtype.kind != "c"
+            ),
+        )
     converted_values = values.astype(result_dtype, copy=False)
     converted_scalar = np.asarray(scalar, dtype=result_dtype)[()]
-    if reflected:
-        return np.asarray(operation(converted_scalar, converted_values))
-    return np.asarray(operation(converted_values, converted_scalar))
+    with np.errstate(
+        over="ignore",
+        under="ignore",
+        invalid="ignore",
+        divide="ignore",
+    ):
+        if reflected:
+            return np.asarray(operation(converted_scalar, converted_values))
+        return np.asarray(operation(converted_values, converted_scalar))
 
 
 def _logical_axis_scalar_operation(
@@ -1702,9 +2863,8 @@ def _logical_axis_scalar_operation(
         )
         return _axis(values)
 
-    if range_kind == "ordinal":
+    if range_kind in ("ordinal", "unit"):
         is_integer_scalar = scalar_array.dtype.kind in "bui"
-        unit_step = logical_step == 1
         if operation in (np.add, np.subtract) and is_integer_scalar:
             if operation is np.add:
                 new_reference = (
@@ -1741,21 +2901,33 @@ def _logical_axis_scalar_operation(
                     np.subtract,
                 ).reshape(())[()]
                 new_step = logical_step
-            return LatticeAxis.from_start_step(
+            generated = LatticeAxis.from_start_step(
                 new_reference,
                 new_step,
                 len(canonical),
             )
+            if range_kind == "unit" and (
+                operation is np.add
+                or (operation is np.subtract and not reflected)
+            ):
+                return LatticeAxis(
+                    np.asarray(generated),
+                    step_hint=generated._step_hint,
+                    _logical_ref=generated._logical_ref,
+                    _logical_step=generated._logical_step,
+                    _logical_offset=generated._logical_offset,
+                    _range_kind="unit",
+                )
+            return generated
         elif (
             operation in (np.add, np.subtract)
-            and unit_step
+            and range_kind == "unit"
             and not (operation is np.subtract and reflected)
         ):
-            # AbstractUnitRange +/- Real calls ``range(first +/- x,
-            # length=...)``.  That constructor stores an ordinary
-            # StepRangeLen reference/step rather than a TwicePrecision pair.
-            # For Float16/Float32, both stored values remain in that low type;
-            # widening them here changes every later range index operation.
+            # AbstractUnitRange +/- Real calls
+            # ``range(first +/- x, length=...)``. An explicit unit-step
+            # StepRange instead keeps its integer step, so it must continue
+            # through the generic start/step/length branch below.
             if operation is np.add:
                 new_reference = _julia_array_scalar_operation(
                     np.asarray(reference),
@@ -1875,9 +3047,17 @@ def _logical_axis_scalar_operation(
                 new_step = logical_step
         elif operation is np.multiply:
             new_reference = _tp_multiply(reference, converted_scalar)
-            new_step = _tp_multiply(logical_step, converted_scalar)
+            new_step = _tp_truncate(
+                _tp_multiply(logical_step, converted_scalar),
+                _nbitslen(len(canonical), int(offset)),
+            )
         else:
             new_reference = _tp_divide(reference, converted_scalar)
+            # Base's StepRangeLen scalar-division specialization preserves
+            # the complete divided TwicePrecision step.  Scalar
+            # multiplication, above, deliberately re-truncates it for the
+            # range length; the two operations are not implemented as exact
+            # inverses in Base.
             new_step = _tp_divide(logical_step, converted_scalar)
         new_kind = "tp"
     else:
@@ -2110,6 +3290,20 @@ def _as_decimal_array(value: Any) -> np.ndarray:
     return output
 
 
+def _decimal_object_operation(
+    operation: np.ufunc,
+    left: Any,
+    right: Any,
+) -> np.ndarray:
+    """Apply Decimal arithmetic with Julia BigFloat's nontrapping specials."""
+
+    with localcontext() as context:
+        context.traps[DivisionByZero] = False
+        context.traps[InvalidOperation] = False
+        context.traps[DecimalOverflow] = False
+        return np.asarray(operation(left, right))
+
+
 def _julia_array_array_operation(
     left: Any, right: Any, operation: np.ufunc
 ) -> np.ndarray:
@@ -2130,11 +3324,13 @@ def _julia_array_array_operation(
             first.astype(object, copy=False),
             second.astype(object, copy=False),
         )
-        return np.asarray(operation(first, second))
+        return _decimal_object_operation(operation, first, second)
     if _object_contains_decimal(first) or _object_contains_decimal(second):
         first, second = np.broadcast_arrays(first, second)
-        return np.asarray(
-            operation(_as_decimal_array(first), _as_decimal_array(second))
+        return _decimal_object_operation(
+            operation,
+            _as_decimal_array(first),
+            _as_decimal_array(second),
         )
     first_is_fraction = (
         first.dtype.kind == "O"
@@ -2165,6 +3361,18 @@ def _julia_array_array_operation(
             division=operation in (np.divide, np.true_divide),
             operation=operation,
         )
+        if (
+            operation in (np.divide, np.true_divide)
+            and result_dtype.kind == "c"
+        ):
+            return _julia_complex_divide_array(
+                first,
+                second,
+                result_dtype,
+                real_denominator=(
+                    first.dtype.kind == "c" and second.dtype.kind != "c"
+                ),
+            )
         converted_first = first.astype(result_dtype, copy=False)
         converted_second = second.astype(result_dtype, copy=False)
         with np.errstate(
@@ -2786,13 +3994,13 @@ class _CheckedFlatIterator:
         self._owner = owner
 
     def __iter__(self) -> Iterator[Any]:
-        return iter(np.asarray(self._owner).flat)
+        return iter(self._owner._storage().flat)
 
     def __len__(self) -> int:
         return self._owner.size
 
     def __getitem__(self, key: Any) -> Any:
-        return np.asarray(self._owner).flat[key]
+        return self._owner._storage().flat[key]
 
     def __setitem__(self, key: Any, value: Any) -> None:
         flat_indices = np.arange(self._owner.size)[key]
@@ -2803,51 +4011,862 @@ class _CheckedFlatIterator:
             )
             self._owner[coordinates] = value
             return
-        values = np.broadcast_to(np.asarray(value), target_indices.shape)
-        for index in np.ndindex(target_indices.shape):
-            coordinates = np.unravel_index(
-                int(target_indices[index]), self._owner.shape, order="C"
-            )
-            self._owner[coordinates] = values[index]
+        raw_value = _CheckedFieldArray._unwrap_checked(value)
+        values = np.broadcast_to(
+            np.asarray(raw_value), target_indices.shape
+        )
+        state = self._owner._state()
+        state.begin_write()
+        try:
+            for index in np.ndindex(target_indices.shape):
+                coordinates = np.unravel_index(
+                    int(target_indices[index]), self._owner.shape, order="C"
+                )
+                self._owner[coordinates] = values[index]
+        finally:
+            state.end_write()
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(np.asarray(self._owner).flat, name)
+        return getattr(self._owner._storage().flat, name)
+
+
+class _FieldReadOnlyGuard(np.ndarray):
+    """Keep public ndarray aliases behind a permanently read-only base.
+
+    NumPy normally collapses a plain-ndarray view chain to its owning base.
+    Retaining one subclass in the chain makes ``np.asarray(field.data)`` and
+    ``field.data.view(np.ndarray)`` base themselves on the checked public
+    view.  Neither those aliases nor the public view can consequently enable
+    their WRITEABLE flag.
+    """
+
+    @property
+    def base(self) -> None:
+        """Hide private storage from public ndarray base-chain traversal."""
+
+        return None
+
+
+def _julia_setindex_shapes_match(
+    source_shape: tuple[int, ...],
+    target_shape: tuple[int, ...],
+) -> bool:
+    """Translate Base.setindex_shape_check for array right-hand sides."""
+
+    source_size = math.prod(source_shape)
+    target_size = math.prod(target_shape)
+    source_ndim = len(source_shape)
+    target_ndim = len(target_shape)
+
+    if target_ndim == 0:
+        return source_size == 1
+    if source_ndim == 0:
+        return target_size == 1
+    if source_ndim == 1 and target_ndim in (1, 2):
+        return source_size == target_size
+    if source_ndim == 2 and target_ndim == 2:
+        return source_size == target_size and (
+            target_shape[0] == 1
+            or target_shape[0] == source_shape[0]
+            or source_shape[0] == 1
+        )
+
+    source_index = target_index = 0
+    while True:
+        source_length = source_shape[source_index]
+        target_length = target_shape[target_index]
+        if (
+            source_index == source_ndim - 1
+            or target_index == target_ndim - 1
+        ):
+            source_length *= math.prod(source_shape[source_index + 1 :])
+            target_length *= math.prod(target_shape[target_index + 1 :])
+            return source_length == target_length
+        if source_length == target_length:
+            source_index += 1
+            target_index += 1
+        elif source_length == 1:
+            source_index += 1
+        elif target_length == 1:
+            target_index += 1
+        else:
+            return False
+
+
+def _normalized_integer_indices(
+    values: Any,
+    size: int,
+) -> np.ndarray:
+    """Normalize zero-based signed/unsigned integer indices without wrapping."""
+
+    raw = np.asarray(values)
+    if raw.dtype.kind not in "iu":
+        raise TypeError("indices must be integer or Boolean")
+    normalized = np.empty(raw.shape, dtype=np.intp)
+    for index in np.ndindex(raw.shape):
+        value = int(raw[index])
+        if value < 0:
+            value += size
+        if value < 0 or value >= size:
+            raise IndexError("index is outside checked field data")
+        normalized[index] = value
+    return normalized
+
+
+def _julia_checked_storage_key(
+    key: Any,
+    shape: tuple[int, ...],
+) -> Any:
+    """Normalize multi-selector dense-array arity like Julia.
+
+    A lone selector deliberately keeps ordinary NumPy/Python basic-index
+    behavior at the public ``.data`` binding boundary.  With two or more
+    selectors, Julia permits omitted trailing singleton dimensions and
+    redundant trailing scalar-zero selectors (the zero-based spelling of its
+    one-valued extra indices).
+    """
+
+    if not isinstance(key, tuple) or len(key) <= 1:
+        return key
+    selectors = list(key)
+    if sum(selector is Ellipsis for selector in selectors) > 1:
+        return key
+    if any(selector is Ellipsis for selector in selectors):
+        position = next(
+            index
+            for index, selector in enumerate(selectors)
+            if selector is Ellipsis
+        )
+        explicit = len(selectors) - 1
+        selectors[position : position + 1] = [
+            slice(None)
+        ] * max(0, len(shape) - explicit)
+    if len(selectors) < len(shape):
+        trailing = shape[len(selectors) :]
+        if not all(size == 1 for size in trailing):
+            raise IndexError(
+                "omitted trailing checked-array axes must be singleton"
+            )
+        selectors.extend([0] * len(trailing))
+    elif len(selectors) > len(shape):
+        extras = selectors[len(shape) :]
+        for selector in extras:
+            raw = np.asarray(selector)
+            if (
+                raw.ndim != 0
+                or raw.dtype.kind not in "iu"
+                or raw.dtype.kind == "b"
+                or int(raw) != 0
+            ):
+                raise IndexError(
+                    "extra checked-array indices must select trailing "
+                    "singleton coordinates"
+                )
+        selectors = selectors[: len(shape)]
+    return tuple(selectors)
+
+
+def _julia_linear_index_plan(
+    key: Any,
+    shape: tuple[int, ...],
+) -> np.ndarray | np.intp | None:
+    """Return Julia/F-order linear destinations for non-basic indexing.
+
+    One index addresses Julia's linear column-major storage. An integer index
+    array retains its own shape; one Boolean index selects true entries in
+    column-major mask order. With multiple dimensional selectors, every
+    non-scalar selector contributes all of its dimensions and selectors form
+    a Cartesian product rather than NumPy's paired advanced index.
+
+    ``None`` means the key is an ordinary full-arity scalar/slice tuple whose
+    storage-sharing NumPy view already has Julia's Cartesian topology.
+    """
+
+    selectors = list(key if isinstance(key, tuple) else (key,))
+    if any(selector is None for selector in selectors):
+        return None
+    if sum(selector is Ellipsis for selector in selectors) > 1:
+        return None
+
+    if len(selectors) == 1 and selectors[0] is not Ellipsis:
+        selector = selectors[0]
+        total = math.prod(shape)
+        if isinstance(selector, slice):
+            return None
+        raw = np.asarray(selector)
+        if raw.dtype.kind == "b":
+            if raw.ndim == 0:
+                return None
+            if not (
+                (raw.ndim == 1 and raw.size == total)
+                or raw.shape == shape
+            ):
+                raise IndexError(
+                    "Boolean linear index must be a length-total vector or "
+                    "have exactly the field shape"
+                )
+            return np.flatnonzero(raw.ravel(order="F")).astype(
+                np.intp, copy=False
+            )
+        if raw.ndim == 0:
+            return None
+        return _normalized_integer_indices(raw, total)
+
+    if any(selector is Ellipsis for selector in selectors):
+        ellipsis_index = next(
+            index
+            for index, selector in enumerate(selectors)
+            if selector is Ellipsis
+        )
+        explicit_axes = len(selectors) - 1
+        selectors[ellipsis_index : ellipsis_index + 1] = [
+            slice(None)
+        ] * max(0, len(shape) - explicit_axes)
+    if len(selectors) < len(shape):
+        trailing_shape = shape[len(selectors) :]
+        if not all(size == 1 for size in trailing_shape):
+            raise IndexError(
+                "omitted trailing checked-array axes must be singleton"
+            )
+        selectors.extend([0] * (len(shape) - len(selectors)))
+    if len(selectors) != len(shape):
+        return None
+
+    has_array_selector = any(
+        not isinstance(selector, slice)
+        and np.asarray(selector).ndim > 0
+        for selector in selectors
+    )
+    if not has_array_selector:
+        return None
+
+    dimensional: list[tuple[int, np.ndarray]] = []
+    scalar_indices: dict[int, int] = {}
+    for axis, selector in enumerate(selectors):
+        if isinstance(selector, slice):
+            dimensional.append(
+                (
+                    axis,
+                    np.arange(shape[axis], dtype=np.intp)[selector],
+                )
+            )
+            continue
+        raw = np.asarray(selector)
+        if raw.ndim == 0:
+            if raw.dtype.kind == "b":
+                raise TypeError("Boolean scalar indices are not supported")
+            scalar_indices[axis] = int(
+                _normalized_integer_indices(raw, shape[axis]).reshape(())[()]
+            )
+            continue
+        if raw.dtype.kind == "b":
+            if raw.ndim != 1 or raw.size != shape[axis]:
+                raise IndexError(
+                    "Boolean dimensional index must match its axis"
+                )
+            indices = np.flatnonzero(raw).astype(np.intp, copy=False)
+        else:
+            indices = _normalized_integer_indices(raw, shape[axis])
+        dimensional.append((axis, indices))
+
+    output_shape = tuple(
+        extent
+        for _, indices in dimensional
+        for extent in indices.shape
+    )
+    strides: list[int] = []
+    stride = 1
+    for size in shape:
+        strides.append(stride)
+        stride *= size
+    linear = np.zeros(output_shape, dtype=np.intp)
+    dimension_offset = 0
+    total_dimensions = len(output_shape)
+    for axis, indices in dimensional:
+        index_dimensions = indices.ndim
+        reshape = (
+            (1,) * dimension_offset
+            + indices.shape
+            + (1,) * (
+                total_dimensions - dimension_offset - index_dimensions
+            )
+        )
+        linear += indices.reshape(reshape) * strides[axis]
+        dimension_offset += index_dimensions
+    for axis, index in scalar_indices.items():
+        linear += index * strides[axis]
+    return linear
+
+
+class _FieldStorageState:
+    """Shared authoritative storage and weakly held public façades."""
+
+    __slots__ = (
+        "root",
+        "_facades",
+        "_write_depth",
+        "_dirty",
+        "__weakref__",
+    )
+
+    def __init__(self, root: np.ndarray) -> None:
+        self.root = root
+        self._facades: dict[
+            int, weakref.ReferenceType[_CheckedFieldArray]
+        ] = {}
+        self._write_depth = 0
+        self._dirty = False
+
+    def prune(self) -> None:
+        """Discard dead façade references during ordinary use, not just writes."""
+
+        dead = [
+            key
+            for key, reference in self._facades.items()
+            if reference() is None
+        ]
+        for key in dead:
+            self._facades.pop(key, None)
+
+    def register(self, facade: "_CheckedFieldArray") -> None:
+        key = id(facade)
+        state_reference = weakref.ref(self)
+
+        def discard(
+            reference: weakref.ReferenceType[_CheckedFieldArray],
+            *,
+            facade_key: int = key,
+            owner: weakref.ReferenceType[_FieldStorageState] = state_reference,
+        ) -> None:
+            state = owner()
+            if state is not None and state._facades.get(facade_key) is reference:
+                state._facades.pop(facade_key, None)
+
+        self._facades[key] = weakref.ref(facade, discard)
+
+    def read(self) -> None:
+        # Reads are deliberately O(1). Weakref callbacks remove dead façades;
+        # a write synchronization necessarily visits each live façade once.
+        return None
+
+    def synchronize(self) -> None:
+        for reference in tuple(self._facades.values()):
+            facade = reference()
+            if facade is not None:
+                facade._refresh_snapshot()
+        self._dirty = False
+
+    def begin_write(self) -> None:
+        self._write_depth += 1
+
+    def changed(self) -> None:
+        self._dirty = True
+        if self._write_depth == 0:
+            self.synchronize()
+
+    def end_write(self) -> None:
+        if self._write_depth <= 0:
+            raise RuntimeError("unbalanced checked-storage write batch")
+        self._write_depth -= 1
+        if self._write_depth == 0 and self._dirty:
+            self.synchronize()
 
 
 class _CheckedFieldArray(np.ndarray):
-    """Field storage that rejects NumPy's lossy implicit assignments.
+    """Checked façade over private field storage.
 
-    Julia exposes ``field.data`` as a mutable typed array, whose own
-    ``setindex!`` performs checked conversion. A plain NumPy ndarray instead
-    truncates float-to-int and complex-to-real assignments. This view retains
-    ndarray interoperability and storage aliasing while validating every
-    ordinary assignment through the same conversion routine as
-    ``LatticeField.__setitem__``.
+    NumPy 2.5's ``ufunc.at`` writes through an ndarray even when its
+    ``WRITEABLE`` flag is false.  A read-only ndarray view therefore cannot be
+    a security boundary for Julia-style checked assignment.  Each public
+    façade owns a read-only *snapshot* while ``_storage_view`` points at the
+    private authoritative field array.  Checked methods update the private
+    array; raw aliases made by ``np.asarray`` or ``view(np.ndarray)`` can at
+    worst modify their detached snapshot.
+
+    A fresh façade is returned for each ``field.data`` access.  Basic slicing
+    and transposition return another checked façade over the corresponding
+    private view.  Operations that allocate independent results return normal
+    mutable ndarrays instead of half-connected subclass instances.
     """
 
-    def __new__(cls, values: Any) -> "_CheckedFieldArray":
-        if isinstance(values, cls):
-            return values
-        source = np.asarray(values)
-        result = np.array(
-            source,
+    __array_priority__ = 1000
+
+    _SNAPSHOT_ATTRIBUTES = frozenset(
+        {
+            "__array_interface__",
+            "__array_struct__",
+            "base",
+            "ctypes",
+            "data",
+            "flags",
+            "setflags",
+        }
+    )
+    _UNSAFE_MUTATING_METHODS = frozenset(
+        {
+            "byteswap",
+            "itemset",
+            "partition",
+            "resize",
+            "setfield",
+            "sort",
+        }
+    )
+    _UNSAFE_ARRAY_FUNCTIONS = frozenset(
+        {
+            np.copyto,
+            np.fill_diagonal,
+            np.place,
+            np.put,
+            np.put_along_axis,
+            np.putmask,
+        }
+    )
+
+    def __new__(
+        cls,
+        storage: Any,
+        state: _FieldStorageState | None = None,
+    ) -> "_CheckedFieldArray":
+        storage_view = np.asarray(storage)
+        if state is None:
+            state = _FieldStorageState(storage_view)
+        snapshot = np.array(
+            storage_view,
             copy=True,
-            order="F" if source.flags.f_contiguous else "C",
-        ).view(cls)
+            order="F" if storage_view.flags.f_contiguous else "C",
+        )
+        # Keep a private writable handle to the detached snapshot so checked
+        # mutation can keep an already-returned façade coherent.  No public
+        # base chain reaches the authoritative field storage.
+        writer = snapshot.view(np.ndarray)
+        snapshot.setflags(write=False)
+        guard = snapshot.view(_FieldReadOnlyGuard)
+        guard.setflags(write=False)
+        result = guard.view(cls)
         result.setflags(write=False)
+        result._writer_view = writer
+        result._storage_view = storage_view
+        result._storage_state = state
+        state.register(result)
         return result
 
     def __array_finalize__(self, obj: Any) -> None:
-        del obj
+        # ndarray may create temporary subclass objects before a public method
+        # can decide whether the result is a live view or an independent
+        # allocation.  Such objects must never inherit an unrelated storage
+        # writer.  Explicit view-producing methods below construct a new
+        # façade with the correct private view.
+        raw = np.ndarray.view(self, np.ndarray)
+        state = _FieldStorageState(raw)
+        self._writer_view = raw
+        self._storage_view = raw
+        self._storage_state = state
+        state.register(self)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {"shape", "strides", "dtype", "real", "imag"}:
+            raise AttributeError(
+                f"checked field-data metadata {name!r} is immutable; "
+                "use checked item assignment"
+            )
+        np.ndarray.__setattr__(self, name, value)
+
+    def __getattribute__(self, name: str) -> Any:
+        """Forward inherited ndarray reads through current private storage.
+
+        Explicit checked methods remain normal class attributes. Every other
+        ndarray property/method is evaluated on authoritative storage and its
+        result is classified generically as either a checked storage-sharing
+        view or an ordinary detached result.
+        """
+
+        if (
+            name.startswith("_")
+            or name in type(self).__dict__
+            or name in _CheckedFieldArray._SNAPSHOT_ATTRIBUTES
+            or not hasattr(np.ndarray, name)
+        ):
+            return np.ndarray.__getattribute__(self, name)
+        storage = np.ndarray.__getattribute__(self, "_storage")()
+        attribute = getattr(storage, name)
+        if not callable(attribute):
+            return np.ndarray.__getattribute__(self, "_classify_result")(
+                attribute
+            )
+        if name in _CheckedFieldArray._UNSAFE_MUTATING_METHODS:
+            def rejected_mutation(*args: Any, **kwargs: Any) -> Any:
+                del args, kwargs
+                raise TypeError(
+                    f"{name} cannot mutate checked field storage; use checked "
+                    "item assignment or operate on field.data.copy()"
+                )
+
+            return rejected_mutation
+
+        def current_method(*args: Any, **kwargs: Any) -> Any:
+            output_position = _ndarray_method_out_position(name)
+            positional_output = (
+                args[output_position]
+                if output_position is not None
+                and output_position < len(args)
+                else _NUMPY_NO_VALUE
+            )
+            keyword_output = kwargs.get("out", _NUMPY_NO_VALUE)
+            output = (
+                keyword_output
+                if keyword_output is not _NUMPY_NO_VALUE
+                else positional_output
+            )
+            checked_outputs = np.ndarray.__getattribute__(
+                self, "_collect_checked"
+            )(output)
+            if checked_outputs:
+                natural_kwargs = dict(kwargs)
+                natural_kwargs.pop("out", None)
+                natural_args = list(args)
+                if (
+                    positional_output is not _NUMPY_NO_VALUE
+                    and output_position is not None
+                ):
+                    natural_args[output_position] = None
+                raw_args = np.ndarray.__getattribute__(
+                    self, "_unwrap_checked"
+                )(tuple(natural_args))
+                raw_kwargs = np.ndarray.__getattribute__(
+                    self, "_unwrap_checked"
+                )(natural_kwargs)
+                natural_result = getattr(
+                    np.ndarray.__getattribute__(self, "_storage")(), name
+                )(*raw_args, **raw_kwargs)
+                output_items = output if isinstance(output, tuple) else (output,)
+                result_items = (
+                    natural_result
+                    if isinstance(natural_result, tuple)
+                    else (natural_result,)
+                )
+                if len(output_items) != len(result_items):
+                    raise TypeError(
+                        f"{name} returned {len(result_items)} outputs for "
+                        f"{len(output_items)} destinations"
+                    )
+                returned: list[Any] = []
+                for destination, produced in zip(
+                    output_items, result_items, strict=True
+                ):
+                    if isinstance(destination, _CheckedFieldArray):
+                        destination[...] = np.asarray(produced)
+                        returned.append(destination)
+                    elif destination is None:
+                        returned.append(produced)
+                    else:
+                        np.copyto(destination, produced, casting="unsafe")
+                        returned.append(destination)
+                return (
+                    tuple(returned)
+                    if isinstance(output, tuple)
+                    else returned[0]
+                )
+            raw_args = np.ndarray.__getattribute__(
+                self, "_unwrap_checked"
+            )(args)
+            raw_kwargs = np.ndarray.__getattribute__(
+                self, "_unwrap_checked"
+            )(kwargs)
+            result = getattr(
+                np.ndarray.__getattribute__(self, "_storage")(), name
+            )(*raw_args, **raw_kwargs)
+            return np.ndarray.__getattribute__(
+                self, "_classify_result"
+            )(result)
+
+        return current_method
+
+    def copy(self, order: str = "C") -> np.ndarray:
+        """Return an ordinary independent mutable array."""
+
+        return np.array(self._storage(), copy=True, order=order)
+
+    def flatten(self, order: str = "C") -> np.ndarray:
+        """Return an ordinary independent mutable flattened array."""
+
+        return np.asarray(self._storage()).flatten(order=order)
+
+    def astype(
+        self,
+        dtype: Any,
+        order: str = "K",
+        casting: str = "unsafe",
+        subok: bool = True,
+        copy: bool = True,
+    ) -> np.ndarray:
+        """Cast into an ordinary ndarray, never a disconnected façade."""
+
+        detached = np.array(self._storage(), copy=True, order="K")
+        return detached.astype(
+            dtype,
+            order=order,
+            casting=casting,
+            subok=False,
+            copy=copy,
+        )
+
+    def take(
+        self,
+        indices: Any,
+        axis: int | None = None,
+        out: np.ndarray | None = None,
+        mode: str = "raise",
+    ) -> np.ndarray:
+        """Take values into ordinary mutable storage."""
+
+        if isinstance(out, _CheckedFieldArray):
+            result = np.asarray(self._storage()).take(
+                indices, axis=axis, mode=mode
+            )
+            out[...] = result
+            return out
+        return np.asarray(self._storage()).take(
+            indices, axis=axis, out=out, mode=mode
+        )
+
+    @staticmethod
+    def _return_reduction_out(out: Any, result: Any) -> Any:
+        """Commit a reduction result through checked ``out`` conversion."""
+
+        if out is None:
+            return result
+        if isinstance(out, _CheckedFieldArray):
+            produced = np.asarray(result)
+            if produced.ndim == 0:
+                out[()] = produced.reshape(())[()]
+            else:
+                out[...] = produced
+            return out
+        np.copyto(np.asarray(out), np.asarray(result), casting="unsafe")
+        return out
+
+    def sum(
+        self,
+        axis: Any = None,
+        dtype: Any = None,
+        out: Any = None,
+        keepdims: bool = False,
+        initial: Any = _NUMPY_NO_VALUE,
+        where: Any = _NUMPY_NO_VALUE,
+    ) -> Any:
+        """Use Julia's reduction order on current authoritative storage."""
+
+        if (
+            dtype is None
+            and initial is _NUMPY_NO_VALUE
+            and where is _NUMPY_NO_VALUE
+        ):
+            result = _julia_sum(
+                self._storage(), axis=axis, keepdims=keepdims
+            )
+        else:
+            kwargs: dict[str, Any] = {
+                "axis": axis,
+                "dtype": dtype,
+                "keepdims": keepdims,
+            }
+            if initial is not _NUMPY_NO_VALUE:
+                kwargs["initial"] = initial
+            if where is not _NUMPY_NO_VALUE:
+                kwargs["where"] = self._unwrap_checked(where)
+            with localcontext() as context:
+                context.traps[DivisionByZero] = False
+                context.traps[InvalidOperation] = False
+                context.traps[DecimalOverflow] = False
+                result = np.sum(self._storage(), **kwargs)
+        return self._return_reduction_out(out, result)
+
+    def cumsum(
+        self,
+        axis: int | None = None,
+        dtype: Any = None,
+        out: Any = None,
+    ) -> Any:
+        """Cumulative Julia addition without Decimal trapping."""
+
+        if dtype is None:
+            result = _julia_cumsum(self._storage(), axis=axis)
+        else:
+            with localcontext() as context:
+                context.traps[DivisionByZero] = False
+                context.traps[InvalidOperation] = False
+                context.traps[DecimalOverflow] = False
+                result = np.cumsum(
+                    self._storage(), axis=axis, dtype=dtype
+                )
+        return self._return_reduction_out(out, result)
+
+    def view(self, dtype: Any = None, type: Any = None) -> np.ndarray:
+        """Return a detached ordinary NumPy view/copy.
+
+        NumPy's raw-ndarray escape hatch deliberately loses checked mutation.
+        Detaching here ensures that loss can never expose field storage.
+        """
+
+        detached = np.array(self._storage(), copy=True, order="K")
+        if dtype is None and type is None:
+            return detached.view()
+        if type is None:
+            return detached.view(dtype)
+        if dtype is None:
+            return detached.view(type=type)
+        return detached.view(dtype=dtype, type=type)
+
+    @staticmethod
+    def _unwrap_checked(value: Any) -> Any:
+        if isinstance(value, _CheckedFieldArray):
+            return value._storage()
+        if isinstance(value, tuple):
+            return tuple(
+                _CheckedFieldArray._unwrap_checked(item) for item in value
+            )
+        if isinstance(value, list):
+            return [
+                _CheckedFieldArray._unwrap_checked(item) for item in value
+            ]
+        if isinstance(value, dict):
+            return {
+                key: _CheckedFieldArray._unwrap_checked(item)
+                for key, item in value.items()
+            }
+        return value
+
+    def _classify_result(self, result: Any) -> Any:
+        """Turn a storage result into a checked view or ordinary allocation."""
+
+        if isinstance(result, tuple):
+            return tuple(self._classify_result(item) for item in result)
+        if isinstance(result, list):
+            return [self._classify_result(item) for item in result]
+        if not isinstance(result, np.ndarray):
+            return result
+        storage = self._storage()
+        if np.shares_memory(result, storage):
+            if not result.flags.writeable and self._state().root.flags.writeable:
+                try:
+                    result.setflags(write=True)
+                except ValueError:
+                    pass
+            return _CheckedFieldArray(result, self._state())
+        return np.array(result, copy=True, order="K", subok=False)
+
+    def _refresh_snapshot(self) -> None:
+        writer = getattr(self, "_writer_view", None)
+        storage = getattr(self, "_storage_view", None)
+        if writer is None or storage is None:
+            return
+        np.copyto(writer, storage, casting="no")
+
+    def _state(self) -> _FieldStorageState:
+        state = getattr(self, "_storage_state", None)
+        if state is None:
+            raise ValueError(
+                "This derived array is not connected to field storage."
+            )
+        return state
+
+    @staticmethod
+    def _collect_checked(value: Any) -> tuple["_CheckedFieldArray", ...]:
+        if isinstance(value, _CheckedFieldArray):
+            return (value,)
+        if isinstance(value, (tuple, list)):
+            return tuple(
+                item
+                for child in value
+                for item in _CheckedFieldArray._collect_checked(child)
+            )
+        if isinstance(value, dict):
+            return tuple(
+                item
+                for child in value.values()
+                for item in _CheckedFieldArray._collect_checked(child)
+            )
+        return ()
+
+    @property
+    def base(self) -> None:
+        """Terminate the public base chain at the checked storage façade."""
+
+        return None
+
+    def _writer(self) -> np.ndarray:
+        writer = getattr(self, "_writer_view", None)
+        if writer is None:
+            raise ValueError(
+                "This derived array no longer aliases checked field storage."
+            )
+        return writer
+
+    def _storage(self) -> np.ndarray:
+        storage = getattr(self, "_storage_view", None)
+        if storage is None:
+            raise ValueError(
+                "This derived array no longer aliases checked field storage."
+            )
+        state = getattr(self, "_storage_state", None)
+        if state is not None:
+            state.read()
+        return storage
+
+    @staticmethod
+    def _plain_result(value: Any) -> Any:
+        if isinstance(value, tuple):
+            return tuple(_CheckedFieldArray._plain_result(item) for item in value)
+        if isinstance(value, np.ndarray):
+            return np.array(value, copy=True, subok=False)
+        return value
 
     def __getitem__(self, key: Any) -> Any:
-        result = super().__getitem__(key)
+        storage = self._storage()
+        effective_key = _julia_checked_storage_key(key, storage.shape)
+        linear_plan = _julia_linear_index_plan(
+            effective_key, storage.shape
+        )
+        if linear_plan is not None:
+            if np.asarray(linear_plan).ndim == 0:
+                coordinates = np.unravel_index(
+                    int(linear_plan), storage.shape, order="F"
+                )
+                return np.ndarray.__getitem__(storage, coordinates)
+            flat_storage = np.asarray(storage).ravel(order="F")
+            return np.asarray(
+                np.ndarray.__getitem__(flat_storage, linear_plan)
+            ).copy(order="K")
+        result = np.ndarray.__getitem__(storage, effective_key)
         if isinstance(result, np.ndarray) and result.ndim == 0:
             return np.asarray(result).reshape(())[()]
-        return result
+        if not isinstance(result, np.ndarray):
+            return result
+        if np.shares_memory(result, storage):
+            return _CheckedFieldArray(result, self._state())
+        return np.array(result, copy=True, subok=False)
 
     def __setitem__(self, key: Any, value: Any) -> None:
-        target = np.ndarray.__getitem__(self, key)
+        storage = self._storage()
+        effective_input_key = _julia_checked_storage_key(
+            key, storage.shape
+        )
+        linear_plan = _julia_linear_index_plan(
+            effective_input_key, storage.shape
+        )
+        if linear_plan is not None and np.asarray(linear_plan).ndim == 0:
+            coordinates = np.unravel_index(
+                int(linear_plan), storage.shape, order="F"
+            )
+            target = np.ndarray.__getitem__(storage, coordinates)
+            effective_key: Any = coordinates
+        elif linear_plan is not None:
+            target = np.asarray(storage).ravel(order="F")[linear_plan]
+            effective_key = None
+        else:
+            target = np.ndarray.__getitem__(storage, effective_input_key)
+            effective_key = effective_input_key
         if not isinstance(target, np.ndarray):
             if isinstance(value, np.ndarray) and value.ndim != 0:
                 raise ValueError(
@@ -2860,44 +4879,123 @@ class _CheckedFieldArray(np.ndarray):
                     f"Inexact assignment to scalar element type {self.dtype}."
                 )
             converted = _julia_assignment_values(
-                np.asarray(value), np.asarray(self)
+                np.asarray(value), storage
             )
             if converted.ndim != 0:
                 raise ValueError(
                     f"Inexact assignment to scalar element type {self.dtype}."
                 )
-            self.setflags(write=True)
-            try:
-                np.ndarray.__setitem__(self, key, converted.reshape(())[()])
-            finally:
-                self.setflags(write=False)
+            scalar = converted.reshape(())[()]
+            np.ndarray.__setitem__(storage, effective_key, scalar)
+            self._state().changed()
             return
 
-        try:
-            broadcast = np.broadcast_to(np.asarray(value), target.shape)
-        except ValueError as error:
+        raw_value = self._unwrap_checked(value)
+        source = np.asarray(raw_value)
+        if source.ndim == 0 and not isinstance(value, np.ndarray):
             raise ValueError(
-                "Assignment source cannot be broadcast to the selected shape."
-            ) from error
+                "Indexed assignment with one scalar value to multiple "
+                "locations is not supported; use fill for scalar assignment."
+            )
+        if not _julia_setindex_shapes_match(source.shape, target.shape):
+            raise DimensionMismatch(
+                f"Cannot assign array shape {source.shape} to selected "
+                f"shape {target.shape}."
+            )
 
-        # Julia's broadcast assignment converts and stores one element at a
-        # time in column-major Cartesian order. A late InexactError therefore
-        # leaves the successfully converted prefix mutated.
-        self.setflags(write=True)
+        # Julia consumes the right-hand side and the selected destination in
+        # column-major linear order. Its setindex shape check permits only
+        # singleton-dimension rearrangements that preserve that order; it
+        # never applies NumPy-style singleton broadcasting.
+        source_values = np.array(
+            source, copy=True, order="F", subok=False
+        ).ravel(order="F")
+        shares_storage = (
+            linear_plan is None
+            and bool(target.size)
+            and np.shares_memory(target, storage)
+        )
+        if shares_storage:
+            destinations = (
+                ("view", np.unravel_index(index, target.shape, order="F"))
+                for index in range(target.size)
+            )
+        else:
+            if linear_plan is not None:
+                selected = np.asarray(linear_plan).ravel(order="F")
+            else:
+                linear_map = np.arange(
+                    storage.size, dtype=np.intp
+                ).reshape(storage.shape, order="C")
+                selected = np.asarray(
+                    np.ndarray.__getitem__(linear_map, effective_key)
+                ).ravel(order="F")
+            destinations = (("flat", int(index)) for index in selected)
+
+        state = self._state()
+        state.begin_write()
         try:
-            writable_target = np.ndarray.__getitem__(self, key)
-            for linear_index in range(writable_target.size):
-                index = np.unravel_index(
-                    linear_index, writable_target.shape, order="F"
-                )
+            for source_index, (kind, destination) in enumerate(destinations):
                 converted = _julia_assignment_values(
-                    np.asarray(broadcast[index]), np.asarray(self)
+                    np.asarray(source_values[source_index]), storage
                 )
-                np.ndarray.__setitem__(
-                    writable_target, index, converted.reshape(())[()]
-                )
+                scalar = converted.reshape(())[()]
+                if kind == "view":
+                    np.ndarray.__setitem__(target, destination, scalar)
+                else:
+                    coordinates = np.unravel_index(
+                        destination,
+                        storage.shape,
+                        order=(
+                            "F" if linear_plan is not None else "C"
+                        ),
+                    )
+                    np.ndarray.__setitem__(storage, coordinates, scalar)
+                state.changed()
         finally:
-            self.setflags(write=False)
+            state.end_write()
+
+    @property
+    def T(self) -> "_CheckedFieldArray":
+        return _CheckedFieldArray(self._storage().T, self._state())
+
+    def transpose(self, *axes: Any) -> "_CheckedFieldArray":
+        return _CheckedFieldArray(
+            self._storage().transpose(*axes), self._state()
+        )
+
+    def swapaxes(self, axis1: int, axis2: int) -> "_CheckedFieldArray":
+        return _CheckedFieldArray(
+            self._storage().swapaxes(axis1, axis2), self._state()
+        )
+
+    def squeeze(self, axis: Any = None) -> Any:
+        result = self._storage().squeeze(axis=axis)
+        if isinstance(result, np.ndarray) and np.shares_memory(
+            result, self._storage()
+        ):
+            return _CheckedFieldArray(result, self._state())
+        return self._plain_result(result)
+
+    def reshape(
+        self,
+        *shape: Any,
+        order: str = "C",
+        copy: bool | None = None,
+    ) -> Any:
+        kwargs: dict[str, Any] = {"order": order}
+        if copy is not None:
+            kwargs["copy"] = copy
+        result = self._storage().reshape(*shape, **kwargs)
+        if np.shares_memory(result, self._storage()):
+            return _CheckedFieldArray(result, self._state())
+        return np.array(result, copy=True, subok=False)
+
+    def ravel(self, order: str = "C") -> Any:
+        result = self._storage().ravel(order=order)
+        if np.shares_memory(result, self._storage()):
+            return _CheckedFieldArray(result, self._state())
+        return np.array(result, copy=True, subok=False)
 
     @property
     def flat(self) -> _CheckedFlatIterator:
@@ -2908,14 +5006,12 @@ class _CheckedFieldArray(np.ndarray):
         self.flat[:] = value
 
     def fill(self, value: Any) -> None:
-        converted = _julia_assignment_values(value, np.asarray(self))
+        converted = _julia_assignment_values(value, self._storage())
         if converted.ndim != 0:
             raise ValueError("fill requires a scalar value")
-        self.setflags(write=True)
-        try:
-            np.ndarray.fill(self, converted.reshape(())[()])
-        finally:
-            self.setflags(write=False)
+        scalar = converted.reshape(())[()]
+        np.ndarray.fill(self._storage(), scalar)
+        self._state().changed()
 
     def put(
         self,
@@ -2924,29 +5020,284 @@ class _CheckedFieldArray(np.ndarray):
         mode: str = "raise",
     ) -> None:
         raw_indices = np.asarray(indices)
-        raw_values = np.broadcast_to(np.asarray(values), raw_indices.shape)
-        for index in np.ndindex(raw_indices.shape):
-            flat_index = int(raw_indices[index])
-            if mode == "wrap":
-                flat_index %= self.size
-            elif mode == "clip":
-                flat_index = min(max(flat_index, 0), self.size - 1)
-            elif flat_index < 0:
-                flat_index += self.size
-            coordinates = np.unravel_index(flat_index, self.shape, order="C")
-            self[coordinates] = raw_values[index]
+        raw_values = np.broadcast_to(
+            np.asarray(self._unwrap_checked(values)), raw_indices.shape
+        )
+        state = self._state()
+        state.begin_write()
+        try:
+            for index in np.ndindex(raw_indices.shape):
+                flat_index = int(raw_indices[index])
+                if mode == "wrap":
+                    flat_index %= self.size
+                elif mode == "clip":
+                    flat_index = min(max(flat_index, 0), self.size - 1)
+                elif flat_index < 0:
+                    flat_index += self.size
+                coordinates = np.unravel_index(
+                    flat_index, self.shape, order="C"
+                )
+                self[coordinates] = raw_values[index]
+        finally:
+            state.end_write()
 
     def _inplace(self, other: Any, operation: np.ufunc) -> "_CheckedFieldArray":
-        if np.asarray(other).ndim == 0:
+        values = np.asarray(self._storage())
+        raw_other = self._unwrap_checked(other)
+        if np.asarray(raw_other).ndim == 0:
             result = _julia_array_scalar_operation(
-                np.asarray(self), np.asarray(other).reshape(())[()], operation
+                values, np.asarray(raw_other).reshape(())[()], operation
             )
         else:
             result = _julia_array_array_operation(
-                np.asarray(self), np.asarray(other), operation
+                values, np.asarray(raw_other), operation
             )
         self[...] = result
         return self
+
+    def _ufunc_at(
+        self,
+        ufunc: np.ufunc,
+        indices: Any,
+        operands: tuple[Any, ...],
+    ) -> None:
+        """Perform unbuffered updates through the checked scalar gate."""
+
+        if ufunc.nin not in (1, 2) or len(operands) != ufunc.nin - 1:
+            raise TypeError(
+                f"checked {ufunc.__name__}.at with {ufunc.nin} inputs is "
+                "not supported"
+            )
+        selected = np.arange(self.size, dtype=np.intp).reshape(self.shape)[
+            indices
+        ]
+        selected_array = np.asarray(selected)
+        operand_arrays = tuple(
+            np.broadcast_to(
+                np.asarray(self._unwrap_checked(operand)),
+                selected_array.shape,
+            )
+            for operand in operands
+        )
+        positions: Any = (
+            ((),)
+            if selected_array.ndim == 0
+            else np.ndindex(selected_array.shape)
+        )
+        state = self._state()
+        state.begin_write()
+        try:
+            for position in positions:
+                flat_index = int(selected_array[position])
+                coordinates = np.unravel_index(
+                    flat_index, self.shape, order="C"
+                )
+                current = self._storage()[coordinates]
+                if ufunc.nin == 1:
+                    result = np.asarray(ufunc(np.asarray(current)))
+                else:
+                    result = _julia_array_scalar_operation(
+                        np.asarray(current),
+                        operand_arrays[0][position],
+                        ufunc,
+                    )
+                self[coordinates] = np.asarray(result).reshape(())[()]
+        finally:
+            state.end_write()
+
+    def __array_function__(
+        self,
+        func: Any,
+        types: tuple[type[Any], ...],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> Any:
+        """Classify every NumPy function result by storage provenance."""
+
+        del types
+        if args and isinstance(args[0], _CheckedFieldArray):
+            if func is np.sum:
+                return args[0].sum(*args[1:], **kwargs)
+            if func is np.cumsum:
+                return args[0].cumsum(*args[1:], **kwargs)
+        sources = self._collect_checked((args, kwargs))
+        if func is np.copyto:
+            destination = args[0] if args else kwargs.get("dst")
+            if isinstance(destination, _CheckedFieldArray):
+                raise TypeError(
+                    "copyto cannot mutate checked field storage; use checked "
+                    "item assignment or operate on field.data.copy()"
+                )
+        elif func in self._UNSAFE_ARRAY_FUNCTIONS:
+            raise TypeError(
+                f"{getattr(func, '__name__', func)!s} cannot mutate checked "
+                "field storage; use checked item assignment or operate on "
+                "field.data.copy()"
+            )
+        if (
+            func is np.nan_to_num
+            and kwargs.get("copy", True) is False
+        ):
+            raise TypeError(
+                "nan_to_num(copy=False) cannot mutate checked field storage"
+            )
+
+        output_position = _array_function_out_position(func)
+        positional_output = (
+            args[output_position]
+            if output_position is not None
+            and output_position < len(args)
+            else _NUMPY_NO_VALUE
+        )
+        keyword_output = kwargs.get("out", _NUMPY_NO_VALUE)
+        output = (
+            keyword_output
+            if keyword_output is not _NUMPY_NO_VALUE
+            else positional_output
+        )
+        if self._collect_checked(output):
+            natural_args = list(args)
+            if (
+                positional_output is not _NUMPY_NO_VALUE
+                and output_position is not None
+            ):
+                natural_args[output_position] = None
+            natural_kwargs = dict(kwargs)
+            natural_kwargs.pop("out", None)
+            raw_args = self._unwrap_checked(tuple(natural_args))
+            raw_kwargs = self._unwrap_checked(natural_kwargs)
+            with localcontext() as context:
+                context.traps[DivisionByZero] = False
+                context.traps[InvalidOperation] = False
+                context.traps[DecimalOverflow] = False
+                natural_result = func(*raw_args, **raw_kwargs)
+            if isinstance(output, tuple):
+                produced_items = (
+                    natural_result
+                    if isinstance(natural_result, tuple)
+                    else (natural_result,)
+                )
+                if len(output) != len(produced_items):
+                    raise TypeError(
+                        f"{func.__name__} produced {len(produced_items)} "
+                        f"outputs for {len(output)} destinations"
+                    )
+                return tuple(
+                    self._return_reduction_out(destination, produced)
+                    if destination is not None
+                    else produced
+                    for destination, produced in zip(
+                        output, produced_items, strict=True
+                    )
+                )
+            return self._return_reduction_out(output, natural_result)
+
+        raw_args = self._unwrap_checked(args)
+        raw_kwargs = self._unwrap_checked(kwargs)
+        result = func(*raw_args, **raw_kwargs)
+
+        def classify(value: Any) -> Any:
+            if isinstance(value, tuple):
+                return tuple(classify(item) for item in value)
+            if isinstance(value, list):
+                return [classify(item) for item in value]
+            if not isinstance(value, np.ndarray):
+                return value
+            for source in sources:
+                if np.shares_memory(value, source._storage()):
+                    return source._classify_result(value)
+            return np.array(value, copy=True, order="K", subok=False)
+
+        return classify(result)
+
+    def __array_ufunc__(
+        self,
+        ufunc: np.ufunc,
+        method: str,
+        *inputs: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Keep every mutating ufunc behind checked field conversion."""
+
+        if method == "at":
+            target = inputs[0]
+            if isinstance(target, _CheckedFieldArray):
+                target._ufunc_at(ufunc, inputs[1], tuple(inputs[2:]))
+                return None
+            raw_inputs = tuple(
+                np.asarray(value._storage())
+                if isinstance(value, _CheckedFieldArray)
+                else value
+                for value in inputs
+            )
+            return getattr(ufunc, method)(*raw_inputs, **kwargs)
+
+        raw_inputs = tuple(
+            np.asarray(value._storage())
+            if isinstance(value, _CheckedFieldArray)
+            else value
+            for value in inputs
+        )
+        outputs = kwargs.get("out")
+        output_items = (
+            ()
+            if outputs is None
+            else outputs if isinstance(outputs, tuple) else (outputs,)
+        )
+        has_checked_output = any(
+            isinstance(value, _CheckedFieldArray)
+            for value in output_items
+        )
+        natural_kwargs = dict(kwargs)
+        if has_checked_output:
+            # A same-dtype staging output would perform NumPy's unchecked
+            # cast before the Julia conversion gate (e.g. 4.5 -> Int64(4)).
+            # Compute the natural result first, then commit element by element.
+            natural_kwargs.pop("out", None)
+        else:
+            natural_kwargs = self._unwrap_checked(natural_kwargs)
+        with localcontext() as context:
+            context.traps[DivisionByZero] = False
+            context.traps[InvalidOperation] = False
+            context.traps[DecimalOverflow] = False
+            result = getattr(ufunc, method)(*raw_inputs, **natural_kwargs)
+        if outputs is None:
+            return self._plain_result(result)
+        if not has_checked_output:
+            return result
+        staged_result = result if isinstance(result, tuple) else (result,)
+        if len(output_items) != len(staged_result):
+            raise TypeError(
+                f"{ufunc.__name__}.{method} produced "
+                f"{len(staged_result)} outputs for {len(output_items)} "
+                "destinations"
+            )
+        returned_outputs: list[Any] = []
+        for destination, staged in zip(
+            output_items, staged_result, strict=True
+        ):
+            if isinstance(destination, _CheckedFieldArray):
+                produced = np.asarray(staged)
+                if destination.ndim == 0:
+                    destination[()] = produced.reshape(())[()]
+                else:
+                    destination[...] = produced
+                returned_outputs.append(destination)
+                continue
+            if destination is None:
+                returned_outputs.append(staged)
+            else:
+                np.copyto(
+                    np.asarray(destination),
+                    np.asarray(staged),
+                    casting="unsafe",
+                )
+                returned_outputs.append(destination)
+        return (
+            tuple(returned_outputs)
+            if len(returned_outputs) != 1
+            else returned_outputs[0]
+        )
 
     def __iadd__(self, other: Any) -> "_CheckedFieldArray":
         return self._inplace(other, np.add)
@@ -2966,7 +5317,8 @@ class LatticeField:
 
     __array_priority__ = 1000
     __slots__ = (
-        "data",
+        "_data",
+        "_storage_state",
         "L",
         "flambda",
         "field_type",
@@ -2976,14 +5328,23 @@ class LatticeField:
     def __setattr__(self, name: str, value: Any) -> None:
         if getattr(self, "_frozen", False) and name in {
             "data",
+            "_data",
+            "_storage_state",
             "L",
             "flambda",
             "field_type",
         }:
-            if name == "data" and value is getattr(self, "data", None):
+            if (
+                name == "data"
+                and isinstance(value, _CheckedFieldArray)
+                and value._state() is self._storage_state
+                and value._storage() is self._data
+            ):
                 # Python writes the result of ``field.data += value`` back to
                 # the attribute after the checked in-place mutation. This is
-                # not a metadata change.
+                # not a metadata change. Require the exact root façade rather
+                # than merely shared memory so assigning a slice/view cannot
+                # masquerade as augmented-assignment writeback.
                 return
             raise AttributeError(f"LatticeField metadata {name!r} is immutable.")
         object.__setattr__(self, name, value)
@@ -3007,6 +5368,8 @@ class LatticeField:
         axes = as_lattice(lattice)
         if field_type is Intensity:
             # Deliberately allocate, matching Julia's broadcast constructor.
+            if isinstance(array, _CheckedFieldArray):
+                array = array._storage()
             if array.dtype.kind == "c":
                 raise TypeError(
                     "Julia's partial Intensity constructor cannot order complex "
@@ -3017,11 +5380,15 @@ class LatticeField:
                 array = np.array(array, dtype=object, copy=True)
                 for index in np.ndindex(array.shape):
                     value = array[index]
+                    if isinstance(value, Decimal) and value.is_nan():
+                        continue
                     if value < 0:
                         array[index] = type(value)(0)
             else:
                 array = np.where(array < 0, np.zeros((), dtype=array.dtype), array)
         elif field_type is ComplexAmplitude:
+            if isinstance(array, _CheckedFieldArray):
+                array = array._storage()
             array = np.asarray(array, dtype=np.complex128).copy()
         self._initialize(array, axes, flambda, field_type)
 
@@ -3061,11 +5428,32 @@ class LatticeField:
         object.__setattr__(self, "_frozen", False)
         if data.ndim != len(lattice) or data.shape != tuple(map(len, lattice)):
             raise DimensionMismatch("Field data size does not match lattice size.")
-        self.data = _CheckedFieldArray(data)
+        if isinstance(data, _CheckedFieldArray):
+            # Julia's field constructor stores an existing Array by
+            # reference. Preserve that aliasing when one field's checked data
+            # is passed directly to another field constructor.
+            storage = data._storage()
+            state = data._state()
+        else:
+            # Partial constructors for Intensity and ComplexAmplitude have
+            # already allocated their broadcast/conversion results above.
+            # Every other Julia constructor retains its input array, so keep
+            # the NumPy array itself rather than introducing a Python-only
+            # defensive copy.
+            storage = np.asarray(data)
+            state = _FieldStorageState(storage)
+        object.__setattr__(self, "_data", storage)
+        object.__setattr__(self, "_storage_state", state)
         self.L = lattice
         self.flambda = flambda
         self.field_type = field_type
         object.__setattr__(self, "_frozen", True)
+
+    @property
+    def data(self) -> _CheckedFieldArray:
+        """Return a checked façade whose raw NumPy aliases are snapshots."""
+
+        return _CheckedFieldArray(self._data, self._storage_state)
 
     @classmethod
     def __class_getitem__(cls, parameters: Any) -> Any:
@@ -3360,7 +5748,9 @@ class LatticeField:
     def __abs__(self) -> "LatticeField":
         if self.field_type is not ComplexAmplitude:
             raise TypeError("Behavior undefined for this combination of inputs.")
-        return LatticeField[Modulus](np.abs(self.data), self.L, self.flambda)
+        return LatticeField[Modulus](
+            _julia_abs(self.data), self.L, self.flambda
+        )
 
     def sqrt(self) -> "LatticeField":
         if self.field_type is not Intensity:
@@ -3527,11 +5917,9 @@ def _add_fields(left: LatticeField, right: LatticeField) -> LatticeField:
         raise TypeError("Behavior undefined for this combination of inputs.")
     elq(left, right)
     if left.field_type is Intensity:
-        # Python infix operators are necessarily binary.  Preserve ordinary
-        # value semantics: a subsequent operation observes exactly the data
-        # visible in each operand.  Julia's distinct unparenthesized n-ary
-        # overload has no equivalent Python syntax and must not be emulated by
-        # storing hidden expression history on the returned field.
+        # Python infix operators are binary and left-associated. Preserve
+        # eager value semantics: each visible intermediate is the complete
+        # input to the next operation.
         return LatticeField[Intensity](
             _julia_array_array_operation(left.data, right.data, np.add),
             left.L,
@@ -3672,7 +6060,7 @@ def square(field: LatticeField) -> LatticeField:
                 )
             magnitude[index] = abs(rational)
     else:
-        magnitude = np.abs(values)
+        magnitude = _julia_abs(values)
     return LatticeField[Intensity](
         _julia_array_array_operation(
             magnitude, magnitude, np.multiply
@@ -3700,8 +6088,12 @@ def _real_phase_phasors(data: Any) -> np.ndarray:
         # binary64 value to BigFloat before applying the high-precision exp.
         factor = Decimal.from_float(float(2 * np.pi))
         for index in np.ndindex(values.shape):
-            sine, cosine = _decimal_sincos(factor * values[index])
-            output[index] = _DecimalComplex(cosine, sine)
+            if not values[index].is_finite():
+                nan = Decimal("NaN")
+                output[index] = _DecimalComplex(nan, nan)
+            else:
+                sine, cosine = _decimal_sincos(factor * values[index])
+                output[index] = _DecimalComplex(cosine, sine)
         return output
     # ``2pi * im`` is ComplexF64 in Julia and therefore widens every machine
     # real/complex phase array before exponentiation.
@@ -3861,15 +6253,47 @@ def wrap(field: LatticeField) -> LatticeField:
 def normalizeLF(field: LatticeField) -> LatticeField:
     """Normalize intensity by its sum or amplitude by its discrete L2 norm."""
 
-    with np.errstate(divide="ignore", invalid="ignore"):
-        if field.field_type is Intensity:
-            result = np.abs(field.data / np.sum(field.data))
-        elif issubclass(field.field_type, Amplitude):
-            result = field.data / np.sqrt(np.sum(np.abs(field.data) ** 2))
+    values = np.asarray(field.data)
+    if field.field_type is Intensity:
+        total = _julia_sum(values)
+        quotient = _julia_array_scalar_operation(
+            values, total, np.divide
+        )
+        if (
+            quotient.dtype.kind == "O"
+            and quotient.size > 0
+            and all(isinstance(value, Fraction) for value in quotient.flat)
+        ):
+            result = np.empty(quotient.shape, dtype=object)
+            for index in np.ndindex(quotient.shape):
+                rational = _fraction_int64(quotient[index])
+                result[index] = (
+                    _fraction_int64_negate(rational)
+                    if rational.numerator < 0
+                    else rational
+                )
         else:
-            raise TypeError(
-                "normalizeLF is only defined for intensity/amplitude fields."
-            )
+            result = _julia_abs(quotient)
+    elif issubclass(field.field_type, Amplitude):
+        magnitude = _julia_abs(values)
+        squared = _julia_array_array_operation(
+            magnitude, magnitude, np.multiply
+        )
+        squared_sum = _julia_sum(squared)
+        if isinstance(squared_sum, Decimal):
+            with localcontext() as context:
+                context.traps[DivisionByZero] = False
+                context.traps[InvalidOperation] = False
+                context.traps[DecimalOverflow] = False
+                norm = squared_sum.sqrt()
+        else:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                norm = np.sqrt(squared_sum)
+        result = _julia_array_scalar_operation(values, norm, np.divide)
+    else:
+        raise TypeError(
+            "normalizeLF is only defined for intensity/amplitude fields."
+        )
     return LatticeField._from_full(
         result,
         field.L,

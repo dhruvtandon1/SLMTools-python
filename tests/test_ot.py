@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from fractions import Fraction
 import unittest
 import warnings
@@ -276,6 +276,56 @@ class CostMapAndIntegrationTests(unittest.TestCase):
         self.assertEqual(singleton_cost.shape, (1, 1))
         self.assertTrue(np.isnan(singleton_cost[0, 0]))
 
+    def test_bigfloat_degenerate_normalization_and_singleton_cost_propagate(
+        self,
+    ) -> None:
+        with localcontext() as context:
+            context.prec = 77
+            zeros = slm.normalizeDistribution(
+                np.asarray([Decimal(0), Decimal(0)], dtype=object)
+            )
+            self.assertEqual(zeros.dtype, np.dtype(object))
+            self.assertTrue(
+                all(
+                    isinstance(value, Decimal) and value.is_nan()
+                    for value in zeros
+                )
+            )
+
+            infinite = slm.normalizeDistribution(
+                np.asarray(
+                    [Decimal("Infinity"), Decimal(1)], dtype=object
+                )
+            )
+            self.assertIsInstance(infinite[0], Decimal)
+            self.assertTrue(infinite[0].is_nan())
+            self.assertIsInstance(infinite[1], Decimal)
+            self.assertTrue(infinite[1].is_zero())
+
+            axis = slm.LatticeAxis(
+                np.asarray([Decimal(0)], dtype=object),
+                step_hint=Decimal(1),
+            )
+            singleton_cost = slm.getCostMatrix((axis,))
+            self.assertEqual(singleton_cost.dtype, np.dtype(object))
+            self.assertEqual(singleton_cost.shape, (1, 1))
+            self.assertIsInstance(singleton_cost[0, 0], Decimal)
+            self.assertTrue(singleton_cost[0, 0].is_nan())
+
+    def test_rational_int64_normalization_overflow_matches_julia(self) -> None:
+        limits = np.iinfo(np.int64)
+        with self.assertRaises(OverflowError):
+            slm.normalizeDistribution(
+                np.asarray(
+                    [Fraction(int(limits.max)), Fraction(1)],
+                    dtype=object,
+                )
+            )
+        with self.assertRaises(OverflowError):
+            slm.normalizeDistribution(
+                np.asarray([Fraction(int(limits.min))], dtype=object)
+            )
+
     def test_integration_indices_reject_lossy_integer_coercion(self) -> None:
         vector = np.arange(4.0)
         lattice = (np.arange(4.0),)
@@ -315,7 +365,9 @@ class CostMapAndIntegrationTests(unittest.TestCase):
             [Fraction(-3, 2), Fraction(0), Fraction(5, 2)],
         )
         rational_map = slm.mapify(
-            np.eye(3, dtype=object), (rational_axis,), (rational_axis,)
+            np.eye(3, dtype=np.float64),
+            (rational_axis,),
+            (rational_axis,),
         )
         self.assertEqual(rational_map.dtype, np.dtype(np.float64))
         np.testing.assert_array_equal(rational_map[..., 0], [0.0, 1.0, 2.0])
@@ -384,6 +436,181 @@ class CostMapAndIntegrationTests(unittest.TestCase):
         self.assertEqual(mixed_pd_cost.dtype, np.dtype(object))
         self.assertEqual(mixed_pd_cost[0, 2], Decimal(4))
 
+    def test_object_machine_arrays_do_not_satisfy_ot_numeric_dispatch(self) -> None:
+        vector = np.asarray([1.0, 2.0], dtype=object)
+        matrix = np.eye(2, dtype=object)
+        vector_field = vector.reshape(2, 1)
+        typed_calls = (
+            lambda: slm.mapify(matrix, (range(2),), (range(2),)),
+            lambda: slm.hyperSum(vector, (0,), 1, ()),
+            lambda: slm.hyperSum2(vector, (0,), 1, ()),
+            lambda: slm.scalarPotentialN(
+                vector_field, (range(2),), idx=(0,)
+            ),
+            lambda: slm.normalizeDistribution(vector),
+            lambda: slm.SinkhornConvN(vector, vector, 0.2, 0),
+            lambda: slm.dualToGradients(
+                vector, vector, vector, (range(2),), 0.2
+            ),
+        )
+        for call in typed_calls:
+            with self.subTest(call=call):
+                with self.assertRaisesRegex(
+                    TypeError, "concrete Julia .*numeric element type"
+                ):
+                    call()
+
+        lattice = slm.natlat((2, 2))
+        object_field = slm.LF[slm.Intensity, object, 2](
+            np.ones((2, 2), dtype=object), lattice
+        )
+        field_calls = (
+            lambda: slm.otPhase(
+                object_field, object_field, 0.2, maxiter=0
+            ),
+            lambda: slm.pdotPhase(
+                object_field,
+                object_field,
+                0.5,
+                0.1,
+                [0.0, 0.0],
+                [0.0, 0.0],
+                0.2,
+                maxiter=0,
+            ),
+            lambda: slm.pdotBeamEstimate(
+                object_field,
+                object_field,
+                0.5,
+                0.1,
+                [0.0, 0.0],
+                [0.0, 0.0],
+                0.2,
+                maxiter=0,
+            ),
+            lambda: slm.otQuickPhase(
+                object_field, object_field, 0.2, 0
+            ),
+            lambda: slm.otPhase2(
+                object_field, object_field, 0.2, 0
+            ),
+        )
+        for call in field_calls:
+            with self.subTest(call=call):
+                with self.assertRaisesRegex(
+                    TypeError, "concrete Julia .*numeric element type"
+                ):
+                    call()
+
+        u = vector.copy()
+        v = vector.copy()
+        with self.assertRaisesRegex(
+            TypeError, "concrete Julia real numeric element type"
+        ):
+            getattr(slm, "SinkhornIterBase!")(
+                u,
+                v,
+                vector.copy(),
+                vector.copy(),
+                np.ones(2, dtype=np.complex128),
+                np.ones(2, dtype=np.complex128),
+            )
+        np.testing.assert_array_equal(u, vector)
+        np.testing.assert_array_equal(v, vector)
+
+        # Abstract-array helpers accept Python vector literals. Concrete
+        # Array-only convolutional helpers require explicit contiguous NumPy
+        # storage so strided-view provenance remains distinguishable.
+        normalized = slm.normalizeDistribution([1.0, 3.0])
+        np.testing.assert_array_equal(normalized, [0.25, 0.75])
+        # Python range is the UnitRange/StepRange counterpart accepted by
+        # Julia's AbstractArray normalization overload.
+        normalized_range = slm.normalizeDistribution(range(1, 4))
+        np.testing.assert_allclose(
+            normalized_range, np.asarray([1 / 6, 1 / 3, 1 / 2])
+        )
+        self.assertEqual(normalized_range.dtype, np.dtype(np.float64))
+        with self.assertRaisesRegex(
+            TypeError, "concrete Julia numeric element type"
+        ):
+            slm.normalizeDistribution([])
+        with self.assertRaisesRegex(
+            TypeError, "concrete Julia numeric element type"
+        ):
+            slm.normalizeDistribution(np.asarray([], dtype=object))
+        typed_empty = slm.normalizeDistribution(
+            np.asarray([], dtype=np.float64)
+        )
+        self.assertEqual(typed_empty.dtype, np.dtype(np.float64))
+        self.assertEqual(typed_empty.size, 0)
+        with self.assertRaisesRegex(TypeError, "dense NumPy array"):
+            slm.SinkhornConvN(
+                [0.4, 0.6], [0.5, 0.5], 0.2, 0
+            )
+
+    def test_object_exact_domains_retain_same_element_type_dispatch(self) -> None:
+        rational = np.asarray(
+            [Fraction(1, 3), Fraction(2, 3)], dtype=object
+        )
+        decimal = np.asarray(
+            [Decimal("0.3"), Decimal("0.7")], dtype=object
+        )
+        np.testing.assert_equal(
+            slm.normalizeDistribution(rational), rational
+        )
+        np.testing.assert_equal(
+            slm.normalizeDistribution(decimal), decimal
+        )
+        np.testing.assert_equal(
+            slm.normalizeDistribution(
+                [Fraction(1, 3), Fraction(2, 3)]
+            ),
+            rational,
+        )
+        np.testing.assert_equal(
+            slm.normalizeDistribution(
+                [Decimal("0.3"), Decimal("0.7")]
+            ),
+            decimal,
+        )
+
+        kernel = np.ones(2, dtype=np.complex128)
+        with self.assertRaisesRegex(
+            TypeError, "same Julia element type"
+        ):
+            getattr(slm, "SinkhornIterBase!")(
+                rational.copy(),
+                decimal.copy(),
+                np.asarray([0.5, 0.5]),
+                np.asarray([0.5, 0.5]),
+                kernel,
+                kernel,
+            )
+        with self.assertRaisesRegex(
+            TypeError, "same Julia element type"
+        ):
+            slm.dualToGradients(
+                rational,
+                decimal,
+                np.asarray([0.5, 0.5]),
+                (range(2),),
+                0.2,
+            )
+
+        lattice = (range(2),)
+        rational_field = slm.LF[slm.Intensity, object, 1](
+            rational, lattice
+        )
+        decimal_field = slm.LF[slm.Intensity, object, 1](
+            decimal, lattice
+        )
+        with self.assertRaisesRegex(
+            TypeError, "same Julia element type"
+        ):
+            slm.otQuickPhase(
+                rational_field, decimal_field, 0.2, 0
+            )
+
     def test_empty_cost_and_map_domains_follow_julia(self) -> None:
         empty = (range(0),)
         with self.assertRaises(ValueError):
@@ -403,6 +630,10 @@ class CostMapAndIntegrationTests(unittest.TestCase):
         np.testing.assert_array_equal(
             target_empty, np.zeros((2, 1))
         )
+
+        zero_dimensional = slm.mapify(np.ones((1, 1)), (), ())
+        self.assertEqual(zero_dimensional.dtype, np.dtype(np.float64))
+        self.assertEqual(zero_dimensional.shape, (0,))
 
     def test_decimal_dense_ot_preserves_bigfloat_like_domain(self) -> None:
         axis = slm.LatticeAxis(
@@ -507,7 +738,7 @@ class DenseSinkhornTests(unittest.TestCase):
 
         fine = (np.linspace(x[0] - 0.1, x[-1] + 0.1, 7),)
         with self.assertRaisesRegex(
-            NotImplementedError, "non-integer target ranges"
+            NotImplementedError, "target range family"
         ):
             slm.pdotBeamEstimate(
                 root,
@@ -584,6 +815,137 @@ class DenseSinkhornTests(unittest.TestCase):
             np.testing.assert_allclose(
                 result.data, expected, rtol=2e-15, atol=2e-15
             )
+
+    def test_pdot_beam_unsigned_step_range_len_matches_julia(self) -> None:
+        lattice = (range(1, 4),)
+        root = slm.LF[slm.Intensity](
+            np.asarray([1.0, 2.0, 3.0]), lattice
+        )
+        target = slm.LF[slm.Intensity](
+            np.asarray([3.0, 2.0, 1.0]), lattice
+        )
+        cases = (
+            (
+                np.uint64(1),
+                np.asarray(
+                    [
+                        -0.6991993023937038 + 0.38699092354812786j,
+                        -0.23559278121970195 - 0.8283049645831322j,
+                        -0.2974178288619956 + 0.7289087204737252j,
+                    ]
+                ),
+            ),
+            (
+                np.uint64(2),
+                np.asarray(
+                    [
+                        0.5071259590381044 - 0.3833172906109222j,
+                        0.23468821828318845 - 0.8608319338361174j,
+                        -0.06967480062559796 - 0.3581336255736591j,
+                    ]
+                ),
+            ),
+        )
+        for step, expected in cases:
+            fine_axis = slm.LatticeAxis.from_start_step(
+                np.uint64(1), step, 3
+            )
+            self.assertEqual(fine_axis._range_kind, "srl")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                result = slm.pdotBeamEstimate(
+                    root,
+                    target,
+                    0.5,
+                    0.1,
+                    [0.0],
+                    [0.0],
+                    0.5,
+                    LFine=(fine_axis,),
+                    maxiter=1,
+                )
+            np.testing.assert_allclose(
+                result.data, expected, rtol=2e-15, atol=2e-15
+            )
+
+        for broken_unsigned_family in (
+            np.asarray([1, 2, 3], dtype=np.uint64),
+            slm.LatticeAxis(
+                np.asarray([1, 2, 3], dtype=np.uint64),
+                step_hint=np.uint64(1),
+            ),
+        ):
+            self.assertNotEqual(
+                getattr(broken_unsigned_family, "_range_kind", None), "srl"
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                with self.assertRaisesRegex(
+                    NotImplementedError, "target range family"
+                ):
+                    slm.pdotBeamEstimate(
+                        root,
+                        target,
+                        0.5,
+                        0.1,
+                        [0.0],
+                        [0.0],
+                        0.5,
+                        LFine=(broken_unsigned_family,),
+                        maxiter=1,
+                    )
+
+    def test_pdot_beam_decimal_bigfloat_like_path(self) -> None:
+        with localcontext() as context:
+            context.prec = 77
+            axis = slm.LatticeAxis(
+                np.asarray(
+                    [Decimal(-1), Decimal(0), Decimal(1)],
+                    dtype=object,
+                ),
+                step_hint=Decimal(1),
+            )
+            root = slm.LF[slm.Intensity](
+                np.asarray(
+                    [Decimal(1), Decimal(2), Decimal(3)],
+                    dtype=object,
+                ),
+                (axis,),
+                Decimal(2),
+            )
+            target = slm.LF[slm.Intensity](
+                np.asarray(
+                    [Decimal(3), Decimal(2), Decimal(1)],
+                    dtype=object,
+                ),
+                (axis,),
+                Decimal(2),
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                result = slm.pdotBeamEstimate(
+                    root,
+                    target,
+                    Decimal("0.5"),
+                    Decimal("0.1"),
+                    [Decimal(0)],
+                    [Decimal(0)],
+                    0.5,
+                    maxiter=10,
+                )
+        expected = np.asarray(
+            [
+                -0.5534002481605589 - 0.5063322867805755j,
+                -0.046346772238773294 - 0.23498154289000017j,
+                -0.6347606587150854 + 0.9884788000008184j,
+            ]
+        )
+        self.assertEqual(result.dtype, np.dtype(np.complex128))
+        self.assertIsInstance(result.flambda, Decimal)
+        self.assertEqual(result.L[0].dtype, np.dtype(object))
+        np.testing.assert_allclose(
+            result.data, expected, rtol=3e-15, atol=3e-15
+        )
 
     def test_pdot_beam_keeps_float16_and_float32_root_arithmetic(self) -> None:
         expected = {
@@ -819,7 +1181,7 @@ class ConvolutionalAndSeparableTests(unittest.TestCase):
         result = slm.otPhase2(source, target, 0.2, 0)
         self.assertEqual(result.dtype, np.dtype(np.float64))
         np.testing.assert_allclose(
-            result.data,
+            result.data.copy(),
             np.asarray(
                 [
                     [0.0, -0.3040850845638407],

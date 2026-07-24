@@ -123,8 +123,8 @@ from .bmp8 import save_gray8bmp
 __version__ = "0.3.0"
 JULIA_SOURCE_COMMIT = "ea1c1c9c06b4b2dc46372ac7ee031301b604a007"
 
-# Julia-qualified helpers that are intentionally absent from its ``export``
-# declarations remain package attributes without entering ``__all__``.
+# Source-qualified helpers and explicit spellings for Julia-only call syntax
+# remain package attributes without entering the exact ``__all__`` surface.
 rampPrivate = ramp
 from .templates import _l2form as l2form, _standard_output as lfStandardOutputFormat
 globals()["SinkhornIterBase!"] = _SinkhornIterBase

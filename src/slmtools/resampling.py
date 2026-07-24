@@ -6,15 +6,15 @@ The ``bc`` argument controls the cubic endpoint equations, while
 ``extrapolation_bc`` selects numeric fill, ``Flat``, ``Periodic``, ``Linear``,
 or throwing behavior outside the source grid.
 
-Unlike the Julia methods, nonpositive scale factors are rejected explicitly;
-their original behavior was an assortment of divide/bounds errors rather than
-a useful supported convention.
+The range/lattice upsampler retains Julia's unusual but successful empty
+``StepRangeLen`` results for zero and negative factors. Downsampling and block
+coarsening keep focused errors for their corresponding failing source paths.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import ROUND_FLOOR, Decimal
+from decimal import ROUND_FLOOR, Decimal, localcontext
 from fractions import Fraction
 from numbers import Integral, Number
 from typing import Any, Callable
@@ -30,10 +30,15 @@ from .lattice_field import (
     LatticeField,
     _axis,
     _julia_array_scalar_operation,
+    _julia_sum,
     _logical_axis_scalar_operation,
     as_lattice,
 )
 from .lattice_utils import _looks_like_lattice, _step
+from .misc import (
+    _enable_decimal_nonfinite,
+    _fraction_int64_divide,
+)
 
 
 @dataclass(frozen=True)
@@ -1665,7 +1670,12 @@ def _integer_factor(factor: Any) -> int:
     return result
 
 
-def _factor_tuple(factor: Any, ndim: int) -> tuple[int, ...]:
+def _factor_tuple(
+    factor: Any,
+    ndim: int,
+    *,
+    require_positive: bool = True,
+) -> tuple[int, ...]:
     if type(factor) is int or isinstance(factor, np.int64):
         factors = (_integer_factor(factor),) * ndim
     else:
@@ -1676,7 +1686,7 @@ def _factor_tuple(factor: Any, ndim: int) -> tuple[int, ...]:
         factors = tuple(_integer_factor(item) for item in raw_factors)
         if len(factors) != ndim:
             raise DimensionMismatch("Scale factors must match lattice dimension.")
-    if any(item <= 0 for item in factors):
+    if require_positive and any(item <= 0 for item in factors):
         raise DomainError("Scale factors must be positive.")
     return factors
 
@@ -1730,8 +1740,6 @@ def _downsample_lattice(lattice: Any, factor: Any) -> Lattice:
 def _upsample_axis(axis: Any, factor: Any) -> LatticeAxis:
     factor = _integer_factor(factor)
     values = np.asarray(axis)
-    if factor <= 0:
-        raise DomainError("Upsample factor must be positive.")
     step = (
         _regular_step(axis, require_positive=False)
         if isinstance(axis, LatticeAxis)
@@ -1740,14 +1748,14 @@ def _upsample_axis(axis: Any, factor: Any) -> LatticeAxis:
     # Julia computes ``step(r) / n`` *before* combining it with the Float64
     # index-centering term.  Low-precision division therefore rounds in the
     # source dtype, while the final coordinates are widened to Float64.
-    output_step = _julia_array_scalar_operation(
-        np.asarray(step), factor, np.divide
-    ).reshape(())[()]
-    k = LatticeAxis.from_start_step(
-        np.int64(1),
-        np.int64(1),
-        len(values) * factor,
-    )
+    with np.errstate(divide="ignore", invalid="ignore"):
+        output_step = _julia_array_scalar_operation(
+            np.asarray(step), factor, np.divide
+        ).reshape(())[()]
+    # The Julia source spells this index axis ``1:length(r)*n``, a UnitRange.
+    # Its scalar subtraction overload is observably different from the
+    # explicit unit-step StepRange produced by ``range(start, step, length)``.
+    k = _axis(range(1, len(values) * factor + 1))
     center = np.float64((1 + factor) / 2)
     centered = _logical_axis_scalar_operation(k, center, np.subtract)
     scaled = _logical_axis_scalar_operation(
@@ -1762,7 +1770,9 @@ def _upsample_axis(axis: Any, factor: Any) -> LatticeAxis:
 
 def _upsample_lattice(lattice: Any, factor: Any) -> Lattice:
     axes = as_lattice(lattice)
-    factors = _factor_tuple(factor, len(axes))
+    factors = _factor_tuple(
+        factor, len(axes), require_positive=False
+    )
     return tuple(
         _upsample_axis(axis, item)
         for axis, item in zip(axes, factors, strict=True)
@@ -1839,6 +1849,45 @@ def downsample(
     return _interpolate(array, source, target, interpolation, boundary)
 
 
+def _empty_coarsen_default_dtype(dtype: np.dtype[Any]) -> np.dtype[Any]:
+    """Return Julia's inferred default-reducer dtype for an empty result."""
+
+    if dtype.kind in "biu":
+        return np.dtype(np.float64)
+    return dtype
+
+
+def _empty_coarsen_reducer_dtype(
+    dtype: np.dtype[Any],
+    reducer: Callable[[np.ndarray], Any] | None,
+) -> np.dtype[Any]:
+    """Infer an empty coarsening result without evaluating ``reducer``.
+
+    Julia obtains this type from compiler inference for the comprehension.
+    Python exposes less static callable information, so common NumPy reductions
+    are handled explicitly. An arbitrary Python callable has no result value
+    when it is not called and therefore maps to object storage.
+    """
+
+    if reducer is None or reducer is np.mean:
+        return _empty_coarsen_default_dtype(dtype)
+
+    if any(
+        reducer is candidate
+        for candidate in (np.max, np.amax, np.min, np.amin)
+    ):
+        return dtype
+
+    if reducer is np.sum:
+        if dtype.kind in "bi":
+            return np.dtype(np.int64)
+        if dtype.kind == "u":
+            return np.dtype(np.uint64)
+        return dtype
+
+    return np.dtype(object)
+
+
 def coarsen(
     value: Any,
     factor: Any,
@@ -1857,42 +1906,45 @@ def coarsen(
         raise DomainError(
             "coarsen: Downsample factors ns do not divide the size of array x."
         )
-    if reducer is None:
-        reducer = lambda block: np.sum(block) / block.size
     output_shape = tuple(
         size // item for size, item in zip(array.shape, factors, strict=True)
     )
+    if any(size == 0 for size in output_shape):
+        return np.empty(
+            output_shape,
+            dtype=_empty_coarsen_reducer_dtype(array.dtype, reducer),
+        )
+    default_reducer = reducer is None
+    sum_reducer = reducer is np.sum
     object_output = np.empty(output_shape, dtype=object)
     for index in np.ndindex(output_shape):
         block = tuple(
             slice(i * width, (i + 1) * width)
             for i, width in zip(index, factors, strict=True)
         )
-        object_output[index] = reducer(array[block])
-    if object_output.size == 0:
-        # Julia infers the comprehension element type even when its
-        # Cartesian index set is empty.  NumPy has no callable return-type
-        # inference, so evaluate the reducer once on a one-sample-per-axis
-        # type probe.  The probe is deliberately independent of the possibly
-        # enormous coarsening factors: only the reducer's scalar result dtype
-        # is needed, not a materialized superpixel.
-        #
-        # This preserves, for example, Float32/ComplexF32 default means and
-        # custom reducers returning Int16 or ComplexF32 instead of silently
-        # manufacturing a Float64 empty result.
-        probe = np.zeros((1,) * array.ndim, dtype=array.dtype)
-        try:
-            reduced_probe = reducer(probe)
-        except Exception:
-            # A Python callable can be value- or shape-dependent in ways that
-            # Julia's inferred comprehension element type is not.  Object is
-            # the only non-narrowing representation when a safe probe cannot
-            # determine that type.
-            return np.empty(output_shape, dtype=object)
-        reduced_array = np.asarray(reduced_probe)
-        if reduced_array.ndim != 0:
-            return np.empty(output_shape, dtype=object)
-        return np.empty(output_shape, dtype=reduced_array.dtype)
+        superpixel = array[block]
+        if default_reducer or sum_reducer:
+            total = _julia_sum(superpixel)
+            if default_reducer:
+                if isinstance(total, Fraction):
+                    total = _fraction_int64_divide(
+                        total, Fraction(superpixel.size, 1)
+                    )
+                elif isinstance(total, Decimal):
+                    with localcontext() as context:
+                        _enable_decimal_nonfinite(context)
+                        total = total / Decimal(superpixel.size)
+                else:
+                    divided = _julia_array_scalar_operation(
+                        np.asarray(total),
+                        np.int64(superpixel.size),
+                        np.divide,
+                    )
+                    total = divided.reshape(())[()]
+            object_output[index] = total
+        else:
+            assert reducer is not None
+            object_output[index] = reducer(superpixel)
     sample_values = list(object_output.flat)
     dtype = np.result_type(*[np.asarray(item).dtype for item in sample_values])
     output = np.empty(output_shape, dtype=dtype)

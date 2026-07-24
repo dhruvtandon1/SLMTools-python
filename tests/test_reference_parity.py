@@ -1,14 +1,15 @@
 """Small cross-language goldens and package-wide acceptance checks.
 
 The dense-OT values below were generated with Julia SLMTools commit
-ea1c1c9c06b4b2dc46372ac7ee031301b604a007, Julia 1.12.6 loading the pinned
-project manifest, OptimalTransport 0.3.20, and ``--compiled-modules=no``.
+ea1c1c9c06b4b2dc46372ac7ee031301b604a007, the manifest's exact Julia
+1.11.6 runtime, and OptimalTransport 0.3.20.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
+import subprocess
 import unittest
 
 import numpy as np
@@ -16,6 +17,9 @@ from PIL import Image, ImageFont
 
 import slmtools as slm
 from slmtools import subimages
+
+
+_AUDITED_JULIA_COMMIT = "ea1c1c9c06b4b2dc46372ac7ee031301b604a007"
 
 
 class ReferenceParityTests(unittest.TestCase):
@@ -45,6 +49,8 @@ class ReferenceParityTests(unittest.TestCase):
             "SinkhornIterBase!",
         ):
             self.assertTrue(callable(getattr(slm, qualified)))
+        self.assertFalse(hasattr(slm, "julia_add"))
+        self.assertFalse(hasattr(slm, "julia_mul"))
 
     def test_remaining_template_and_scalar_entry_points(self) -> None:
         lattice = slm.natlat((12, 12))
@@ -72,11 +78,11 @@ class ReferenceParityTests(unittest.TestCase):
 
         expected = np.asarray(
             [
-                0.49427105834925295,
-                0.25665975677383207,
-                0.1792217920522723,
-                0.2540031182403051,
-                0.25665975677383207,
+                0.49427105834925306,
+                0.2566597567738322,
+                0.1792217920522724,
+                0.25400311824030514,
+                0.2566597567738321,
                 0.0,
                 -0.08790203141485209,
                 -0.009288840596768988,
@@ -87,7 +93,7 @@ class ReferenceParityTests(unittest.TestCase):
                 0.2530199367901494,
                 -0.009288840596768988,
                 -0.10094500122561556,
-                -0.022220416553216327,
+                -0.022220416553216382,
             ]
         )
         np.testing.assert_allclose(
@@ -95,17 +101,23 @@ class ReferenceParityTests(unittest.TestCase):
         )
         self.assertIs(phase.field_type, slm.RealPhase)
 
-    def test_reduced_readme_workflow(self) -> None:
-        lattice = slm.natlat((8, 8))
+    def test_exact_readme_quick_start(self) -> None:
+        size = 16
+        lattice = slm.natlat((size, size))
         dual = slm.dualShiftLattice(lattice)
         source = slm.lfGaussian(slm.Intensity, lattice, 1.0)
-        target = slm.lfRing(slm.Intensity, dual, 1.0, 0.4)
-        phase_ot = slm.otPhase2(source, target, 0.05, 8)
-        phase_gs = slm.gs(source, target, 4, phase_ot)
-        output = slm.square(slm.sft(np.sqrt(source) * phase_gs))
-        display = slm.look(target, output)
-        self.assertEqual(display.shape, (8, 16))
-        self.assertTrue(np.all(np.isfinite(output.data)))
+        target = slm.lfRing(slm.Intensity, dual, 2.5, 0.5)
+        phase_ot = slm.otPhase(source, target, 0.002)
+        phase_ot2 = slm.otPhase2(source, target, 0.0002, 200)
+        phase_gs = slm.gs(source, target, 100, phase_ot)
+        output_ot = slm.square(slm.sft(np.sqrt(source) * phase_ot))
+        output_ot2 = slm.square(slm.sft(np.sqrt(source) * phase_ot2))
+        output_gs = slm.square(slm.sft(np.sqrt(source) * phase_gs))
+        display = slm.look(target, output_ot, output_ot2, output_gs)
+        self.assertEqual(display.shape, (size, 4 * size))
+        self.assertTrue(np.all(np.isfinite(output_ot.data)))
+        self.assertTrue(np.all(np.isfinite(output_ot2.data)))
+        self.assertTrue(np.all(np.isfinite(output_gs.data)))
         self.assertIs(phase_gs.field_type, slm.ComplexPhase)
 
     def test_subimages_keeps_julia_grid_order_and_upstream_padall_behavior(self) -> None:
@@ -143,16 +155,70 @@ class ReferenceParityTests(unittest.TestCase):
 
         self.assertEqual(subimages.plotToImage(FakePlot()).shape, (3, 2, 4))
 
-    def test_port_is_not_a_git_repository(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        self.assertFalse(any(path.name == ".git" for path in root.rglob(".git")))
-
     @unittest.skipUnless(
         os.environ.get("SLMTOOLS_JULIA_REPO"),
         "set SLMTOOLS_JULIA_REPO for the large read-only image integration",
     )
     def test_original_orientation_fixture_read_only(self) -> None:
         original = Path(os.environ["SLMTOOLS_JULIA_REPO"])
+        try:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(original),
+                    "merge-base",
+                    "--is-ancestor",
+                    _AUDITED_JULIA_COMMIT,
+                    "HEAD",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(original),
+                    "diff",
+                    "--quiet",
+                    _AUDITED_JULIA_COMMIT,
+                    "HEAD",
+                    "--",
+                    ":(glob)src/**/*.jl",
+                    "Project.toml",
+                    "Manifest.toml",
+                    ":(glob)test/test_data/test_images_B/LinearPhases/**",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(original),
+                    "diff",
+                    "--quiet",
+                    _AUDITED_JULIA_COMMIT,
+                    "--",
+                    ":(glob)src/**/*.jl",
+                    "Project.toml",
+                    "Manifest.toml",
+                    ":(glob)test/test_data/test_images_B/LinearPhases/**",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            self.fail(
+                "SLMTOOLS_JULIA_REPO must descend from the audited commit "
+                "without changing Julia source, its environment, or the "
+                "required fixture files"
+            )
         directory = original / "test/test_data/test_images_B/LinearPhases"
         fields, indices = slm.loadDir(str(directory) + os.sep, ".bmp")
         roi = (slice(539, 840), slice(899, 1200))

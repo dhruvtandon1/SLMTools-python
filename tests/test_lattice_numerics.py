@@ -26,12 +26,15 @@ from slmtools.lattice_field import (
 )
 from slmtools.lattice_utils import (
     FrFTBasis,
+    Nyquist,
     hermiteBasis,
     ldot,
     natlat,
     natrange,
     padout,
+    r2,
     shiftedDFTBasis,
+    toDim,
     wigner_fft,
 )
 from slmtools.resampling import (
@@ -142,8 +145,12 @@ class ResamplingTests(unittest.TestCase):
             downsample((range(5),), 2)
         with self.assertRaises(DomainError):
             coarsen(np.zeros((3, 4)), (2, 2))
-        with self.assertRaises(DomainError):
-            upsample((range(4),), 0)
+        empty = upsample((range(1, 5),), 0)[0]
+        self.assertEqual(len(empty), 0)
+        self.assertTrue(np.isinf(empty._step_hint))
+        reverse_empty = upsample((range(1, 5),), -1)[0]
+        self.assertEqual(len(reverse_empty), 0)
+        self.assertEqual(reverse_empty._step_hint, -1)
 
 
 class DualAndTransformTests(unittest.TestCase):
@@ -168,7 +175,7 @@ class DualAndTransformTests(unittest.TestCase):
             3 * np.asarray(dual[0])[:, None]
             + 0 * np.asarray(dual[1])[None, :]
         ) / 2
-        np.testing.assert_allclose(phase.data, expected)
+        np.testing.assert_allclose(phase.data.copy(), expected)
         self.assertIs(phase.field_type, RealPhase)
 
     def test_float16_steprangelen_arithmetic_matches_julia_goldens(self):
@@ -573,7 +580,7 @@ class DualAndTransformTests(unittest.TestCase):
         self.assertNotIsInstance(np.add(axis, axis), LatticeAxis)
 
     def test_general_range_affine_paths_match_live_julia_bits(self):
-        # Live Julia 1.12.6 probes.  These exercise three distinct Base range
+        # Exact Julia 1.11.6 probes. These exercise three distinct Base range
         # representations: UnitRange{Int64}, low-float StepRangeLen with
         # Float64 ref/step, and Float64 TwicePrecision StepRangeLen.
         dot = ldot((np.float16(0.001),), (range(1, 12),))
@@ -629,6 +636,31 @@ class DualAndTransformTests(unittest.TestCase):
             ),
         )
 
+        # Base re-truncates a TwicePrecision step after scalar
+        # multiplication (but not after scalar division, as exercised by
+        # natrange above).
+        multiplied = (
+            LatticeAxis.from_start_step(-1.0, 0.1, 10) * np.float64(0.03)
+        )
+        np.testing.assert_array_equal(
+            multiplied.view(np.uint64),
+            np.asarray(
+                [
+                    0xBF9EB851EB851EB8,
+                    0xBF9BA5E353F7CED9,
+                    0xBF989374BC6A7EFA,
+                    0xBF95810624DD2F1A,
+                    0xBF926E978D4FDF3B,
+                    0xBF8EB851EB851EB8,
+                    0xBF889374BC6A7EFA,
+                    0xBF826E978D4FDF3B,
+                    0xBF789374BC6A7EFA,
+                    0xBF689374BC6A7EFA,
+                ],
+                dtype=np.uint64,
+            ),
+        )
+
         ordinal = LatticeAxis.from_start_step(
             np.int64(-3), np.int64(1), 7
         )
@@ -637,10 +669,10 @@ class DualAndTransformTests(unittest.TestCase):
             np.asarray(
                 [
                     0xC166,
-                    0xBECC,
-                    0xB998,
-                    0x34D0,
-                    0x3D34,
+                    0xBECD,
+                    0xB99A,
+                    0x34CD,
+                    0x3D33,
                     0x409A,
                     0x429A,
                 ],
@@ -658,6 +690,26 @@ class DualAndTransformTests(unittest.TestCase):
                     0xB99A,
                     0xBECD,
                     0xC166,
+                ],
+                dtype=np.uint16,
+            ),
+        )
+
+        # UnitRange has a distinct broadcast overload even though its visible
+        # step is also one. Python's unit-step ``range`` preserves that
+        # distinction from an explicit ``LatticeAxis.from_start_step``.
+        unit = LF[Generic](np.zeros(7), (range(-3, 4),)).L[0]
+        np.testing.assert_array_equal(
+            (unit + np.float16(0.3)).view(np.uint16),
+            np.asarray(
+                [
+                    0xC166,
+                    0xBECC,
+                    0xB998,
+                    0x34D0,
+                    0x3D34,
+                    0x409A,
+                    0x429A,
                 ],
                 dtype=np.uint16,
             ),
@@ -800,8 +852,63 @@ class DualAndTransformTests(unittest.TestCase):
             np.dtype(np.bool_),
         )
         np.testing.assert_array_equal(boolean, [0, 1, 2, 3])
+        # Base chooses StepRangeLen whenever the computed endpoint is
+        # unsigned; unlike signed StepRange, that family permits zero steps.
+        unsigned_constant = LatticeAxis.from_start_step(
+            np.uint64(2), np.uint64(0), 3
+        )
+        np.testing.assert_array_equal(
+            unsigned_constant,
+            np.asarray([2, 2, 2], dtype=np.uint64),
+        )
         with self.assertRaisesRegex(ValueError, "step cannot be zero"):
-            LatticeAxis.from_start_step(np.uint64(2), np.uint64(0), 3)
+            LatticeAxis.from_start_step(np.uint8(2), np.uint8(0), 3)
+
+    def test_integer_range_endpoint_overflow_follows_base_range_family(self):
+        maximum = np.iinfo(np.int64).max
+        minimum = np.iinfo(np.int64).min
+
+        # range(typemax(Int), step=1, length=2) computes a wrapped signed
+        # endpoint and StepRange normalizes it to an empty range.
+        empty = LatticeAxis.from_start_step(
+            np.int64(maximum), np.int64(1), 2
+        )
+        self.assertEqual(empty.dtype, np.dtype(np.int64))
+        self.assertEqual(len(empty), 0)
+
+        # Base's modular StepRange length specialization has several
+        # counterintuitive exact Julia 1.11.6 boundary outcomes.
+        two = LatticeAxis.from_start_step(
+            np.int64(0), np.int64(minimum), 0
+        )
+        np.testing.assert_array_equal(two, [0, minimum])
+        with self.assertRaisesRegex(
+            NotImplementedError, r"exact Julia 1\.11\.6"
+        ):
+            LatticeAxis.from_start_step(
+                np.int64(minimum), np.bool_(True), 0
+            )
+
+    def test_float_range_nonfinite_and_signed_zero_match_julia_base(self):
+        zero = LatticeAxis.from_start_step(0.0, -0.0, 3)
+        self.assertFalse(np.signbit(zero._step_hint))
+        np.testing.assert_array_equal(zero, [0.0, 0.0, 0.0])
+
+        narrow_infinity = LatticeAxis.from_start_step(
+            np.float32(np.inf), np.float32(1), 3
+        )
+        np.testing.assert_array_equal(
+            narrow_infinity,
+            np.full(3, np.float32(np.inf), dtype=np.float32),
+        )
+        wide_infinity = LatticeAxis.from_start_step(
+            np.float64(np.inf), np.float64(1), 3
+        )
+        self.assertTrue(np.all(np.isnan(wide_infinity)))
+
+        infinite_step = LatticeAxis.from_start_step(1.0, np.inf, 3)
+        self.assertTrue(np.isnan(infinite_step._step_hint))
+        self.assertTrue(np.all(np.isnan(infinite_step)))
 
     def test_empty_range_consumers_and_uint64_dual_match_julia(self):
         empty = LatticeAxis.from_start_step(
@@ -832,6 +939,60 @@ class DualAndTransformTests(unittest.TestCase):
             np.full(6, 0x5F555555, dtype=np.uint32),
         )
 
+    def test_lattice_utility_dispatch_and_zero_dimensional_failures(self):
+        for value in (
+            True,
+            np.int8(3),
+            np.int32(3),
+            np.uint64(3),
+            3.0,
+        ):
+            with self.assertRaises(TypeError):
+                natrange(value)
+        for value in ([3, 4], np.asarray([3, 4]), (np.int32(3),)):
+            with self.assertRaises(TypeError):
+                natlat(value)
+
+        vector = np.asarray([1, 2])
+        for invalid in (True, np.int32(1), np.uint64(1)):
+            with self.assertRaises(TypeError):
+                toDim(vector, invalid, 2)
+            with self.assertRaises(TypeError):
+                toDim(vector, 1, invalid)
+        for invalid_vector in ((1, 2), "12", 3):
+            with self.assertRaises(TypeError):
+                toDim(invalid_vector, 1, 2)
+
+        # The source does not validate d against n; reshape succeeds when the
+        # resulting all-singleton shape has the correct element count.
+        np.testing.assert_array_equal(toDim([7], 0, 2), [[7]])
+        self.assertEqual(toDim(np.asarray(7), 1, 0).shape, ())
+
+        with self.assertRaises(TypeError):
+            r2(())
+        with self.assertRaises(TypeError):
+            ldot(np.asarray([], dtype=np.int64), ())
+        with self.assertRaises(TypeError):
+            ldot((), ())
+
+    def test_nyquist_widens_narrow_integer_steps_before_multiplication(self):
+        cases = (
+            (np.int8, 100, np.float64(0.005)),
+            (np.uint8, 200, np.float64(0.0025)),
+            (np.int16, 20_000, np.float64(0.000025)),
+        )
+        for dtype, step, expected in cases:
+            axis = LatticeAxis.from_start_step(
+                dtype(0), dtype(step), 1
+            )
+            actual = Nyquist((axis,))[0]
+            self.assertIs(type(actual), np.float64)
+            self.assertEqual(actual, expected)
+
+        zero = LatticeAxis.from_start_step(0.0, -0.0, 1)
+        actual_zero = Nyquist((zero,))[0]
+        self.assertTrue(np.isposinf(actual_zero))
+
     def test_shifted_fft_matches_definition_and_round_trip(self):
         rng = np.random.default_rng(42)
         data = rng.normal(size=(5, 4)) + 1j * rng.normal(size=(5, 4))
@@ -843,7 +1004,9 @@ class DualAndTransformTests(unittest.TestCase):
         field = LF[ComplexAmplitude](data, lattice, 1.5)
         transformed = sft(field)
         self.assertIs(transformed.field_type, ComplexAmplitude)
-        np.testing.assert_allclose(isft(transformed).data, data, atol=1e-12)
+        np.testing.assert_allclose(
+            isft(transformed).data.copy(), data, atol=1e-12
+        )
 
         rational = np.array([Fraction(1), Fraction(2)], dtype=object)
         rational_transform = sft(rational)
@@ -865,6 +1028,10 @@ class BasisAndWignerTests(unittest.TestCase):
             np.testing.assert_allclose(
                 basis.conj().T @ basis, np.eye(n), atol=2e-14
             )
+        for n in (-2, -1, 0):
+            basis = shiftedDFTBasis(n)
+            self.assertEqual(basis.shape, (0, 0))
+            self.assertEqual(basis.dtype, np.dtype(np.complex128))
 
     def test_unusable_upstream_hermite_and_fractional_fourier_bases(self):
         with self.assertRaisesRegex(NotImplementedError, "audited Julia"):
@@ -912,6 +1079,41 @@ class BasisAndWignerTests(unittest.TestCase):
         np.testing.assert_allclose(
             wigner_fft(short).ravel(order="F"), expected_fortran, atol=5e-16
         )
+
+    def test_wigner_fft_keeps_concrete_numeric_vector_dispatch(self):
+        for dtype in (np.bool_, np.int32, np.uint64):
+            result = wigner_fft(np.asarray([1, 0], dtype=dtype))
+            self.assertEqual(result.shape, (2, 4))
+            self.assertEqual(result.dtype, np.dtype(np.float64))
+
+        # Python lists model Julia Vector literals. Tuples and ranges model
+        # distinct Julia container types and do not match Vector{T}.
+        self.assertEqual(wigner_fft([1, 0]).shape, (2, 4))
+        for invalid in (
+            (1, 0),
+            range(2),
+            np.asarray(["1", "0"]),
+            np.asarray([1, 0], dtype=object),
+            np.asarray([1.0, 0.0], dtype=object),
+            np.asarray([1 + 0j, 0j], dtype=object),
+            np.asarray([[1, 0]]),
+        ):
+            with self.assertRaises(TypeError):
+                wigner_fft(invalid)
+        self.assertEqual(
+            wigner_fft(
+                np.asarray([Fraction(1), Fraction(0)], dtype=object)
+            ).shape,
+            (2, 4),
+        )
+        self.assertEqual(
+            wigner_fft(
+                np.asarray([Decimal(1), Decimal(0)], dtype=object)
+            ).shape,
+            (2, 4),
+        )
+        with self.assertRaises(ValueError):
+            wigner_fft(np.asarray([], dtype=np.int64))
 
 
 if __name__ == "__main__":

@@ -570,30 +570,66 @@ class ResamplingRegressionTests(unittest.TestCase):
 
     def test_empty_coarsen_retains_julia_inferred_reducer_dtype(self) -> None:
         # Locked Julia goldens:
+        #   coarsen(Bool[], 2)      :: Vector{Float64}
         #   coarsen(Float32[], 2)   :: Vector{Float32}
         #   coarsen(ComplexF32[],2) :: Vector{ComplexF32}
         #   coarsen(Int8[], 2)      :: Vector{Float64}
         for dtype, expected in (
-            (np.float32, np.float32),
-            (np.complex64, np.complex64),
+            (np.bool_, np.float64),
             (np.int8, np.float64),
+            (np.uint8, np.float64),
+            (np.float16, np.float16),
+            (np.float32, np.float32),
+            (np.float64, np.float64),
+            (np.complex64, np.complex64),
+            (np.complex128, np.complex128),
         ):
             result = coarsen(np.empty(0, dtype=dtype), 2)
             self.assertEqual(result.shape, (0,))
             self.assertEqual(result.dtype, np.dtype(expected))
 
-        complex_result = coarsen(
+        matrix = coarsen(np.empty((0, 4), dtype=np.float32), (2, 2))
+        self.assertEqual(matrix.shape, (0, 2))
+        self.assertEqual(matrix.dtype, np.dtype(np.float32))
+
+        for reducer, dtype, expected in (
+            (np.max, np.float32, np.float32),
+            (np.amax, np.complex64, np.complex64),
+            (np.min, np.float16, np.float16),
+            (np.amin, np.uint8, np.uint8),
+            (np.mean, np.int8, np.float64),
+            (np.sum, np.int8, np.int64),
+            (np.sum, np.uint8, np.uint64),
+        ):
+            result = coarsen(
+                np.empty(0, dtype=dtype), 2, reducer=reducer
+            )
+            self.assertEqual(result.dtype, np.dtype(expected))
+
+    def test_empty_coarsen_does_not_execute_custom_reducer(self) -> None:
+        calls: list[tuple[int, ...]] = []
+
+        class Reducer:
+            def __call__(self, block: np.ndarray) -> np.complex64:
+                calls.append(block.shape)
+                return np.complex64(1 + 2j)
+
+        result = coarsen(
             np.empty(0, dtype=np.float32),
             2,
-            reducer=lambda block: np.complex64(1 + 2j),
+            reducer=Reducer(),
         )
-        integer_result = coarsen(
-            np.empty(0, dtype=np.float32),
-            2,
-            reducer=lambda block: np.int16(3),
+        self.assertEqual(calls, [])
+        self.assertEqual(result.dtype, np.dtype(object))
+
+        unknown_result = coarsen(
+            np.empty((4, 0), dtype=np.float32),
+            (2, 2),
+            reducer=Reducer(),
         )
-        self.assertEqual(complex_result.dtype, np.dtype(np.complex64))
-        self.assertEqual(integer_result.dtype, np.dtype(np.int16))
+        self.assertEqual(calls, [])
+        self.assertEqual(unknown_result.shape, (2, 0))
+        self.assertEqual(unknown_result.dtype, np.dtype(object))
 
     def test_rational_interpolation_is_exact(self) -> None:
         source = np.array([Fraction(index) for index in range(4)], dtype=object)
@@ -706,9 +742,17 @@ class ResamplingRegressionTests(unittest.TestCase):
             with self.assertRaises(DomainError):
                 downsample(source, factor)
             with self.assertRaises(DomainError):
-                upsample(source, factor)
-            with self.assertRaises(DomainError):
                 coarsen(np.arange(4.0), factor)
+        zero_factor = upsample(source, 0)
+        self.assertEqual(len(zero_factor), 0)
+        self.assertEqual(zero_factor._range_kind, "srl")
+        self.assertTrue(np.isinf(zero_factor._logical_ref))
+        self.assertTrue(np.isinf(zero_factor._logical_step))
+        negative_factor = upsample(source, -1)
+        self.assertEqual(len(negative_factor), 0)
+        self.assertEqual(negative_factor._range_kind, "srl")
+        self.assertEqual(negative_factor._logical_ref, -1.0)
+        self.assertEqual(negative_factor._logical_step, -1.0)
 
         singleton = LatticeAxis(np.array([2.0]), step_hint=0.5)
         for constructor in (CubicSplineInterpolation, LinearInterpolation):

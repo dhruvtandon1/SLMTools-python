@@ -205,6 +205,22 @@ class GerchbergSaxtonTests(unittest.TestCase):
         np.testing.assert_array_equal(logged.data, np.ones(2, dtype=np.complex128))
         self.assertEqual(errors, [0.5857864376269049])
 
+    def test_gs_log_checks_rational_int64_square_before_fft_conversion(self) -> None:
+        lattice = slm.natlat((1,))
+        value = Fraction(3_037_000_500)
+        source = slm.LF[slm.Modulus, object, 1](
+            np.asarray([value], dtype=object), lattice
+        )
+        target = slm.LF[slm.Modulus, object, 1](
+            np.asarray([value], dtype=object),
+            slm.dualShiftLattice(lattice),
+        )
+        phase = slm.LF[slm.RealPhase, object, 1](
+            np.asarray([Fraction(0)], dtype=object), lattice
+        )
+        with self.assertRaisesRegex(OverflowError, "Rational"):
+            slm.gsLog(source, target, 0, phase)
+
     def test_gs_log_retains_julia_low_precision_normalization(self) -> None:
         expected = {
             np.float16: (
@@ -389,7 +405,7 @@ class PhaseDiversityTests(unittest.TestCase):
         )
         # FFTW and pocketfft differ by a handful of binary64 ulps.
         np.testing.assert_allclose(
-            result.data, expected, rtol=2e-15, atol=2e-15
+            result.data.copy(), expected, rtol=2e-15, atol=2e-15
         )
         self.assertIsInstance(result.flambda, np.float32)
         self.assertTrue(

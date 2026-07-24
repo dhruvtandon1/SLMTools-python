@@ -47,6 +47,7 @@ from .lattice_field import (
     _julia_array_array_operation,
     _julia_array_scalar_operation,
     _logical_axis_scalar_operation,
+    _require_dense_ndarray,
     as_lattice,
     elq,
     normalizeLF,
@@ -277,7 +278,7 @@ def padout(
         pairs = _normalize_padding(padding, len(lattice))
         return tuple(_pad_axis(axis, pair) for axis, pair in zip(lattice, pairs))
 
-    array = np.asarray(value)
+    array = _require_dense_ndarray(value, "padout array")
     pairs = _normalize_padding(padding, array.ndim)
     if any(before < 0 or after < 0 for before, after in pairs):
         # Julia's AbstractRange overload supports negative coordinate cropping,
@@ -423,11 +424,15 @@ def ldot(left: Any, right: Any) -> np.ndarray:
         if not all(_is_real_number(value) for value in coefficients):
             raise TypeError("Lattice dot-product coefficients must be real.")
     else:
-        vector = (
-            _julia_literal_array(vector_input)
-            if isinstance(vector_input, list)
-            else np.asarray(vector_input)
-        )
+        if isinstance(vector_input, list):
+            vector = _julia_literal_array(vector_input)
+        elif isinstance(vector_input, np.ndarray):
+            vector = _require_dense_ndarray(vector_input, "ldot vector")
+        else:
+            raise TypeError(
+                "ldot vector input must be a list, dense NumPy vector, "
+                "or real tuple"
+            )
         if vector.ndim != 1:
             raise ValueError("Vector length != Lattice dimension.")
         coefficients = tuple(vector)
@@ -468,14 +473,15 @@ def Nyquist(lattice: Any) -> tuple[Any, ...]:
 
     output: list[Any] = []
     for axis in as_lattice(lattice):
-        doubled = _julia_array_scalar_operation(
-            np.asarray(_step(axis)), np.int64(2), np.multiply
-        ).reshape(())[()]
-        output.append(
-            _julia_array_scalar_operation(
-                np.asarray(np.int64(1)), doubled, np.divide
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            doubled = _julia_array_scalar_operation(
+                np.asarray(_step(axis)), np.int64(2), np.multiply
             ).reshape(())[()]
-        )
+            output.append(
+                _julia_array_scalar_operation(
+                    np.asarray(np.int64(1)), doubled, np.divide
+                ).reshape(())[()]
+            )
     return tuple(output)
 
 
@@ -646,10 +652,26 @@ def wigner_fft(signal: Any) -> np.ndarray:
     values = (
         _julia_literal_array(signal)
         if isinstance(signal, list)
-        else np.asarray(signal)
+        else _require_dense_ndarray(signal, "wigner_fft signal")
     )
     if values.ndim != 1:
         raise TypeError("wigner_fft expects a one-dimensional vector.")
+    if (
+        isinstance(signal, np.ndarray)
+        and values.dtype.kind == "O"
+        and not any(
+            isinstance(value, (Fraction, Decimal))
+            for value in values.flat
+        )
+    ):
+        # Explicit object storage for ordinary machine numbers corresponds
+        # to Julia ``Vector{Any}``, which does not satisfy
+        # ``Vector{T} where T<:Number``. Fraction and Decimal are retained
+        # because NumPy has no concrete Rational or BigFloat dtype for them.
+        raise TypeError(
+            "wigner_fft object arrays must represent a Fraction or Decimal "
+            "numeric vector."
+        )
     if values.dtype.kind not in "buifcO" or (
         values.dtype.kind == "O"
         and not all(

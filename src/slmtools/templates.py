@@ -27,7 +27,9 @@ from .lattice_field import (
     _is_real_number,
     _julia_literal_array,
     _julia_promote_numeric_dtypes,
+    _julia_sum,
     _logical_axis_scalar_operation,
+    _require_dense_ndarray,
     as_lattice,
     wrap,
 )
@@ -341,7 +343,7 @@ def _standard_output(
     lattice: tuple[np.ndarray, ...],
     flambda: Any,
 ) -> LatticeField:
-    values = np.asarray(data)
+    values = _require_dense_ndarray(data, "lfStandardOutputFormat data")
     name = _tag_name(tag)
     if tag is ComplexPhase or name in {"ComplexPhase", "S1Phase"}:
         if np.isrealobj(values):
@@ -511,7 +513,7 @@ def lfGaussian(
     cell_volume = np.asarray(1, dtype=np.int64)
     for axis in centered:
         cell_volume = _julia_binary(cell_volume, _step(axis), np.multiply)
-    energy = np.sum(_julia_binary(data, data, np.multiply))
+    energy = _julia_sum(_julia_binary(data, data, np.multiply))
     denominator = _julia_binary(energy, cell_volume, np.multiply)
     scale = _julia_sqrt(_julia_binary(norm, denominator, np.divide))
     # ``p .*= scale`` assigns back into the original element type in Julia.

@@ -7,6 +7,7 @@ import operator
 import numpy as np
 import pytest
 
+from slmtools._bigfloat import _MPFR, _to_mpfr
 from slmtools.lattice_field import (
     ComplexAmplitude,
     ComplexPhase,
@@ -21,11 +22,20 @@ from slmtools.lattice_field import (
     _julia_literal_array,
     elq,
     phasor,
+    square,
     wrap,
 )
 from slmtools.dual_lattices import dualLattice, dualShiftLattice, ldq
 from slmtools.lattice_utils import _step, latticeDisplacement, ldot, padout, r2
-from slmtools.misc import SchroffError, centroid, clip, nabs, ramp, window
+from slmtools.misc import (
+    SchroffError,
+    _fraction_int64_divide,
+    centroid,
+    clip,
+    nabs,
+    ramp,
+    window,
+)
 
 
 def test_lattice_equality_uses_array_norm_isapprox_per_axis() -> None:
@@ -52,6 +62,14 @@ def test_lattice_equality_uses_array_norm_isapprox_per_axis() -> None:
     elq(
         (np.array([1.0], dtype=np.float32),),
         (np.array([1.0 + 1e-5], dtype=np.float64),),
+    )
+
+    # The object-backed Rational path must still use array-level norm
+    # isapprox, not independent scalar comparisons (the zero coordinate is
+    # the distinguishing case).
+    elq(
+        (np.array([Fraction(0), Fraction(1)], dtype=object),),
+        (np.array([1e-9, 1.000000001]),),
     )
 
 
@@ -484,6 +502,74 @@ def test_working_rational_and_bigfloat_misc_paths() -> None:
     assert isinstance(rational_padded[0], Fraction)
 
 
+def test_bigfloat_nabs_and_centroid_propagate_nonfinite_values() -> None:
+    with localcontext() as context:
+        context.prec = 77
+        zero_normalized = nabs(
+            np.asarray([Decimal(0), Decimal(0)], dtype=object)
+        )
+        assert zero_normalized.dtype == np.dtype(object)
+        assert all(
+            isinstance(value, Decimal) and value.is_nan()
+            for value in zero_normalized
+        )
+
+        infinite_normalized = nabs(
+            np.asarray(
+                [Decimal("Infinity"), Decimal(1)], dtype=object
+            )
+        )
+        assert isinstance(infinite_normalized[0], Decimal)
+        assert infinite_normalized[0].is_nan()
+        assert isinstance(infinite_normalized[1], Decimal)
+        assert infinite_normalized[1].is_zero()
+
+        axis = LatticeAxis(
+            np.asarray([Decimal(0), Decimal(1)], dtype=object),
+            step_hint=Decimal(1),
+        )
+        field = LF[Intensity, object, 1](
+            np.asarray(
+                [Decimal("Infinity"), Decimal(1)], dtype=object
+            ),
+            (axis,),
+        )
+        center = centroid(field, threshold=Decimal(0))
+        assert center.dtype == np.dtype(object)
+        assert isinstance(center[0], Decimal)
+        assert center[0].is_nan()
+
+
+def test_rational_int64_nabs_and_centroid_overflow_match_julia() -> None:
+    limits = np.iinfo(np.int64)
+    maximum = Fraction(int(limits.max))
+    minimum = Fraction(int(limits.min))
+
+    with pytest.raises(OverflowError):
+        nabs(np.asarray([maximum, maximum], dtype=object))
+    with pytest.raises(OverflowError):
+        nabs(np.asarray([minimum], dtype=object))
+    with pytest.raises(OverflowError):
+        centroid(
+            np.asarray([maximum, Fraction(1)], dtype=object),
+            threshold=Fraction(0),
+        )
+
+
+def test_rational_int64_division_cross_cancels_before_checked_products() -> None:
+    limits = np.iinfo(np.int64)
+    minimum = Fraction(int(limits.min))
+    maximum = Fraction(int(limits.max))
+
+    assert _fraction_int64_divide(minimum, minimum) == Fraction(1)
+    assert _fraction_int64_divide(minimum, Fraction(1)) == minimum
+    assert _fraction_int64_divide(minimum, maximum) == Fraction(
+        int(limits.min), int(limits.max)
+    )
+    with pytest.raises(OverflowError):
+        _fraction_int64_divide(minimum, Fraction(-1))
+
+
 def test_window_empty_widths_and_integer_dispatch_match_julia() -> None:
     image = np.asarray([0.0, 1.0, 0.0])
     zero = window(image, 0)
@@ -546,11 +632,17 @@ def test_bigfloat_like_wrap_and_rational_intensity_sqrt() -> None:
             np.array([Decimal("0.25")], dtype=object), (range(1),)
         )
         value = wrap(phase).data[0]
-        assert value.real == Decimal(
-            "6.1232339957367658861303296613750014646403777988362830520960549827724863083977e-17"
+        assert isinstance(value.real, _MPFR)
+        assert isinstance(value.imag, _MPFR)
+        assert value.real == _to_mpfr(
+            Decimal(
+                "6.1232339957367658861303296613750014646403777988362830520960549827724863083977e-17"
+            )
         )
-        assert value.imag == Decimal(
-            "0.99999999999999999999999999999999812530027167267800669190544314290300696003654"
+        assert value.imag == _to_mpfr(
+            Decimal(
+                "0.99999999999999999999999999999999812530027167267800669190544314290300696003654"
+            )
         )
 
     intensity = LF[Intensity, object, 1](
@@ -614,6 +706,62 @@ def test_unary_plus_matches_julia_supported_tags() -> None:
     assert positive_amplitude.dtype == np.dtype(np.complex128)
     np.testing.assert_array_equal(positive_amplitude.data, unusual_amplitude.data)
 
+    boolean_intensity = LF[Intensity, np.bool_, 1](
+        np.asarray([True, False]), lattice
+    )
+    positive_boolean = +boolean_intensity
+    assert positive_boolean.dtype == np.dtype(np.int64)
+    np.testing.assert_array_equal(positive_boolean.data, [1, 0])
+
+    boolean_phase = LF[RealPhase, np.bool_, 1](
+        np.asarray([True, False]), lattice
+    )
+    conjugated_boolean = boolean_phase.conj()
+    assert conjugated_boolean.dtype == np.dtype(np.int64)
+    np.testing.assert_array_equal(conjugated_boolean.data, [-1, 0])
+
+
+def test_rational_int64_arithmetic_uses_checked_base_algorithms() -> None:
+    maximum = np.iinfo(np.int64).max
+    lattice = (range(1),)
+
+    left = LF[RealPhase, object, 1](
+        np.asarray([Fraction(maximum)], dtype=object), lattice
+    )
+    right = LF[RealPhase, object, 1](
+        np.asarray([Fraction(1)], dtype=object), lattice
+    )
+    with pytest.raises(OverflowError):
+        left + right
+
+    first_phase = LF[ComplexPhase, object, 1](
+        np.asarray([Fraction(maximum)], dtype=object), lattice
+    )
+    second_phase = LF[ComplexPhase, object, 1](
+        np.asarray([Fraction(2)], dtype=object), lattice
+    )
+    with pytest.raises(OverflowError):
+        first_phase * second_phase
+
+    # Base cross-cancels before checked multiplication, so this product is
+    # valid despite both source numerators touching the boundary.
+    cancellable_left = LF[ComplexPhase, object, 1](
+        np.asarray([Fraction(maximum, 2)], dtype=object), lattice
+    )
+    cancellable_right = LF[ComplexPhase, object, 1](
+        np.asarray([Fraction(2, maximum)], dtype=object), lattice
+    )
+    np.testing.assert_array_equal(
+        (cancellable_left * cancellable_right).data,
+        np.asarray([Fraction(1)], dtype=object),
+    )
+
+    modulus = LF[Modulus, object, 1](
+        np.asarray([Fraction(maximum)], dtype=object), lattice
+    )
+    with pytest.raises(OverflowError):
+        square(modulus)
+
 
 def test_binary_intensity_addition_has_value_semantics() -> None:
     lattice = (range(1),)
@@ -635,7 +783,8 @@ def test_binary_intensity_addition_has_value_semantics() -> None:
 
     # Python has no n-ary infix dispatch hook: a three-term RealPhase sum is a
     # sequence of the same valid Julia binary overload and stores no expression
-    # history either.
+    # history. Exact translation of Julia's single variadic call uses
+    # explicitly parenthesized Julia binary expression instead.
     phase = LF[RealPhase](np.array([1]), lattice)
     np.testing.assert_array_equal((phase + phase + phase).data, [3])
 

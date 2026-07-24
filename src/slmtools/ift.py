@@ -12,6 +12,7 @@ from fractions import Fraction
 from typing import Any
 
 import numpy as np
+import pyfftw
 from pyfftw.interfaces import numpy_fft as _fftw_fft
 
 from .lattice_field import (
@@ -27,6 +28,8 @@ from .lattice_field import (
     _julia_add_sum,
     _julia_array_array_operation,
     _julia_array_scalar_operation,
+    _julia_sum,
+    _require_dense_ndarray,
     as_lattice,
     elq,
 )
@@ -356,6 +359,39 @@ def _fft_with_plan(values: np.ndarray, plan: Any, *, inverse: bool) -> np.ndarra
             raise TypeError("FFT plan must be callable or support applying itself to an array") from exc
 
 
+class _FFTWComplexPlan:
+    """Single-threaded column-major FFTW plan matching Julia ``plan_fft``."""
+
+    def __init__(self, shape: tuple[int, ...], *, inverse: bool) -> None:
+        self._input = pyfftw.empty_aligned(
+            shape, dtype=np.complex128, order="F"
+        )
+        self._output = pyfftw.empty_aligned(
+            shape, dtype=np.complex128, order="F"
+        )
+        self._plan = pyfftw.FFTW(
+            self._input,
+            self._output,
+            axes=tuple(range(len(shape))),
+            direction="FFTW_BACKWARD" if inverse else "FFTW_FORWARD",
+            flags=("FFTW_ESTIMATE",),
+            threads=1,
+            normalise_idft=True,
+        )
+
+    def __call__(self, values: Any) -> np.ndarray:
+        self._input[...] = np.asarray(values, dtype=np.complex128)
+        self._plan()
+        return self._output.copy(order="F")
+
+
+def _fftw_plan_pair(shape: tuple[int, ...]) -> tuple[_FFTWComplexPlan, _FFTWComplexPlan]:
+    return (
+        _FFTWComplexPlan(shape, inverse=False),
+        _FFTWComplexPlan(shape, inverse=True),
+    )
+
+
 def gsIter(
     guess: Any,
     u: Any,
@@ -369,11 +405,9 @@ def gsIter(
     N-dimensional FFT and normalized inverse FFT, matching FFTW's defaults.
     """
 
-    if not all(isinstance(value, np.ndarray) for value in (guess, u, v)):
-        raise TypeError("gsIter requires dense NumPy arrays")
-    guess_array = np.asarray(guess)
-    u_array = np.asarray(u)
-    v_array = np.asarray(v)
+    guess_array = _require_dense_ndarray(guess, "gsIter guess")
+    u_array = _require_dense_ndarray(u, "gsIter u")
+    v_array = _require_dense_ndarray(v, "gsIter v")
     if guess_array.dtype != np.dtype(np.complex128):
         raise TypeError("guess must have Julia ComplexF64 element type")
     if u_array.dtype != np.dtype(np.float64) or v_array.dtype != np.dtype(
@@ -450,8 +484,9 @@ def gs(
         v_work = v_data
     ushift = np.fft.ifftshift(u_work)
     vshift = np.fft.ifftshift(v_work)
+    ft, ift = _fftw_plan_pair(tuple(guess.shape))
     for _ in range(iterations):
-        guess = gsIter(guess, ushift, vshift)
+        guess = gsIter(guess, ushift, vshift, ft, ift)
     return _make_field(ComplexPhase, np.fft.fftshift(_phasor(guess)), u_field.L, u_field.flambda)
 
 
@@ -505,18 +540,28 @@ def gsLog(
     # those component-wise low-precision divisions and their logged error.
     u_data = np.asarray(u_field.data)
     v_data = np.asarray(v_field.data)
-    if u_data.dtype.kind == "O" and all(
+    rational_u = u_data.dtype.kind == "O" and all(
         isinstance(value, Fraction) for value in u_data.flat
-    ):
-        # Julia's sqrt(::Rational) normalization and ComplexF64 FFT plan move
-        # this otherwise-generic logger into Float64 work arithmetic.
-        u_data = np.asarray(u_data, dtype=np.float64)
-    if v_data.dtype.kind == "O" and all(
+    )
+    rational_v = v_data.dtype.kind == "O" and all(
         isinstance(value, Fraction) for value in v_data.flat
-    ):
+    )
+    u_squared = _julia_array_array_operation(u_data, u_data, np.multiply)
+    v_squared = _julia_array_array_operation(v_data, v_data, np.multiply)
+    u_total = _julia_sum(u_squared)
+    v_total = _julia_sum(v_squared)
+    u_norm = (
+        np.sqrt(float(u_total)) if rational_u else np.sqrt(u_total)
+    )
+    v_norm = (
+        np.sqrt(float(v_total)) if rational_v else np.sqrt(v_total)
+    )
+    # The ComplexF64 FFT plan converts Rational work arrays only after their
+    # exact, checked normalization reductions have completed.
+    if rational_u:
+        u_data = np.asarray(u_data, dtype=np.float64)
+    if rational_v:
         v_data = np.asarray(v_data, dtype=np.float64)
-    u_norm = np.sqrt(np.sum(u_data**2))
-    v_norm = np.sqrt(np.sum(v_data**2))
     guess = np.fft.ifftshift(u_data * _phasor(_phase_array(phi0)))
     # Julia applies the divisions directly. Zero-norm inputs therefore remain
     # valid method calls and propagate IEEE NaN/Inf through later iterations
@@ -525,13 +570,22 @@ def gsLog(
         ushift = np.fft.ifftshift(u_data) / u_norm
         vshift = np.fft.ifftshift(v_data) / v_norm
     errors: list[float] = []
+    ft, ift = _fftw_plan_pair(tuple(guess.shape))
     for iteration in range(iterations):
-        update = np.fft.ifftn(_phasor(np.fft.fftn(guess)) * vshift)
+        update = ift(_phasor(ft(guess)) * vshift)
         if iteration % cadence == 0:
-            update_norm = float(np.sqrt(np.sum(np.abs(update) ** 2)))
+            update_norm = float(
+                np.sqrt(_julia_sum(np.abs(update) ** 2))
+            )
             with np.errstate(divide="ignore", invalid="ignore"):
                 normalized = update / update_norm
-            errors.append(float(np.sum((np.abs(ushift) - np.abs(normalized)) ** 2)))
+            errors.append(
+                float(
+                    _julia_sum(
+                        (np.abs(ushift) - np.abs(normalized)) ** 2
+                    )
+                )
+            )
         guess = ushift * _phasor(update)
     phase = _make_field(ComplexPhase, np.fft.fftshift(_phasor(guess)), u_field.L, u_field.flambda)
     return phase, errors
@@ -539,7 +593,12 @@ def gsLog(
 
 def _normalize_modulus(values: Any) -> np.ndarray:
     array = np.asarray(values)
-    norm = float(np.sqrt(np.sum(np.abs(array) ** 2)))
+    magnitudes = np.abs(array)
+    squared = _julia_array_array_operation(
+        magnitudes, magnitudes, np.multiply
+    )
+    total = _julia_sum(squared)
+    norm = np.sqrt(float(total)) if isinstance(total, Fraction) else np.sqrt(total)
     with np.errstate(divide="ignore", invalid="ignore"):
         return array / norm
 
@@ -554,7 +613,7 @@ def gsError(U: LatticeField, V: LatticeField, phase: LatticeField) -> float:
     _validate_equal(u_field, phase)
     reconstruction = np.abs(_sft_array(np.asarray(u_field.data) * _phase_array(phase)))
     difference = _normalize_modulus(reconstruction) - _normalize_modulus(v_field.data)
-    return float(np.sum(difference**2))
+    return float(_julia_sum(difference**2))
 
 
 def _prepare_pdgs(
@@ -628,17 +687,13 @@ def pdgsIter(
         raise TypeError("pdgsIter phases and moduli must be tuples")
     if not phis or len(phis) != len(mods):
         raise ValueError("phis and mods must be nonempty and have equal length")
-    if not isinstance(guess, np.ndarray):
-        raise TypeError("pdgsIter guess must be a dense NumPy array")
-    guess_array = np.asarray(guess)
+    guess_array = _require_dense_ndarray(guess, "pdgsIter guess")
     if guess_array.dtype != np.dtype(np.complex128):
         raise TypeError("pdgsIter guess must have Julia ComplexF64 element type")
-    total = np.zeros(guess_array.shape, dtype=np.complex128)
+    updates: list[np.ndarray] = []
     for phi, modulus in zip(phis, mods, strict=True):
-        if not isinstance(phi, np.ndarray) or not isinstance(modulus, np.ndarray):
-            raise TypeError("pdgsIter phases and moduli must contain dense arrays")
-        phi_array = np.asarray(phi)
-        modulus_array = np.asarray(modulus)
+        phi_array = _require_dense_ndarray(phi, "pdgsIter phase")
+        modulus_array = _require_dense_ndarray(modulus, "pdgsIter modulus")
         if phi_array.dtype != np.dtype(np.complex128):
             raise TypeError("pdgsIter phases must have Julia ComplexF64 element type")
         if modulus_array.dtype != np.dtype(np.float64):
@@ -647,8 +702,8 @@ def pdgsIter(
             raise ValueError("guess, phases, and moduli must have the same shape")
         propagated = _fft_with_plan(guess_array * phi_array, ft, inverse=False)
         update = _fft_with_plan(modulus_array * _phasor(propagated), ift, inverse=True)
-        total += update * np.conjugate(phi_array)
-    return total / len(phis)
+        updates.append(update * np.conjugate(phi_array))
+    return np.asarray(_julia_add_sum(tuple(updates))) / len(phis)
 
 
 def pdgs(
@@ -675,8 +730,9 @@ def pdgs(
             "positive-iteration pdgs has no matching ComplexF64 pdgsIter method"
         )
     guess = np.fft.ifftshift(np.asarray(beamGuess.data, dtype=np.complex128))
+    ft, ift = _fftw_plan_pair(tuple(guess.shape))
     for _ in range(iterations):
-        guess = pdgsIter(guess, phis, mods)
+        guess = pdgsIter(guess, phis, mods, ft, ift)
     return _make_field(ComplexAmp, np.fft.fftshift(guess), beamGuess.L, beamGuess.flambda)
 
 
@@ -708,14 +764,18 @@ def pdgsLog(
         )
     guess = np.fft.ifftshift(np.asarray(beamGuess.data, dtype=np.complex128))
     errors: list[float] = []
+    ft, ift = _fftw_plan_pair(tuple(guess.shape))
     for iteration in range(iterations):
         updates = tuple(
-            np.fft.ifftn(modulus * _phasor(np.fft.fftn(guess * phi))) * np.conjugate(phi)
+            ift(modulus * _phasor(ft(guess * phi))) * np.conjugate(phi)
             for phi, modulus in zip(phis, mods, strict=True)
         )
-        guess = np.add.reduce(updates) / len(updates)
+        guess = _julia_add_sum(updates) / len(updates)
         if iteration % cadence == 0:
-            spread = sum(float(np.sum(np.abs(update - guess) ** 2)) for update in updates)
+            spread = sum(
+                float(_julia_sum(np.abs(update - guess) ** 2))
+                for update in updates
+            )
             errors.append(float(np.sqrt(spread) / len(updates)))
     result = _make_field(ComplexAmp, np.fft.fftshift(guess), beamGuess.L, beamGuess.flambda)
     return result, errors
@@ -741,7 +801,13 @@ def pdgsError(
     for image, phase in zip(images, phases, strict=True):
         target = _normalize_modulus(image.data)
         reconstruction = _normalize_modulus(_sft_array(beam * _phase_array(phase)))
-        errors.append(float(np.sum((np.abs(target) - np.abs(reconstruction)) ** 2)))
+        errors.append(
+            float(
+                _julia_sum(
+                    (np.abs(target) - np.abs(reconstruction)) ** 2
+                )
+            )
+        )
     return float(sum(errors) / len(errors))
 
 
@@ -834,7 +900,9 @@ def mraf(
     u = _normalize_modulus(u_field.data)
     v = _normalize_modulus(v_field.data)
     guess = u * _phase_array(phi0)
-    compensation = float(np.sqrt(np.sum(np.abs(_sft_array(guess)) ** 2)))
+    compensation = float(
+        np.sqrt(_julia_sum(np.abs(_sft_array(guess)) ** 2))
+    )
     for _ in range(iterations):
         output = _sft_array(guess)
         target = _phasor(output[roi]) * v[roi] * m
