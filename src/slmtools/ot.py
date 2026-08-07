@@ -20,10 +20,23 @@ from fractions import Fraction
 from typing import Any
 import warnings
 
+import gmpy2
 import numpy as np
 
+from ._bigfloat import (
+    _MPC,
+    _MPFR,
+    _MPFRComplex,
+    _MPQ,
+    _MPZ,
+    _bigfloat_context,
+    _mpfr_rtol,
+    _to_mpfr,
+)
+from ._omission import _OMITTED
 from .lattice_field import (
     ComplexAmp,
+    DimensionMismatch,
     Intensity,
     LatticeField,
     Modulus,
@@ -44,8 +57,10 @@ from .lattice_field import (
     _julia_literal_array,
     _julia_rtol,
     _julia_sum,
+    _julia_typed_zero,
     _is_real_number,
     _object_contains_decimal,
+    _object_contains_gmp,
     as_lattice,
     square,
 )
@@ -120,7 +135,7 @@ def _ot_numeric_domain(value: Any) -> tuple[str, bool] | None:
         _is_real_number(item)
         or isinstance(
             item,
-            (_DecimalComplex, complex, np.complexfloating),
+            (_DecimalComplex, _MPC, complex, np.complexfloating),
         )
         for item in items
     ):
@@ -129,12 +144,34 @@ def _ot_numeric_domain(value: Any) -> tuple[str, bool] | None:
     has_decimal_complex = any(
         isinstance(item, _DecimalComplex) for item in items
     )
+    has_mpfr_complex = any(isinstance(item, _MPC) for item in items)
     has_machine_complex = any(
         isinstance(item, (complex, np.complexfloating))
         for item in items
     )
     has_decimal = any(isinstance(item, Decimal) for item in items)
+    has_mpfr = any(isinstance(item, _MPFR) for item in items)
     has_fraction = any(isinstance(item, Fraction) for item in items)
+    has_mpq = any(isinstance(item, _MPQ) for item in items)
+    has_mpz = any(isinstance(item, _MPZ) for item in items)
+    if has_mpfr_complex or (
+        has_machine_complex and (has_mpfr or has_mpq or has_mpz)
+    ):
+        return "complex-bigfloat-mpfr", False
+    if has_mpfr:
+        return (
+            ("complex-bigfloat-mpfr", False)
+            if has_machine_complex
+            else ("bigfloat-mpfr", True)
+        )
+    if has_mpq:
+        if has_machine_complex:
+            return "complex-bigfloat-mpfr", False
+        return "rational-bigint", True
+    if has_mpz:
+        if has_machine_complex:
+            return "complex-bigfloat-mpfr", False
+        return "bigint", True
     if has_decimal_complex:
         return "complex-bigfloat", False
     if has_decimal:
@@ -151,9 +188,14 @@ def _ot_numeric_domain(value: Any) -> tuple[str, bool] | None:
             # used for Julia ``Array{Real}`` in the compatibility contract.
             return "abstract-real", True
         return "rational-int64", True
-    # With no exact/arbitrary-precision anchor, object dtype denotes
-    # ``Array{Any}`` even if every runtime value happens to be numeric.
-    return None
+    if has_machine_complex:
+        return "abstract-number", False
+    # NumPy object storage is also the only practical spelling for successful
+    # Julia arrays whose declared element type is an abstract numeric
+    # supertype (for example ``Vector{Real}`` or ``Vector{Number}``). Favor
+    # preserving that public domain over guessing that the same storage meant
+    # ``Vector{Any}``.
+    return "abstract-real", True
 
 
 def _require_ot_numeric_array(
@@ -216,6 +258,17 @@ def _require_ot_numeric_array(
         raise TypeError(
             f"{name} must have a concrete Julia {requirement} element type"
         )
+    if domain[0] in {"abstract-real", "abstract-number"}:
+        array = _julia_literal_array(
+            list(array.ravel(order="F"))
+        ).reshape(array.shape, order="F")
+        promoted_domain = _ot_numeric_domain(array)
+        if promoted_domain is None:
+            raise TypeError(
+                f"{name} abstract numeric values have no common Julia "
+                "promotion"
+            )
+        domain = promoted_domain
     return array, domain[0]
 
 
@@ -329,18 +382,35 @@ def _cost_matrix_terms(
 
 def _normalization_value(
     matrix: np.ndarray,
-    normalization: Callable[[np.ndarray], Any] | None,
+    normalization: Callable[[np.ndarray], Any],
 ) -> Any:
     if normalization is None:
-        return 1.0
+        raise TypeError(
+            "normalization must be callable; Julia's nothing path has no "
+            "matching call"
+        )
     if not callable(normalization):
-        raise TypeError("normalization must be callable or None")
+        raise TypeError("normalization must be callable")
+    complex_values = matrix.dtype.kind == "c" or (
+        matrix.dtype.kind == "O"
+        and any(
+            isinstance(
+                value,
+                (_MPC, _DecimalComplex, complex, np.complexfloating),
+            )
+            for value in matrix.flat
+        )
+    )
+    if complex_values and normalization in (np.max, np.amax):
+        raise TypeError(
+            "Julia maximum cannot order complex cost-matrix values"
+        )
     return normalization(matrix)
 
 
 def _normalize_cost(
     matrix: np.ndarray,
-    normalization: Callable[[np.ndarray], Any] | None,
+    normalization: Callable[[np.ndarray], Any],
 ) -> np.ndarray:
     """Apply Julia's broadcasted cost normalization."""
 
@@ -378,16 +448,16 @@ def _normalize_cost(
 
 def getCostMatrix(
     Lmu: Sequence[Any],
-    Lv: Sequence[Any] | None = None,
+    Lv: Any = _OMITTED,
     *,
-    normalization: Callable[[np.ndarray], Any] | None = np.max,
+    normalization: Callable[[np.ndarray], Any] = np.max,
 ) -> np.ndarray:
     """Return the normalized dense squared-Euclidean transport cost matrix."""
 
     source = _as_lattice(Lmu, allow_empty_axes=True)
     target = (
         source
-        if Lv is None
+        if Lv is _OMITTED
         else _as_lattice(Lv, allow_empty_axes=True)
     )
     if len(source) != len(target):
@@ -403,7 +473,7 @@ def pdCostMatrix(
     alphaRoot: float,
     alphaTarget: float,
     *,
-    normalization: Callable[[np.ndarray], Any] | None = np.max,
+    normalization: Callable[[np.ndarray], Any] = np.max,
     flambda: float = 1.0,
 ) -> np.ndarray:
     """Return the legacy phase-diversity cost matrix.
@@ -424,7 +494,7 @@ def pdCostMatrix(
     if len(root) != len(target):
         raise ValueError("root and target lattices must have the same dimensionality")
     delta_array = _julia_array_scalar_operation(
-        np.asarray(alphaRoot), alphaTarget, np.subtract
+        alphaRoot, alphaTarget, np.subtract
     )
     delta = _julia_array_scalar_operation(
         delta_array, flambda, np.multiply
@@ -440,7 +510,13 @@ def _safe_inverse(values: Any) -> np.ndarray:
         result = np.empty(array.shape, dtype=object)
         for index in np.ndindex(array.shape):
             value = array[index]
-            result[index] = type(value)(0) if value == 0 else 1 / value
+            result[index] = (
+                _julia_typed_zero(value)
+                if value == 0
+                else _julia_array_scalar_operation(
+                    value, 1, np.divide, reflected=True
+                ).reshape(())[()]
+            )
         return result
     if array.dtype.kind in "fc":
         # Julia's literal ``1 / x`` keeps Float16/Float32 and
@@ -476,7 +552,8 @@ def _julia_matmul(left: Any, right: Any) -> np.ndarray:
     decimal_work = _object_contains_decimal(
         first
     ) or _object_contains_decimal(second)
-    if fraction_work or decimal_work:
+    gmp_work = _object_contains_gmp(first) or _object_contains_gmp(second)
+    if fraction_work or decimal_work or gmp_work:
         if first.ndim == 1:
             left_matrix = first.reshape(1, first.shape[0])
             left_vector = True
@@ -506,7 +583,7 @@ def _julia_matmul(left: Any, right: Any) -> np.ndarray:
         )
         for row in range(left_matrix.shape[0]):
             for column in range(right_matrix.shape[1]):
-                if fraction_work:
+                if fraction_work or gmp_work:
                     products = []
                     for inner in range(left_matrix.shape[1]):
                         product = _julia_array_array_operation(
@@ -689,7 +766,14 @@ def _hyper_sum(
     selected = array[selection]
     domain = _ot_numeric_domain(selected)
     exact_domain = None if domain is None else domain[0]
-    if exact_domain in ("rational-int64", "bigfloat"):
+    if exact_domain in (
+        "rational-int64",
+        "rational-bigint",
+        "bigfloat",
+        "bigfloat-mpfr",
+        "complex-bigfloat-mpfr",
+        "bigint",
+    ):
         moved = np.moveaxis(selected, axis, 0)
         cumulative_moved = np.empty(moved.shape, dtype=object)
         for tail_index in np.ndindex(moved.shape[1:]):
@@ -712,12 +796,16 @@ def _hyper_sum(
                     correction[index] = _fraction_int64_divide(
                         selected[index], Fraction(2, 1)
                     )
-                else:
+                elif exact_domain == "bigfloat":
                     with localcontext() as context:
                         _enable_decimal_nonfinite(context)
                         correction[index] = (
                             _as_decimal_approx(selected[index]) / Decimal(2)
                         )
+                else:
+                    correction[index] = _julia_array_scalar_operation(
+                        selected[index], 2, np.divide
+                    ).reshape(())[()]
             cumulative = _julia_array_array_operation(
                 cumulative, correction, np.subtract
             )
@@ -763,7 +851,7 @@ def scalarPotentialN(
     L: Sequence[Any],
     *,
     idx: Sequence[int] | None = None,
-    dimOrder: Sequence[int] | None = None,
+    dimOrder: Any = _OMITTED,
 ) -> np.ndarray:
     """Integrate an N-D vector field along the ordered coordinate path.
 
@@ -785,7 +873,7 @@ def scalarPotentialN(
         if idx is None
         else _origin_tuple(idx, spatial_shape)
     )
-    if dimOrder is None:
+    if dimOrder is _OMITTED:
         order_spec = tuple(range(1, ndim + 1))
     else:
         supplied_order = tuple(dimOrder)
@@ -827,6 +915,30 @@ def normalizeDistribution(U: Any) -> np.ndarray:
     """Normalize absolute values to a probability distribution."""
 
     array, domain = _require_ot_numeric_array(U, "U")
+    if domain in (
+        "bigfloat-mpfr",
+        "complex-bigfloat-mpfr",
+        "bigint",
+    ):
+        with _bigfloat_context():
+            values = np.empty(array.shape, dtype=object)
+            for index in np.ndindex(array.shape):
+                values[index] = abs(array[index])
+            total = _julia_sum(values)
+            total_mpfr = _to_mpfr(total)
+            result = np.empty(array.shape, dtype=object)
+            for index in np.ndindex(array.shape):
+                result[index] = _to_mpfr(values[index]) / total_mpfr
+            return result
+    if domain == "rational-bigint":
+        values = np.empty(array.shape, dtype=object)
+        for index in np.ndindex(array.shape):
+            values[index] = abs(array[index])
+        total = _julia_sum(values)
+        result = np.empty(array.shape, dtype=object)
+        for index in np.ndindex(array.shape):
+            result[index] = values[index] / total
+        return result
     if domain == "bigfloat":
         with localcontext() as context:
             _enable_decimal_nonfinite(context)
@@ -981,6 +1093,93 @@ def _decimal_sinkhorn_gibbs(
     return kernel * u[:, None] * v[None, :], converged
 
 
+def _mpfr_sinkhorn_gibbs(
+    source: np.ndarray,
+    target: np.ndarray,
+    cost: np.ndarray,
+    epsilon: Any,
+    *,
+    absolute_tolerance: Any,
+    relative_tolerance: Any,
+    interval: int,
+    maxiter: int,
+) -> tuple[np.ndarray, bool]:
+    """Run the BigFloat Sinkhorn work cache in Julia's 256-bit context."""
+
+    def convert_array(values: Any) -> np.ndarray:
+        array = np.asarray(values)
+        converted = np.empty(array.shape, dtype=object)
+        for index in np.ndindex(array.shape):
+            converted[index] = _to_mpfr(array[index])
+        return converted
+
+    with _bigfloat_context():
+        source_mpfr = convert_array(source)
+        target_mpfr = convert_array(target)
+        cost_mpfr = convert_array(cost)
+        epsilon_mpfr = _to_mpfr(epsilon)
+        atol_mpfr = _to_mpfr(absolute_tolerance)
+        rtol_mpfr = _to_mpfr(relative_tolerance)
+        kernel = np.empty(cost_mpfr.shape, dtype=object)
+        for index in np.ndindex(cost_mpfr.shape):
+            kernel[index] = gmpy2.exp(-cost_mpfr[index] / epsilon_mpfr)
+        one = _to_mpfr(1)
+        u = np.full(source_mpfr.shape, one, dtype=object)
+        v = np.full(target_mpfr.shape, one, dtype=object)
+        Kv = np.matmul(kernel, v)
+        converged = False
+        countdown = interval
+        for iteration in range(1, maxiter + 1):
+            u = source_mpfr / Kv
+            v = target_mpfr / np.matmul(kernel.T, u)
+            Kv = np.matmul(kernel, v)
+            countdown -= 1
+            if countdown == 0 or iteration == maxiter:
+                countdown = interval
+                current = u * Kv
+                norm_current = _julia_sum(
+                    np.asarray(
+                        [abs(value) for value in current], dtype=object
+                    )
+                )
+                error = _julia_sum(
+                    np.asarray(
+                        [
+                            abs(left - right)
+                            for left, right in zip(
+                                source_mpfr,
+                                current,
+                                strict=True,
+                            )
+                        ],
+                        dtype=object,
+                    )
+                )
+                source_norm = _julia_sum(
+                    np.asarray(
+                        [abs(value) for value in source_mpfr],
+                        dtype=object,
+                    )
+                )
+                finite = all(
+                    gmpy2.is_finite(value)
+                    for value in (
+                        error,
+                        source_norm,
+                        norm_current,
+                        atol_mpfr,
+                        rtol_mpfr,
+                    )
+                )
+                converged = finite and error < max(
+                    atol_mpfr,
+                    rtol_mpfr * max(source_norm, norm_current),
+                )
+                if converged:
+                    break
+        return kernel * u[:, None] * v[None, :], converged
+
+
 def _sinkhorn_gibbs(
     mu: Any,
     nu: Any,
@@ -996,13 +1195,13 @@ def _sinkhorn_gibbs(
 ) -> np.ndarray:
     """OptimalTransport.jl 0.3.20 ``SinkhornGibbs`` for vector marginals."""
 
-    source_input, _ = _require_ot_numeric_array(
+    source_input, source_domain = _require_ot_numeric_array(
         mu, "source marginal", real=True
     )
-    target_input, _ = _require_ot_numeric_array(
+    target_input, target_domain = _require_ot_numeric_array(
         nu, "target marginal", real=True
     )
-    cost_input, _ = _require_ot_numeric_array(
+    cost_input, cost_domain = _require_ot_numeric_array(
         cost, "cost matrix", real=True
     )
     if (
@@ -1018,7 +1217,30 @@ def _sinkhorn_gibbs(
         or _object_contains_decimal(cost_input)
         or isinstance(epsilon, Decimal)
     )
-    if decimal_work:
+    mpfr_domains = {
+        "bigfloat-mpfr",
+        "rational-bigint",
+        "bigint",
+    }
+    mpfr_work = (
+        source_domain in mpfr_domains
+        or target_domain in mpfr_domains
+        or cost_domain in mpfr_domains
+        or isinstance(epsilon, (_MPFR, _MPQ, _MPZ))
+    )
+    if mpfr_work:
+        with _bigfloat_context():
+            source_check = np.asarray(
+                [_to_mpfr(value) for value in source_input], dtype=object
+            )
+            target_check = np.asarray(
+                [_to_mpfr(value) for value in target_input], dtype=object
+            )
+            invalid_marginal = any(
+                not gmpy2.is_finite(value) or value < 0
+                for value in (*source_check, *target_check)
+            )
+    elif decimal_work:
         source_check = _as_decimal_array(source_input)
         target_check = _as_decimal_array(target_input)
         invalid_marginal = any(
@@ -1058,7 +1280,15 @@ def _sinkhorn_gibbs(
         relative_tolerance = (
             0
             if absolute_tolerance > 0
-            else (_decimal_rtol() if decimal_work else np.sqrt(np.finfo(float).eps))
+            else (
+                _mpfr_rtol()
+                if mpfr_work
+                else (
+                    _decimal_rtol()
+                    if decimal_work
+                    else np.sqrt(np.finfo(float).eps)
+                )
+            )
         )
     else:
         relative_tolerance = rtol
@@ -1082,6 +1312,25 @@ def _sinkhorn_gibbs(
         if interval_value is None
         else _int64_value(interval_value, "check_convergence")
     )
+
+    if mpfr_work:
+        plan, converged = _mpfr_sinkhorn_gibbs(
+            source_input,
+            target_input,
+            cost_input,
+            epsilon,
+            absolute_tolerance=absolute_tolerance,
+            relative_tolerance=relative_tolerance,
+            interval=interval,
+            maxiter=maxiter_value,
+        )
+        if not converged:
+            warnings.warn(
+                f"Sinkhorn algorithm ({maxiter_value}/{maxiter_value}): not converged",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return plan
 
     if decimal_work:
         with localcontext() as decimal_context:
@@ -1249,9 +1498,11 @@ def _pd_squared_radius(
 
     ndim = len(lattice)
     terms: list[np.ndarray] = []
-    for dimension, (axis, offset) in enumerate(
-        zip(lattice, delta_beta, strict=True)
-    ):
+    for dimension, axis in enumerate(lattice):
+        # Julia's comprehension indexes only the first N entries of dβ.
+        # Equally long Vector inputs may therefore carry paired trailing
+        # components, while a too-short vector still fails by indexing.
+        offset = delta_beta[dimension]
         shifted = _julia_array_scalar_operation(
             np.asarray(axis), offset, np.subtract
         )
@@ -1329,6 +1580,10 @@ def pdotPhase(
             raise ValueError(
                 f"{name} Vector must have at least the image dimensionality"
             )
+    if len(root_beta_values) != len(target_beta_values):
+        raise DimensionMismatch(
+            "betaRoot and betaTarget must have matching lengths"
+        )
     if not all(_is_real_number(value) for value in root_beta_values):
         raise TypeError("betaRoot values must be real")
     if not all(_is_real_number(value) for value in target_beta_values):
@@ -1357,8 +1612,8 @@ def pdotPhase(
     delta_beta = tuple(
         _scalar_operation(root, target, np.subtract)
         for root, target in zip(
-            root_beta_values[:ndim],
-            target_beta_values[:ndim],
+            root_beta_values,
+            target_beta_values,
             strict=True,
         )
     )
@@ -1603,16 +1858,29 @@ def SinkhornConvN(
 ) -> tuple[np.ndarray, np.ndarray, list[float]]:
     """Run the experimental circular-convolution Sinkhorn iteration."""
 
-    source, _ = _require_ot_numeric_array(
+    if not _is_real_number(epsilon):
+        raise TypeError("epsilon must be real")
+    source, source_domain = _require_ot_numeric_array(
         U, "U", real=True, dense=True
     )
-    target, _ = _require_ot_numeric_array(
+    target, target_domain = _require_ot_numeric_array(
         V, "V", real=True, dense=True
     )
     if (
         isinstance(epsilon, Decimal)
         or _object_contains_decimal(U)
         or _object_contains_decimal(V)
+        or isinstance(epsilon, (_MPFR, _MPQ, _MPZ))
+        or source_domain in {
+            "bigfloat-mpfr",
+            "rational-bigint",
+            "bigint",
+        }
+        or target_domain in {
+            "bigfloat-mpfr",
+            "rational-bigint",
+            "bigint",
+        }
     ):
         raise TypeError("type BigFloat not supported by FFTW")
     # Julia creates ``u`` as Float64 but creates ``v`` with the target's
@@ -1661,7 +1929,7 @@ def dualToGradients(u: Any, v: Any, U: Any, LV: Sequence[Any], epsilon: float) -
     v_array, v_domain = _require_ot_numeric_array(
         v, "v", real=True, dense=True
     )
-    source, _ = _require_ot_numeric_array(
+    source, source_domain = _require_ot_numeric_array(
         U, "U", real=True, dense=True
     )
     if u_domain != v_domain:
@@ -1673,11 +1941,33 @@ def dualToGradients(u: Any, v: Any, U: Any, LV: Sequence[Any], epsilon: float) -
         raise TypeError("epsilon must be real")
     if (
         isinstance(epsilon, Decimal)
+        or isinstance(epsilon, (_MPFR, _MPQ, _MPZ))
         or _object_contains_decimal(u_array)
         or _object_contains_decimal(v_array)
         or _object_contains_decimal(source)
         or any(
             _object_contains_decimal(axis)
+            for axis in lattice
+        )
+        or u_domain in {
+            "bigfloat-mpfr",
+            "rational-bigint",
+            "bigint",
+        }
+        or v_domain in {
+            "bigfloat-mpfr",
+            "rational-bigint",
+            "bigint",
+        }
+        or source_domain in {
+            "bigfloat-mpfr",
+            "rational-bigint",
+            "bigint",
+        }
+        or any(
+            _ot_numeric_domain(axis) is not None
+            and _ot_numeric_domain(axis)[0]
+            in {"bigfloat-mpfr", "rational-bigint", "bigint"}
             for axis in lattice
         )
     ):
@@ -1762,6 +2052,12 @@ def _otphase2_kernel(
     exponent = _julia_array_scalar_operation(
         exponent, -1, np.multiply
     )
+    if _object_contains_gmp(exponent):
+        output = np.empty(exponent.shape, dtype=object)
+        with _bigfloat_context():
+            for index in np.ndindex(exponent.shape):
+                output[index] = gmpy2.exp(_to_mpfr(exponent[index]))
+        return output
     if _object_contains_decimal(exponent):
         return _decimal_exp(exponent)
     return np.exp(exponent)

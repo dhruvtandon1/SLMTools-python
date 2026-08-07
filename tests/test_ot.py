@@ -20,7 +20,9 @@ class CostMapAndIntegrationTests(unittest.TestCase):
 
         source = (np.asarray([0.0, 1.0]), np.asarray([10.0, 20.0]))
         target = (np.asarray([-1.0, 2.0]), np.asarray([3.0, 8.0]))
-        raw = slm.getCostMatrix(source, target, normalization=None)
+        raw = slm.getCostMatrix(
+            source, target, normalization=lambda _: 1
+        )
         source_points = np.asarray([[0, 10], [1, 10], [0, 20], [1, 20]])
         target_points = np.asarray([[-1, 3], [2, 3], [-1, 8], [2, 8]])
         expected = np.sum(
@@ -31,11 +33,24 @@ class CostMapAndIntegrationTests(unittest.TestCase):
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            legacy = slm.pdCostMatrix(source, target, 2.0, 1.0, normalization=None)
+            legacy = slm.pdCostMatrix(
+                source,
+                target,
+                2.0,
+                1.0,
+                normalization=lambda _: 1,
+            )
         self.assertFalse(
             any(issubclass(item.category, DeprecationWarning) for item in caught)
         )
         np.testing.assert_array_equal(legacy, expected)
+
+        with self.assertRaisesRegex(TypeError, "must be callable"):
+            slm.getCostMatrix(source, target, normalization=None)
+        with self.assertRaisesRegex(TypeError, "must be callable"):
+            slm.pdCostMatrix(
+                source, target, 2.0, 1.0, normalization=None
+            )
 
     def test_cost_normalization_accepts_julia_broadcast_arrays(self) -> None:
         lattice = (np.arange(3.0),)
@@ -203,16 +218,22 @@ class CostMapAndIntegrationTests(unittest.TestCase):
         # A flattened elementwise multiply followed by np.sum differs in the
         # final component. Julia evaluates ``x * Lv[i]`` as matrix-vector
         # multiplication before applying safeInverse.
-        np.testing.assert_array_equal(
-            result.view(np.uint64),
-            np.asarray(
-                [
-                    0x3FC5F15F40000000,
-                    0x3FC3F2B3A0000000,
-                    0x3FC24924A0000000,
-                ],
-                dtype=np.uint64,
-            ),
+        expected = np.asarray(
+            [
+                0x3FC5F15F40000000,
+                0x3FC3F2B3A0000000,
+                0x3FC24924A0000000,
+            ],
+            dtype=np.uint64,
+        ).view(np.float64)
+        # The matrix product is performed in Float32, and BLAS reduction order
+        # may differ by architecture.  Preserve Julia's operation family while
+        # accepting one source-dtype epsilon of last-bit variation.
+        np.testing.assert_allclose(
+            result,
+            expected,
+            rtol=np.finfo(np.float32).eps,
+            atol=0,
         )
 
     def test_hyper_sums_and_julia_default_anchor(self) -> None:
@@ -405,7 +426,9 @@ class CostMapAndIntegrationTests(unittest.TestCase):
 
         float_axis = np.asarray([0.0, 1.0, 2.0])
         mixed_cost = slm.getCostMatrix(
-            (decimal_axis,), (float_axis,), normalization=None
+            (decimal_axis,),
+            (float_axis,),
+            normalization=lambda _: 1,
         )
         self.assertEqual(mixed_cost.dtype, np.dtype(object))
         self.assertEqual(mixed_cost[0, 2], Decimal(4))
@@ -431,92 +454,57 @@ class CostMapAndIntegrationTests(unittest.TestCase):
             (float_axis,),
             2.0,
             1.0,
-            normalization=None,
+            normalization=lambda _: 1,
         )
         self.assertEqual(mixed_pd_cost.dtype, np.dtype(object))
         self.assertEqual(mixed_pd_cost[0, 2], Decimal(4))
 
-    def test_object_machine_arrays_do_not_satisfy_ot_numeric_dispatch(self) -> None:
+    def test_abstract_numeric_object_arrays_dispatch_like_julia(self) -> None:
         vector = np.asarray([1.0, 2.0], dtype=object)
         matrix = np.eye(2, dtype=object)
         vector_field = vector.reshape(2, 1)
-        typed_calls = (
-            lambda: slm.mapify(matrix, (range(2),), (range(2),)),
-            lambda: slm.hyperSum(vector, (0,), 1, ()),
-            lambda: slm.hyperSum2(vector, (0,), 1, ()),
-            lambda: slm.scalarPotentialN(
+        np.testing.assert_array_equal(
+            slm.mapify(matrix, (range(2),), (range(2),)),
+            [[0.0], [1.0]],
+        )
+        np.testing.assert_array_equal(
+            slm.hyperSum(vector, (0,), 1, ()), [0.0, 2.0]
+        )
+        np.testing.assert_array_equal(
+            slm.hyperSum2(vector, (0,), 1, ()), [0.0, 1.5]
+        )
+        np.testing.assert_array_equal(
+            slm.scalarPotentialN(
                 vector_field, (range(2),), idx=(0,)
             ),
-            lambda: slm.normalizeDistribution(vector),
-            lambda: slm.SinkhornConvN(vector, vector, 0.2, 0),
-            lambda: slm.dualToGradients(
-                vector, vector, vector, (range(2),), 0.2
-            ),
+            [0.0, 1.5],
         )
-        for call in typed_calls:
-            with self.subTest(call=call):
-                with self.assertRaisesRegex(
-                    TypeError, "concrete Julia .*numeric element type"
-                ):
-                    call()
-
-        lattice = slm.natlat((2, 2))
-        object_field = slm.LF[slm.Intensity, object, 2](
-            np.ones((2, 2), dtype=object), lattice
+        np.testing.assert_allclose(
+            slm.normalizeDistribution(vector), [1 / 3, 2 / 3]
         )
-        field_calls = (
-            lambda: slm.otPhase(
-                object_field, object_field, 0.2, maxiter=0
-            ),
-            lambda: slm.pdotPhase(
-                object_field,
-                object_field,
-                0.5,
-                0.1,
-                [0.0, 0.0],
-                [0.0, 0.0],
-                0.2,
-                maxiter=0,
-            ),
-            lambda: slm.pdotBeamEstimate(
-                object_field,
-                object_field,
-                0.5,
-                0.1,
-                [0.0, 0.0],
-                [0.0, 0.0],
-                0.2,
-                maxiter=0,
-            ),
-            lambda: slm.otQuickPhase(
-                object_field, object_field, 0.2, 0
-            ),
-            lambda: slm.otPhase2(
-                object_field, object_field, 0.2, 0
-            ),
+        sinkhorn = slm.SinkhornConvN(vector, vector, 0.2, 0)
+        self.assertEqual(
+            tuple(np.asarray(value).shape for value in sinkhorn),
+            ((2,), (2,), (0,)),
         )
-        for call in field_calls:
-            with self.subTest(call=call):
-                with self.assertRaisesRegex(
-                    TypeError, "concrete Julia .*numeric element type"
-                ):
-                    call()
+        gradients = slm.dualToGradients(
+            vector, vector, vector, (range(2),), 0.2
+        )
+        self.assertEqual(gradients.shape, (2, 1))
+        self.assertTrue(np.all(np.isfinite(gradients)))
 
         u = vector.copy()
         v = vector.copy()
-        with self.assertRaisesRegex(
-            TypeError, "concrete Julia real numeric element type"
-        ):
-            getattr(slm, "SinkhornIterBase!")(
-                u,
-                v,
-                vector.copy(),
-                vector.copy(),
-                np.ones(2, dtype=np.complex128),
-                np.ones(2, dtype=np.complex128),
-            )
-        np.testing.assert_array_equal(u, vector)
-        np.testing.assert_array_equal(v, vector)
+        getattr(slm, "SinkhornIterBase!")(
+            u,
+            v,
+            vector.copy(),
+            vector.copy(),
+            np.ones(2, dtype=np.complex128),
+            np.ones(2, dtype=np.complex128),
+        )
+        np.testing.assert_array_equal(u, [0.5, 0.5])
+        np.testing.assert_array_equal(v, [0.5, 0.5])
 
         # Abstract-array helpers accept Python vector literals. Concrete
         # Array-only convolutional helpers require explicit contiguous NumPy

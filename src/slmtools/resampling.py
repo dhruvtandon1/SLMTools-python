@@ -17,10 +17,22 @@ from dataclasses import dataclass
 from decimal import ROUND_FLOOR, Decimal, localcontext
 from fractions import Fraction
 from numbers import Integral, Number
+from operator import index as integer_index
 from typing import Any, Callable
 
+import gmpy2
 import numpy as np
 
+from ._bigfloat import (
+    _MPC,
+    _MPFR,
+    _MPFRComplex,
+    _MPQ,
+    _MPZ,
+    _bigfloat_context,
+    _to_mpfr,
+)
+from ._omission import _OMITTED
 from .lattice_field import (
     DimensionMismatch,
     DomainError,
@@ -29,9 +41,14 @@ from .lattice_field import (
     LatticeAxis,
     LatticeField,
     _axis,
+    _julia_collect_comprehension_results,
+    _julia_literal_array,
     _julia_array_scalar_operation,
     _julia_sum,
+    _julia_typed_zero,
     _logical_axis_scalar_operation,
+    _with_axis_length_kind,
+    _require_julia_numeric_array,
     as_lattice,
 )
 from .lattice_utils import _looks_like_lattice, _step
@@ -140,18 +157,47 @@ def _object_values(item: Any) -> list[Any]:
     return [value for value in array.flat if value is not None]
 
 
+def _julia_differences(values: Any) -> np.ndarray:
+    """Form adjacent differences in the represented exact context."""
+
+    array = np.asarray(values)
+    if array.dtype.kind == "O" and any(
+        isinstance(item, (_MPFR, _MPC, _MPFRComplex, _MPQ, _MPZ))
+        for item in array.flat
+    ):
+        output = np.empty(max(0, len(array) - 1), dtype=object)
+        with _bigfloat_context():
+            for index in range(len(output)):
+                output[index] = array[index + 1] - array[index]
+        return output
+    return np.diff(array)
+
+
 def _exact_domain(values: Any, target: Any) -> type[Any] | None:
     """Select Python's analogue of Julia Rational/BigFloat promotion."""
 
     value_items = _object_values(values)
     target_items = _object_values(target)
     all_items = value_items + target_items
+    if any(isinstance(item, _MPFRComplex) for item in value_items):
+        return _MPFRComplex
+    if any(isinstance(item, _MPC) for item in value_items):
+        return _MPC
+    if any(isinstance(item, _MPFR) for item in all_items):
+        return _MPFR
+    if any(isinstance(item, (gmpy2.mpz, _MPQ)) for item in value_items):
+        # Interpolations.jl promotes BigInt/Rational{BigInt} coefficients to
+        # the process-default BigFloat domain rather than retaining rationals.
+        return _MPFR
     if any(isinstance(item, Decimal) for item in all_items):
         return Decimal
     if any(isinstance(item, Fraction) for item in value_items):
         target_array = np.asarray(target)
         target_is_exact = (
-            all(isinstance(item, (Integral, Fraction)) for item in target_items)
+            all(
+                isinstance(item, (Integral, Fraction))
+                for item in target_items
+            )
             if target_array.dtype == np.dtype(object)
             else target_array.dtype.kind in "bui"
         )
@@ -163,6 +209,26 @@ def _exact_domain(values: Any, target: Any) -> type[Any] | None:
 def _convert_exact(value: Any, domain: type[Any]) -> Any:
     """Convert a scalar without silently passing through binary Float64."""
 
+    if domain is _MPFRComplex:
+        if isinstance(value, _MPFRComplex):
+            return value
+        if isinstance(value, _MPC):
+            return _MPFRComplex(value.real, value.imag)
+        if isinstance(value, (complex, np.complexfloating)):
+            return _MPFRComplex(value.real, value.imag)
+        return _MPFRComplex(value)
+    if domain is _MPC:
+        if isinstance(value, (_MPC, _MPFRComplex, complex, np.complexfloating)):
+            return _MPC(_to_mpfr(value.real), _to_mpfr(value.imag))
+        return _MPC(_to_mpfr(value), _to_mpfr(0))
+    if domain is _MPFR:
+        return _to_mpfr(value)
+    if domain is _MPQ:
+        if isinstance(value, _MPQ):
+            return value
+        if isinstance(value, Fraction):
+            return _MPQ(value.numerator, value.denominator)
+        return _MPQ(value)
     if domain is Fraction:
         if isinstance(value, Fraction):
             return value
@@ -177,6 +243,12 @@ def _convert_exact(value: Any, domain: type[Any]) -> Any:
         # Julia BigFloat(Float64) preserves the represented binary value.
         return Decimal.from_float(float(value))
     return Decimal(int(value)) if isinstance(value, Integral) else Decimal(value)
+
+
+def _exact_coordinate_domain(domain: type[Any]) -> type[Any]:
+    """Return the real coordinate type paired with an exact value domain."""
+
+    return _MPFR if domain in (_MPC, _MPFRComplex) else domain
 
 
 def _as_exact_array(array: Any, domain: type[Any]) -> np.ndarray:
@@ -272,7 +344,7 @@ def _logical_step(axis: Any) -> Any | None:
         return hint
     if len(values) < 2:
         return hint
-    differences = np.diff(values)
+    differences = _julia_differences(values)
     if values.dtype == np.dtype(object):
         return hint if all(item == hint for item in differences) else None
     # LatticeAxis infers its hint from the first materialized difference when
@@ -303,12 +375,12 @@ def _regular_step(axis: Any, *, require_positive: bool = True) -> Any:
     values = np.asarray(axis)
     hint = getattr(axis, "_step_hint", None)
     if hint is None:
-        hint = np.diff(values)[0]
+        hint = _julia_differences(values)[0]
     if hint == 0 or (require_positive and hint < 0):
         raise ValueError("Interpolation lattice axes must have positive steps.")
     if bool(getattr(axis, "_step_hint_is_logical", False)):
         return hint
-    differences = np.diff(values)
+    differences = _julia_differences(values)
     if values.dtype == np.dtype(object):
         if not all(item == hint for item in differences):
             raise ValueError("Interpolation lattice axes must be regularly spaced.")
@@ -370,6 +442,31 @@ def _solve_symmetric_tridiagonal(
     for row in range(len(diagonal) - 2, -1, -1):
         solution[row] = (
             rhs[row] - off_diagonal[row] * solution[row + 1]
+        ) / diagonal[row]
+    return solution
+
+
+def _solve_tridiagonal(
+    lower: np.ndarray,
+    diagonal: np.ndarray,
+    upper: np.ndarray,
+    right_hand_side: np.ndarray,
+) -> np.ndarray:
+    """Solve a nonsymmetric tridiagonal system with scalar object support."""
+
+    lower = np.array(lower, copy=True)
+    diagonal = np.array(diagonal, copy=True)
+    upper = np.array(upper, copy=True)
+    rhs = np.array(right_hand_side, copy=True)
+    for row in range(1, len(diagonal)):
+        multiplier = lower[row - 1] / diagonal[row - 1]
+        diagonal[row] -= multiplier * upper[row - 1]
+        rhs[row] -= multiplier * rhs[row - 1]
+    solution = np.empty_like(rhs)
+    solution[-1] = rhs[-1] / diagonal[-1]
+    for row in range(len(diagonal) - 2, -1, -1):
+        solution[row] = (
+            rhs[row] - upper[row] * solution[row + 1]
         ) / diagonal[row]
     return solution
 
@@ -455,6 +552,29 @@ def _cubic_second_derivatives(
                 "Flat(OnCell()) cubic interpolation requires a regular axis."
             )
         step = spacing[0]
+        if flat.dtype == np.dtype(object):
+            diagonal = np.empty(n, dtype=object)
+            lower = np.empty(n - 1, dtype=object)
+            upper = np.empty(n - 1, dtype=object)
+            rhs = np.empty_like(flat)
+            diagonal[0] = step * 23 / 24
+            upper[0] = step / 24
+            rhs[0] = slopes[0]
+            lower[-1] = step / 24
+            diagonal[-1] = step * 23 / 24
+            rhs[-1] = -slopes[-1]
+            for index in range(1, n - 1):
+                lower[index - 1] = spacing[index - 1]
+                diagonal[index] = 2 * (
+                    spacing[index - 1] + spacing[index]
+                )
+                upper[index] = spacing[index]
+                rhs[index] = 6 * (
+                    slopes[index] - slopes[index - 1]
+                )
+            return _solve_tridiagonal(
+                lower, diagonal, upper, rhs
+            )
         matrix = np.zeros((n, n), dtype=flat.dtype)
         rhs = np.empty_like(flat)
         matrix[0, 0] = step * np.asarray(23 / 24, dtype=flat.dtype)
@@ -507,6 +627,8 @@ def _float16_tridiagonal_factor(
 def _float16_tridiagonal_solve(
     factor: tuple[np.ndarray, np.ndarray, np.ndarray],
     right_hand_side: np.ndarray,
+    *,
+    divide_last: bool = False,
 ) -> np.ndarray:
     """Apply Interpolations.jl's Float16 forward/back substitution order."""
 
@@ -524,9 +646,17 @@ def _float16_tridiagonal_solve(
             np.multiply(lower[index - 1], solution[index - 1], dtype=np.float16),
             dtype=np.float16,
         )
-    solution[-1] = np.multiply(
-        solution[-1], inverse_diagonal[-1], dtype=np.float16
-    )
+    if divide_last:
+        # AxisAlgorithms' no-offset solve divides the final row directly.
+        # Interpolations' offset-aware first solve instead multiplies by its
+        # precomputed reciprocal.  These differ for some Float16 inputs.
+        solution[-1] = np.divide(
+            solution[-1], diagonal[-1], dtype=np.float16
+        )
+    else:
+        solution[-1] = np.multiply(
+            solution[-1], inverse_diagonal[-1], dtype=np.float16
+        )
     for index in range(len(diagonal) - 2, -1, -1):
         solution[index] = np.multiply(
             np.subtract(
@@ -536,6 +666,57 @@ def _float16_tridiagonal_solve(
             ),
             inverse_diagonal[index],
             dtype=np.float16,
+        )
+    return solution[:, 0] if vector else solution
+
+
+def _float16_tridiagonal_matrix_solve(
+    factor: tuple[np.ndarray, np.ndarray, np.ndarray],
+    right_hand_side: np.ndarray,
+) -> np.ndarray:
+    """Apply Julia LinearAlgebra's Float16 tridiagonal matrix solve."""
+
+    lower, diagonal, upper = factor
+    solution = np.array(right_hand_side, dtype=np.float16, copy=True)
+    vector = solution.ndim == 1
+    if vector:
+        solution = solution[:, None]
+    for index in range(1, len(diagonal)):
+        solution[index] = np.subtract(
+            solution[index],
+            np.multiply(lower[index - 1], solution[index - 1], dtype=np.float16),
+            dtype=np.float16,
+        )
+    solution[-1] = np.divide(
+        solution[-1], diagonal[-1], dtype=np.float16
+    )
+    if len(diagonal) > 1:
+        solution[-2] = np.divide(
+            np.subtract(
+                solution[-2],
+                np.multiply(upper[-1], solution[-1], dtype=np.float16),
+                dtype=np.float16,
+            ),
+            diagonal[-2],
+            dtype=np.float16,
+        )
+    for index in range(len(diagonal) - 3, -1, -1):
+        # Tridiagonal LU retains a second superdiagonal filled with zero when
+        # pivoting was unnecessary; LinearAlgebra still evaluates that term.
+        numerator = np.subtract(
+            solution[index],
+            np.multiply(upper[index], solution[index + 1], dtype=np.float16),
+            dtype=np.float16,
+        )
+        numerator = np.subtract(
+            numerator,
+            np.multiply(
+                np.float16(0), solution[index + 2], dtype=np.float16
+            ),
+            dtype=np.float16,
+        )
+        solution[index] = np.divide(
+            numerator, diagonal[index], dtype=np.float16
         )
     return solution[:, 0] if vector else solution
 
@@ -654,13 +835,21 @@ def _float16_dense_solve(
 
 
 def _float16_cubic_coefficients(
-    values: np.ndarray, boundary: str
+    values: np.ndarray,
+    boundary: str,
+    *,
+    input_is_padded: bool = False,
+    correction_divide_last: bool = True,
 ) -> np.ndarray:
     """Prefilter Float16 values exactly as Interpolations.jl 0.16.2 does."""
 
-    source_length = values.shape[0]
     padded = boundary != "periodic"
-    size = source_length + 2 if padded else source_length
+    if input_is_padded and not padded:
+        raise ValueError("Periodic cubic coefficients do not use padding.")
+    source_length = values.shape[0] - (2 if input_is_padded else 0)
+    size = values.shape[0] if input_is_padded else (
+        source_length + 2 if padded else source_length
+    )
     one_sixth = np.float16(1 / 6)
     lower = np.full(size - 1, one_sixth, dtype=np.float16)
     diagonal = np.full(size, np.float16(2 / 3), dtype=np.float16)
@@ -678,6 +867,20 @@ def _float16_cubic_coefficients(
         corrections = (
             (0, 2, np.float16(1)),
             (size - 1, size - 3, np.float16(1)),
+        )
+    elif boundary == "flat_oncell":
+        # Cubic(Flat(OnCell())) applies its zero-slope condition half a cell
+        # beyond each endpoint. Interpolations.jl expresses the two boundary
+        # rows as [-9, 11, -3, 1] and its reversal. Keep those coefficients
+        # and the Woodbury solve in Float16: widening this prefilter changes
+        # both the stored coefficient type and the knot values.
+        diagonal[0] = diagonal[-1] = np.float16(-9)
+        upper[0] = lower[-1] = np.float16(11)
+        corrections = (
+            (0, 2, np.float16(-3)),
+            (size - 1, size - 3, np.float16(-3)),
+            (0, 3, np.float16(1)),
+            (size - 1, size - 4, np.float16(1)),
         )
     elif boundary == "periodic":
         corrections = (
@@ -700,7 +903,7 @@ def _float16_cubic_coefficients(
         inverse_values[correction, correction] = np.float16(
             np.float16(1) / value
         )
-    base_inverse_rows = _float16_tridiagonal_solve(factor, rows)
+    base_inverse_rows = _float16_tridiagonal_matrix_solve(factor, rows)
     reduced = np.add(
         inverse_values,
         _float16_matmul(columns, base_inverse_rows),
@@ -710,7 +913,9 @@ def _float16_cubic_coefficients(
         reduced, np.eye(correction_count, dtype=np.float16)
     )
 
-    if padded:
+    if input_is_padded:
+        right_hand_side = np.asarray(values, dtype=np.float16)
+    elif padded:
         right_hand_side = np.zeros(
             (size, values.shape[1]), dtype=np.float16
         )
@@ -721,8 +926,48 @@ def _float16_cubic_coefficients(
     correction = _float16_matmul(columns, solution)
     correction = _float16_matmul(woodbury_inverse, correction)
     correction = _float16_matmul(rows, correction)
-    correction = _float16_tridiagonal_solve(factor, correction)
+    correction = _float16_tridiagonal_solve(
+        factor, correction, divide_last=correction_divide_last
+    )
     return np.subtract(solution, correction, dtype=np.float16)
+
+
+def _float16_cubic_tensor_coefficients(
+    values: np.ndarray,
+    boundary: str,
+) -> np.ndarray:
+    """Prefilter every tensor axis before evaluation, in Julia's axis order.
+
+    Interpolations.jl pads the complete coefficient array and then solves its
+    spline system along dimensions ``1:N``.  Evaluating and rounding one axis
+    before prefiltering the next is not equivalent for Float16 data.
+    """
+
+    padded = boundary != "periodic"
+    source = np.asarray(values, dtype=np.float16)
+    coefficients = (
+        np.pad(
+            source,
+            ((1, 1),) * source.ndim,
+            mode="constant",
+        )
+        if padded
+        else np.array(source, copy=True)
+    )
+    for axis in range(coefficients.ndim):
+        moved = np.moveaxis(coefficients, axis, 0)
+        moved_shape = moved.shape
+        filtered = _float16_cubic_coefficients(
+            moved.reshape(moved_shape[0], -1),
+            boundary,
+            input_is_padded=padded,
+            # AxisAlgorithms uses direct division for the final row only in
+            # its first-dimension solver.  Later dimensions multiply by the
+            # precomputed reciprocal inside their SIMD loop.
+            correction_divide_last=axis == 0,
+        )
+        coefficients = np.moveaxis(filtered.reshape(moved_shape), 0, axis)
+    return coefficients
 
 
 def _float16_cubic_weights(
@@ -788,29 +1033,27 @@ def _float16_cubic_weights(
     )
 
 
-def _float16_cubic_axis(
-    values: np.ndarray,
+def _float16_cubic_contract_axis(
+    coefficients: np.ndarray,
     source: np.ndarray,
     target: np.ndarray,
     axis: int,
     *,
-    linear_extrapolation: bool | tuple[bool, bool],
-    extrapolation_target: np.ndarray | None = None,
+    calculation_dtype: np.dtype[Any],
     spline_boundary: str,
+    derivative: bool = False,
 ) -> np.ndarray:
-    """Evaluate a cubic whose stored coefficients use Float16 arithmetic."""
+    """Contract one cubic coefficient axis without rounding the tensor."""
 
-    moved = np.moveaxis(np.asarray(values), axis, 0)
-    flat = moved.reshape(len(source), -1)
-    coefficients = _float16_cubic_coefficients(flat, spline_boundary)
-    output_dtype = _interpolation_output_dtype(moved, target)
+    moved = np.moveaxis(np.asarray(coefficients), axis, 0)
+    flat = moved.reshape(moved.shape[0], -1)
     weight_dtype = np.dtype(target.dtype)
     source_work = source.astype(weight_dtype, copy=False)
     target_work = target.astype(weight_dtype, copy=False)
     spacing = np.subtract(source_work[1], source_work[0], dtype=weight_dtype)
     lower = source_work[0]
     upper = source_work[-1]
-    if spline_boundary == "periodic":
+    if spline_boundary in ("periodic", "flat_oncell"):
         half_spacing = np.divide(
             spacing, np.asarray(2, dtype=weight_dtype), dtype=weight_dtype
         )
@@ -835,7 +1078,216 @@ def _float16_cubic_axis(
         np.asarray(1, dtype=weight_dtype),
         dtype=weight_dtype,
     )
-    base = np.floor(internal).astype(np.int64)
+    if spline_boundary == "flat_oncell":
+        base = np.floor(
+            np.where(
+                internal < np.asarray(1, dtype=weight_dtype),
+                np.add(
+                    internal,
+                    np.asarray(0.5, dtype=weight_dtype),
+                    dtype=weight_dtype,
+                ),
+                internal,
+            )
+        ).astype(np.int64)
+    else:
+        base = np.floor(internal).astype(np.int64)
+    if spline_boundary != "periodic":
+        base = np.where(base > len(source) - 1, base - 1, base)
+    fractional = np.subtract(
+        internal, base.astype(weight_dtype), dtype=weight_dtype
+    )
+    indexes = (
+        tuple(
+            np.mod(base - 2 + offset, len(source))
+            for offset in range(4)
+        )
+        if spline_boundary == "periodic"
+        else tuple(base - 1 + offset for offset in range(4))
+    )
+    weights = _float16_cubic_weights(fractional, derivative=derivative)
+    result = np.multiply(
+        weights[0][:, None],
+        flat[indexes[0]],
+        dtype=calculation_dtype,
+    )
+    for position in range(1, 4):
+        result = np.add(
+            np.multiply(
+                weights[position][:, None],
+                flat[indexes[position]],
+                dtype=calculation_dtype,
+            ),
+            result,
+            dtype=calculation_dtype,
+        )
+    if derivative:
+        result = np.divide(result, spacing, dtype=calculation_dtype)
+    reshaped = result.reshape((len(target),) + moved.shape[1:])
+    return np.moveaxis(reshaped, 0, axis)
+
+
+def _real_cubic_grid_storage_dtype(
+    values: np.ndarray,
+    output_targets: tuple[Any, ...],
+) -> np.dtype[Any] | None:
+    """Return Julia's real low-precision range-indexing storage dtype."""
+
+    value_dtype = np.dtype(values.dtype)
+    if value_dtype not in (np.dtype(np.float16), np.dtype(np.float32)):
+        return None
+    if all(np.asarray(target).ndim == 0 for target in output_targets):
+        # Scalar interpolation returns the promoted calculation type; only
+        # array/range getindex stores into the interpolation's element type.
+        return None
+    output_dtype = value_dtype
+    for target in output_targets:
+        output_dtype = _julia_numeric_dtype(
+            np.empty((), dtype=output_dtype), np.asarray(target)
+        )
+    return output_dtype
+
+
+def _float16_cubic_tensor(
+    values: np.ndarray,
+    sources: tuple[np.ndarray, ...],
+    targets: tuple[np.ndarray, ...],
+    extrapolation_targets: tuple[np.ndarray, ...],
+    linear_axes: tuple[tuple[bool, bool], ...],
+    output_targets: tuple[Any, ...],
+    spline_boundary: str,
+) -> np.ndarray:
+    """Evaluate a Float16 cubic spline as one tensor expression."""
+
+    calculation_dtype = np.dtype(np.float16)
+    for target in targets:
+        calculation_dtype = _julia_numeric_dtype(
+            np.empty((), dtype=calculation_dtype), target
+        )
+    storage_dtype = _real_cubic_grid_storage_dtype(values, output_targets)
+    output_dtype = calculation_dtype if storage_dtype is None else storage_dtype
+    # Range indexing converts only the completed tensor result back to the
+    # interpolation's declared element type.  Intermediate contractions keep
+    # the promotion selected by scaled coordinates and cubic weights.
+    coefficients = _float16_cubic_tensor_coefficients(values, spline_boundary)
+
+    def contract(derivative_axis: int | None = None) -> np.ndarray:
+        output = coefficients
+        # ``interp_getindex`` recursively expands dimension 1 around the
+        # complete expansion of dimensions 2:N, so contractions run from the
+        # last axis to the first and retain their promoted intermediates.
+        for axis in range(output.ndim - 1, -1, -1):
+            output = _float16_cubic_contract_axis(
+                output,
+                sources[axis],
+                targets[axis],
+                axis,
+                calculation_dtype=calculation_dtype,
+                spline_boundary=spline_boundary,
+                derivative=axis == derivative_axis,
+            )
+        return output
+
+    output = contract()
+    for axis, (target, reference, line_sides) in enumerate(
+        zip(targets, extrapolation_targets, linear_axes, strict=True)
+    ):
+        lower_linear, upper_linear = line_sides
+        outside = ((reference < target) & lower_linear) | (
+            (reference > target) & upper_linear
+        )
+        if not np.any(outside):
+            continue
+        displacement = np.where(
+            outside,
+            np.subtract(reference, target, dtype=target.dtype),
+            np.asarray(0, dtype=target.dtype),
+        )
+        shape = [1] * output.ndim
+        shape[axis] = len(displacement)
+        output = np.add(
+            output,
+            np.multiply(
+                displacement.reshape(shape),
+                contract(axis),
+                dtype=calculation_dtype,
+            ),
+            dtype=calculation_dtype,
+        )
+    return output.astype(output_dtype, copy=False)
+
+
+def _float16_cubic_axis(
+    values: np.ndarray,
+    source: np.ndarray,
+    target: np.ndarray,
+    axis: int,
+    *,
+    linear_extrapolation: bool | tuple[bool, bool],
+    extrapolation_target: np.ndarray | None = None,
+    output_target: np.ndarray | None = None,
+    spline_boundary: str,
+) -> np.ndarray:
+    """Evaluate a cubic whose stored coefficients use Float16 arithmetic."""
+
+    moved = np.moveaxis(np.asarray(values), axis, 0)
+    flat = moved.reshape(len(source), -1)
+    coefficients = _float16_cubic_coefficients(flat, spline_boundary)
+    output_dtype = _interpolation_output_dtype(
+        moved,
+        (
+            output_target
+            if spline_boundary == "flat_oncell" and output_target is not None
+            else target
+        ),
+    )
+    weight_dtype = np.dtype(target.dtype)
+    source_work = source.astype(weight_dtype, copy=False)
+    target_work = target.astype(weight_dtype, copy=False)
+    spacing = np.subtract(source_work[1], source_work[0], dtype=weight_dtype)
+    lower = source_work[0]
+    upper = source_work[-1]
+    if spline_boundary in ("periodic", "flat_oncell"):
+        half_spacing = np.divide(
+            spacing, np.asarray(2, dtype=weight_dtype), dtype=weight_dtype
+        )
+        evaluation_lower = np.subtract(
+            lower, half_spacing, dtype=weight_dtype
+        )
+        evaluation_upper = np.add(
+            upper, half_spacing, dtype=weight_dtype
+        )
+    else:
+        evaluation_lower = lower
+        evaluation_upper = upper
+    evaluation_target = np.clip(
+        target_work, evaluation_lower, evaluation_upper
+    )
+    internal = np.add(
+        np.divide(
+            np.subtract(evaluation_target, lower, dtype=weight_dtype),
+            spacing,
+            dtype=weight_dtype,
+        ),
+        np.asarray(1, dtype=weight_dtype),
+        dtype=weight_dtype,
+    )
+    if spline_boundary == "flat_oncell":
+        # Interpolations.floorbounds rounds the lower half-cell toward the
+        # interior before applying the ordinary upper-end adjustment.
+        base = np.floor(
+            np.where(
+                internal < np.asarray(1, dtype=weight_dtype),
+                np.add(
+                    internal,
+                    np.asarray(0.5, dtype=weight_dtype),
+                    dtype=weight_dtype,
+                ),
+                internal,
+            )
+        ).astype(np.int64)
+    else:
+        base = np.floor(internal).astype(np.int64)
     if spline_boundary != "periodic":
         base = np.where(base > len(source) - 1, base - 1, base)
     fractional = np.subtract(
@@ -850,6 +1302,30 @@ def _float16_cubic_axis(
         indexes = tuple(base - 1 + offset for offset in range(4))
 
     def evaluate(*, derivative: bool = False) -> np.ndarray:
+        if (
+            not derivative
+            and spline_boundary == "flat_oncell"
+            and output_dtype == np.dtype(np.float16)
+        ):
+            # OnCell's scaled coordinates and weights are Float64 even when
+            # the samples are Float16. Interpolations.jl collects that weighted
+            # sum in the coordinate type, then converts each result back to
+            # the interpolation's Float16 element type.
+            ratio_weights = _float16_cubic_weights(
+                fractional.astype(np.float64, copy=False)
+            )
+            ratio_result = (
+                ratio_weights[0][:, None]
+                * coefficients[indexes[0]].astype(np.float64)
+            )
+            for position in range(1, 4):
+                ratio_result = (
+                    ratio_weights[position][:, None]
+                    * coefficients[indexes[position]].astype(np.float64)
+                    + ratio_result
+                )
+            return ratio_result.astype(np.float16)
+
         weights = _float16_cubic_weights(
             fractional, derivative=derivative
         )
@@ -913,7 +1389,10 @@ def _natural_cubic_axis(
     *,
     linear_extrapolation: bool | tuple[bool, bool] = False,
     extrapolation_target: np.ndarray | None = None,
+    output_target: np.ndarray | None = None,
     spline_boundary: str = "natural",
+    derivative: bool = False,
+    _mpfr_active: bool = False,
 ) -> np.ndarray:
     """Evaluate a natural cubic spline along one array axis."""
 
@@ -926,10 +1405,25 @@ def _natural_cubic_axis(
     if n == 0:
         raise ValueError("Cannot interpolate an empty axis.")
     exact_domain = _exact_domain(moved, target)
+    if exact_domain in (_MPFR, _MPC, _MPFRComplex) and not _mpfr_active:
+        with _bigfloat_context():
+            return _natural_cubic_axis(
+                values,
+                source,
+                target,
+                axis,
+                linear_extrapolation=linear_extrapolation,
+                extrapolation_target=extrapolation_target,
+                output_target=output_target,
+                spline_boundary=spline_boundary,
+                derivative=derivative,
+                _mpfr_active=True,
+            )
     if exact_domain is not None:
         moved = _as_exact_array(moved, exact_domain)
-        source = _as_exact_array(source, exact_domain)
-        target = _as_exact_array(target, exact_domain)
+        coordinate_domain = _exact_coordinate_domain(exact_domain)
+        source = _as_exact_array(source, coordinate_domain)
+        target = _as_exact_array(target, coordinate_domain)
     coordinate_dtype = _coordinate_dtype(source, target)
     coefficient_dtype = _interpolation_coefficient_dtype(moved)
     output_dtype = _interpolation_output_dtype(moved, target)
@@ -939,8 +1433,11 @@ def _natural_cubic_axis(
     if (
         coefficient_dtype == np.dtype(np.float16)
         and n > 1
-        and spline_boundary != "flat_oncell"
     ):
+        if derivative:
+            raise TypeError(
+                "Float16 tensor derivatives require the tensor spline path."
+            )
         return _float16_cubic_axis(
             np.asarray(values),
             source,
@@ -948,6 +1445,7 @@ def _natural_cubic_axis(
             axis,
             linear_extrapolation=linear_extrapolation,
             extrapolation_target=extrapolation_target,
+            output_target=output_target,
             spline_boundary=spline_boundary,
         )
     calculation_coordinate_dtype = (
@@ -1027,18 +1525,25 @@ def _natural_cubic_axis(
     width = x1 - x0
     a = (x1 - evaluation_target) / width
     b = (evaluation_target - x0) / width
-    output = (
-        a[:, None] * value0
-        + b[:, None] * value1
-        + ((a**3 - a) * width**2)[:, None] * second0 / 6
-        + ((b**3 - b) * width**2)[:, None] * second1 / 6
-    )
+    if derivative:
+        output = (
+            (value1 - value0) / width[:, None]
+            + ((1 - 3 * a**2) * width)[:, None] * second0 / 6
+            + ((3 * b**2 - 1) * width)[:, None] * second1 / 6
+        )
+    else:
+        output = (
+            a[:, None] * value0
+            + b[:, None] * value1
+            + ((a**3 - a) * width**2)[:, None] * second0 / 6
+            + ((b**3 - b) * width**2)[:, None] * second1 / 6
+        )
     lower_linear, upper_linear = (
         linear_extrapolation
         if isinstance(linear_extrapolation, tuple)
         else (linear_extrapolation, linear_extrapolation)
     )
-    if lower_linear or upper_linear:
+    if not derivative and (lower_linear or upper_linear):
         reference = (
             target
             if extrapolation_target is None
@@ -1086,6 +1591,7 @@ def _linear_axis(
     *,
     linear_extrapolation: bool | tuple[bool, bool] = False,
     extrapolation_target: np.ndarray | None = None,
+    _mpfr_active: bool = False,
 ) -> np.ndarray:
     """Evaluate piecewise-linear interpolation along one array axis."""
 
@@ -1098,10 +1604,22 @@ def _linear_axis(
     if n == 0:
         raise ValueError("Cannot interpolate an empty axis.")
     exact_domain = _exact_domain(moved, target)
+    if exact_domain in (_MPFR, _MPC, _MPFRComplex) and not _mpfr_active:
+        with _bigfloat_context():
+            return _linear_axis(
+                values,
+                source,
+                target,
+                axis,
+                linear_extrapolation=linear_extrapolation,
+                extrapolation_target=extrapolation_target,
+                _mpfr_active=True,
+            )
     if exact_domain is not None:
         moved = _as_exact_array(moved, exact_domain)
-        source = _as_exact_array(source, exact_domain)
-        target = _as_exact_array(target, exact_domain)
+        coordinate_domain = _exact_coordinate_domain(exact_domain)
+        source = _as_exact_array(source, coordinate_domain)
+        target = _as_exact_array(target, coordinate_domain)
     coordinate_dtype = _coordinate_dtype(source, target)
     dtype = _interpolation_output_dtype(moved, target)
     source = source.astype(coordinate_dtype, copy=False)
@@ -1232,7 +1750,7 @@ def _map_targets(
     tuple[np.ndarray, ...],
     tuple[np.ndarray, ...],
     tuple[tuple[bool, bool], ...],
-    Any | None,
+    Any,
 ]:
     """Apply Interpolations.jl-compatible extrapolation policies."""
 
@@ -1245,7 +1763,7 @@ def _map_targets(
     extrapolation_targets: list[np.ndarray] = []
     outside_masks: list[np.ndarray] = []
     linear_axes: list[tuple[bool, bool]] = []
-    fill_value: Any | None = None
+    fill_value: Any = _OMITTED
     if oncell_periodic_axes is None:
         oncell_periodic_axes = (False,) * len(ranges)
     if len(oncell_periodic_axes) != len(ranges):
@@ -1353,10 +1871,13 @@ def _map_targets(
             mapped_target = np.clip(target_work, lower, upper)
             outside = np.zeros_like(outside)
             linear_sides = (True, True)
-        elif isinstance(policy, Number) or np.isscalar(policy) or isinstance(
-            policy, tuple
+        elif (
+            policy is None
+            or isinstance(policy, Number)
+            or np.isscalar(policy)
+            or isinstance(policy, tuple)
         ):
-            if fill_value is None:
+            if fill_value is _OMITTED:
                 fill_value = policy
             elif not (
                 policy == fill_value
@@ -1389,18 +1910,25 @@ def _map_targets(
 def _apply_fill(
     output: np.ndarray,
     outside_masks: tuple[np.ndarray, ...],
-    fill_value: Any | None,
+    fill_value: Any,
 ) -> np.ndarray:
     """Apply a scalar fill boundary to the tensor-product result."""
 
-    if fill_value is None or not any(np.any(mask) for mask in outside_masks):
+    if fill_value is _OMITTED:
         return output
+    has_outside = any(np.any(mask) for mask in outside_masks)
     output_dtype = (
         np.dtype(object)
-        if output.dtype == np.dtype(object) or isinstance(fill_value, tuple)
+        if (
+            output.dtype == np.dtype(object)
+            or fill_value is None
+            or isinstance(fill_value, tuple)
+        )
         else _julia_numeric_dtype(output, fill_value)
     )
     output = output.astype(output_dtype, copy=False)
+    if not has_outside:
+        return output
     combined = np.zeros(tuple(map(len, outside_masks)), dtype=bool)
     for axis_number, mask in enumerate(outside_masks):
         shape = [1] * len(outside_masks)
@@ -1461,31 +1989,98 @@ class _CubicSpline:
                 else None
             ),
         )
-
-        output = self.values
-        for axis_number, (
-            source_axis,
-            target_axis,
-            extrapolation_target,
-            linear_axis,
-        ) in enumerate(
-            zip(
-                sources,
+        active_linear_extrapolation = any(
+            (lower_linear or upper_linear)
+            and np.any(reference != target)
+            for target, reference, (lower_linear, upper_linear) in zip(
                 mapped,
                 extrapolation_targets,
                 linear_axes,
                 strict=True,
             )
+        )
+
+        if (
+            self.values.dtype == np.dtype(np.float16)
+            and self.values.ndim > 1
         ):
-            output = _natural_cubic_axis(
-                output,
+            output = _float16_cubic_tensor(
+                self.values,
+                sources,
+                mapped,
+                extrapolation_targets,
+                linear_axes,
+                coordinates,
+                self.spline_boundary,
+            )
+            return _apply_fill(output, outside_masks, fill_value)
+
+        def evaluate_component(derivative_axis: int | None = None) -> np.ndarray:
+            component = self.values
+            for axis_number, (
                 source_axis,
                 target_axis,
-                axis_number,
-                linear_extrapolation=linear_axis,
-                extrapolation_target=extrapolation_target,
-                spline_boundary=self.spline_boundary,
-            )
+                extrapolation_target,
+                linear_axis,
+                output_target,
+            ) in enumerate(
+                zip(
+                    sources,
+                    mapped,
+                    extrapolation_targets,
+                    linear_axes,
+                    coordinates,
+                    strict=True,
+                )
+            ):
+                component = _natural_cubic_axis(
+                    component,
+                    source_axis,
+                    target_axis,
+                    axis_number,
+                    linear_extrapolation=(
+                        (False, False)
+                        if active_linear_extrapolation and self.values.ndim > 1
+                        else linear_axis
+                    ),
+                    extrapolation_target=extrapolation_target,
+                    output_target=np.atleast_1d(np.asarray(output_target)),
+                    spline_boundary=self.spline_boundary,
+                    derivative=axis_number == derivative_axis,
+                )
+            return component
+
+        output = evaluate_component()
+        if active_linear_extrapolation and self.values.ndim > 1:
+            # Extrapolations.jl evaluates the spline and its full gradient at
+            # the clamped point, then adds one displacement-gradient term per
+            # Line axis.  Sequentially extrapolating tensor axes would invent
+            # mixed derivative terms at corners.
+            for axis_number, (target_axis, reference, line_axis) in enumerate(
+                zip(mapped, extrapolation_targets, linear_axes, strict=True)
+            ):
+                lower_linear, upper_linear = line_axis
+                outside = ((reference < target_axis) & lower_linear) | (
+                    (reference > target_axis) & upper_linear
+                )
+                if not np.any(outside):
+                    continue
+                displacement = np.where(
+                    outside,
+                    reference - target_axis,
+                    np.asarray(0, dtype=target_axis.dtype),
+                )
+                shape = [1] * output.ndim
+                shape[axis_number] = len(displacement)
+                output = output + displacement.reshape(shape) * evaluate_component(
+                    axis_number
+                )
+
+        storage_dtype = _real_cubic_grid_storage_dtype(
+            self.values, coordinates
+        )
+        if storage_dtype is not None:
+            output = output.astype(storage_dtype, copy=False)
 
         return _apply_fill(output, outside_masks, fill_value)
 
@@ -1585,7 +2180,7 @@ class _LinearInterpolator:
         for axis in self.ranges:
             if _logical_step(axis) is not None:
                 continue
-            if not np.all(np.diff(np.asarray(axis)) > 0):
+            if not np.all(_julia_differences(axis) > 0):
                 raise ValueError(
                     "Interpolation lattice axes must be strictly increasing."
                 )
@@ -1709,23 +2304,34 @@ def _downsample_axis(axis: Any, factor: Any) -> LatticeAxis:
         if isinstance(axis, LatticeAxis)
         else _step(axis)
     )
-    dtype = _julia_numeric_dtype(values, step)
-    values_work = values.astype(dtype, copy=False)
+    exact_axis = values.dtype.kind == "O" and values.size and all(
+        isinstance(item, (Fraction, Decimal, _MPFR, _MPQ, _MPZ))
+        or (type(item) is int and not np.iinfo(np.int64).min <= item <= np.iinfo(np.int64).max)
+        for item in values.flat
+    )
+    if exact_axis:
+        values_work = values.astype(object, copy=False)
+    else:
+        dtype = _julia_numeric_dtype(values, step)
+        values_work = values.astype(dtype, copy=False)
     endpoint_sum = _julia_array_scalar_operation(
-        np.asarray(values_work[factor - 1]), values_work[0], np.add
+        values_work[factor - 1], values_work[0], np.add
     )
     start = _julia_array_scalar_operation(
         endpoint_sum, 2, np.divide
     ).reshape(())[()]
     output_step = _julia_array_scalar_operation(
-        np.asarray(step), factor, np.multiply
+        step, factor, np.multiply
     ).reshape(())[()]
     output_length = len(values) // factor
     offsets = _axis(range(output_length))
     scaled = _logical_axis_scalar_operation(
         offsets, output_step, np.multiply
     )
-    return _logical_axis_scalar_operation(scaled, start, np.add)
+    result = _logical_axis_scalar_operation(scaled, start, np.add)
+    return _with_axis_length_kind(
+        result, getattr(_axis(axis), "_length_kind", "int64")
+    )
 
 
 def _downsample_lattice(lattice: Any, factor: Any) -> Lattice:
@@ -1750,7 +2356,7 @@ def _upsample_axis(axis: Any, factor: Any) -> LatticeAxis:
     # source dtype, while the final coordinates are widened to Float64.
     with np.errstate(divide="ignore", invalid="ignore"):
         output_step = _julia_array_scalar_operation(
-            np.asarray(step), factor, np.divide
+            step, factor, np.divide
         ).reshape(())[()]
     # The Julia source spells this index axis ``1:length(r)*n``, a UnitRange.
     # Its scalar subtraction overload is observably different from the
@@ -1765,7 +2371,10 @@ def _upsample_axis(axis: Any, factor: Any) -> LatticeAxis:
         # The final ``.+ r[1]`` in Julia raises BoundsError for an empty
         # source even though the generated ordinal range is also empty.
         raise IndexError("Lattice axis index out of bounds")
-    return _logical_axis_scalar_operation(scaled, values[0], np.add)
+    result = _logical_axis_scalar_operation(scaled, values[0], np.add)
+    return _with_axis_length_kind(
+        result, getattr(_axis(axis), "_length_kind", "int64")
+    )
 
 
 def _upsample_lattice(lattice: Any, factor: Any) -> Lattice:
@@ -1784,13 +2393,72 @@ def _index_lattice(shape: tuple[int, ...]) -> Lattice:
     return tuple(_axis(np.arange(1, size + 1), 1) for size in shape)
 
 
+def _builtin_range_indexing_succeeds(axis: LatticeAxis) -> bool:
+    """Whether Julia's interpolation ``getindex`` accepts this range family."""
+
+    dtype_kind = np.asarray(axis).dtype.kind
+    if dtype_kind == "i":
+        return True
+    return dtype_kind == "u" and getattr(axis, "_range_kind", None) == "srl"
+
+
+def _index_numpy_array_like_julia(
+    array: np.ndarray, target_lattice: Lattice
+) -> np.ndarray:
+    """Apply Julia's one-based Cartesian-product indexing to a NumPy array."""
+
+    index_count = len(target_lattice)
+    if index_count == 0:
+        if array.ndim == 0:
+            return array[()]
+        raise DimensionMismatch(
+            "A non-scalar custom interpolation array requires an index."
+        )
+
+    # With fewer indices Julia linearly collapses all dimensions consumed by
+    # the final index. With extra indices it appends singleton dimensions.
+    # Reshape in column-major order to retain Julia's linear-index ordering.
+    if index_count < array.ndim:
+        effective_shape = (
+            array.shape[: index_count - 1]
+            + (int(np.prod(array.shape[index_count - 1 :])),)
+        )
+        effective = np.reshape(array, effective_shape, order="F")
+    elif index_count > array.ndim:
+        effective_shape = array.shape + (1,) * (index_count - array.ndim)
+        effective = np.reshape(array, effective_shape)
+    else:
+        effective = array
+
+    indexes: list[np.ndarray] = []
+    for dimension, (axis, size) in enumerate(
+        zip(target_lattice, effective.shape, strict=True), start=1
+    ):
+        converted = np.empty(len(axis), dtype=np.intp)
+        for position, item in enumerate(np.asarray(axis)):
+            try:
+                one_based = integer_index(item)
+            except TypeError as error:
+                raise TypeError(
+                    f"invalid Julia array index {item!r} in dimension {dimension}"
+                ) from error
+            if one_based < 1 or one_based > size:
+                raise IndexError(
+                    f"Julia array index {one_based} is out of bounds for "
+                    f"dimension {dimension} with size {size}"
+                )
+            converted[position] = one_based - 1
+        indexes.append(converted)
+    return np.asarray(effective[np.ix_(*indexes)])
+
+
 def _interpolate(
     values: Any,
     source: Any,
     target: Any,
     interpolation: Callable[..., Any],
     boundary: Any,
-) -> np.ndarray:
+) -> Any:
     source_lattice = as_lattice(source)
     target_lattice = as_lattice(target)
     array = np.asarray(values)
@@ -1798,47 +2466,130 @@ def _interpolate(
         raise DomainError(
             "Size of array does not match size of interpolation source lattice."
         )
-    interpolator = interpolation(
-        source_lattice, array, extrapolation_bc=boundary
-    )
+    storage_state = None
+    callback_values = values
+    if hasattr(values, "_storage") and hasattr(values, "_state"):
+        # A custom factory receives Julia's ordinary mutable ``f.data`` Array,
+        # including NumPy scalar-broadcast semantics.  Use the authoritative
+        # storage and synchronize every retained checked facade afterward.
+        callback_values = values._storage()
+        storage_state = values._state()
     try:
-        output = interpolator[target_lattice]
-    except TypeError:
-        output = interpolator(*target_lattice)
-    return np.asarray(output)
+        interpolator = interpolation(
+            source_lattice,
+            callback_values,
+            extrapolation_bc=boundary,
+        )
+    finally:
+        if storage_state is not None:
+            storage_state.changed()
+    if (
+        isinstance(interpolator, (_CubicSpline, _LinearInterpolator))
+        and not any(len(axis) == 0 for axis in target_lattice)
+        and any(
+            not _builtin_range_indexing_succeeds(axis)
+            for axis in target_lattice
+        )
+    ):
+        raise NotImplementedError(
+            "the audited Julia built-in resampling path does not produce "
+            "defined values for this target range family"
+        )
+    # Julia's source uses range ``getindex`` here.  A custom interpolation
+    # factory is therefore supported only when its result implements the
+    # corresponding subscription operation; calling it would invent a
+    # successful fallback that the source never attempts.
+    output = (
+        _index_numpy_array_like_julia(interpolator, target_lattice)
+        if isinstance(interpolator, np.ndarray)
+        else interpolator[target_lattice]
+    )
+    return output
+
+
+def _julia_zero_for_array(values: Any) -> Any:
+    """Return ``zero(eltype(values))`` without erasing object element types."""
+
+    array = np.asarray(values)
+    if array.dtype.kind == "O" and array.size:
+        return _julia_typed_zero(array.ravel(order="F")[0])
+    return np.zeros((), dtype=array.dtype)[()]
 
 
 def downsample(
     value: Any,
     *arguments: Any,
-    interpolation: Callable[..., Any] = cubic_spline_interpolation,
-    bc: Any = None,
+    interpolation: Any = _OMITTED,
+    bc: Any = _OMITTED,
 ) -> Any:
     """Downsample an axis/lattice/array/field using Julia-compatible overloads."""
 
     if isinstance(value, LatticeField):
+        _require_julia_numeric_array(value.data, "downsample field")
         if len(arguments) != 1:
             raise TypeError("downsample(field, target_or_factor) expected.")
         specification = arguments[0]
+        if (
+            value.ndim == 0
+            and isinstance(specification, tuple)
+            and len(specification) == 0
+        ):
+            raise TypeError(
+                "zero-dimensional field resampling with an empty tuple is "
+                "ambiguous in Julia"
+            )
         target = (
             as_lattice(specification)
             if _looks_like_lattice(specification)
             else _downsample_lattice(value.L, specification)
         )
-        boundary = np.zeros((), dtype=value.dtype)[()] if bc is None else bc
-        data = _interpolate(value.data, value.L, target, interpolation, boundary)
+        boundary = _julia_zero_for_array(value.data) if bc is _OMITTED else bc
+        interpolation_factory = (
+            cubic_spline_interpolation
+            if interpolation is _OMITTED
+            else interpolation
+        )
+        data = _interpolate(
+            value.data,
+            value.L,
+            target,
+            interpolation_factory,
+            boundary,
+        )
         return LatticeField[value.field_type](data, target, value.flambda)
     if isinstance(value, (LatticeAxis, range)):
+        if interpolation is not _OMITTED:
+            raise TypeError(
+                "downsample(axis, factor) does not accept interpolation"
+            )
+        if bc is not _OMITTED:
+            raise TypeError("downsample(axis, factor) does not accept bc")
         if len(arguments) != 1:
             raise TypeError("downsample(axis, factor) expected.")
         return _downsample_axis(value, arguments[0])
     if _looks_like_lattice(value):
+        if interpolation is not _OMITTED:
+            raise TypeError(
+                "downsample(lattice, factor) does not accept interpolation"
+            )
+        if bc is not _OMITTED:
+            raise TypeError("downsample(lattice, factor) does not accept bc")
         if len(arguments) != 1:
             raise TypeError("downsample(lattice, factor) expected.")
         return _downsample_lattice(value, arguments[0])
 
-    array = np.asarray(value)
-    boundary = np.zeros((), dtype=array.dtype)[()] if bc is None else bc
+    if not isinstance(value, (list, np.ndarray)):
+        raise TypeError(
+            "downsample array input must be a dense array or list literal"
+        )
+
+    array = (
+        _julia_literal_array(value)
+        if isinstance(value, list)
+        else np.asarray(value)
+    )
+    _require_julia_numeric_array(array, "downsample array")
+    boundary = _julia_zero_for_array(array) if bc is _OMITTED else bc
     if len(arguments) == 1:
         source = _index_lattice(array.shape)
         target = _downsample_lattice(source, arguments[0])
@@ -1846,7 +2597,18 @@ def downsample(
         source, target = map(as_lattice, arguments)
     else:
         raise TypeError("downsample(array, factor) or (array, source, target).")
-    return _interpolate(array, source, target, interpolation, boundary)
+    interpolation_factory = (
+        cubic_spline_interpolation
+        if interpolation is _OMITTED
+        else interpolation
+    )
+    return _interpolate(
+        array,
+        source,
+        target,
+        interpolation_factory,
+        boundary,
+    )
 
 
 def _empty_coarsen_default_dtype(dtype: np.dtype[Any]) -> np.dtype[Any]:
@@ -1859,7 +2621,7 @@ def _empty_coarsen_default_dtype(dtype: np.dtype[Any]) -> np.dtype[Any]:
 
 def _empty_coarsen_reducer_dtype(
     dtype: np.dtype[Any],
-    reducer: Callable[[np.ndarray], Any] | None,
+    reducer: Any,
 ) -> np.dtype[Any]:
     """Infer an empty coarsening result without evaluating ``reducer``.
 
@@ -1869,7 +2631,7 @@ def _empty_coarsen_reducer_dtype(
     when it is not called and therefore maps to object storage.
     """
 
-    if reducer is None or reducer is np.mean:
+    if reducer is _OMITTED or reducer is np.mean:
         return _empty_coarsen_default_dtype(dtype)
 
     if any(
@@ -1892,15 +2654,25 @@ def coarsen(
     value: Any,
     factor: Any,
     *,
-    reducer: Callable[[np.ndarray], Any] | None = None,
+    reducer: Any = _OMITTED,
 ) -> Any:
     """Reduce disjoint superpixels; the default reducer is arithmetic mean."""
 
     if isinstance(value, LatticeField):
+        _require_julia_numeric_array(value.data, "coarsen field")
         target = _downsample_lattice(value.L, factor)
         data = coarsen(value.data, factor, reducer=reducer)
         return LatticeField[value.field_type](data, target, value.flambda)
-    array = np.asarray(value)
+    if not isinstance(value, (list, np.ndarray)):
+        raise TypeError(
+            "coarsen array input must be a dense array or list literal"
+        )
+    array = (
+        _julia_literal_array(value)
+        if isinstance(value, list)
+        else np.asarray(value)
+    )
+    _require_julia_numeric_array(array, "coarsen array")
     factors = _factor_tuple(factor, array.ndim)
     if any(size % item for size, item in zip(array.shape, factors, strict=True)):
         raise DomainError(
@@ -1914,15 +2686,38 @@ def coarsen(
             output_shape,
             dtype=_empty_coarsen_reducer_dtype(array.dtype, reducer),
         )
-    default_reducer = reducer is None
+    extrema_reducer = any(
+        reducer is candidate
+        for candidate in (np.max, np.amax, np.min, np.amin)
+    )
+    complex_values = array.dtype.kind == "c" or (
+        array.dtype.kind == "O"
+        and any(
+            isinstance(
+                item,
+                (_MPC, _MPFRComplex, complex, np.complexfloating),
+            )
+            for item in array.flat
+        )
+    )
+    if extrema_reducer and complex_values:
+        raise TypeError("Julia extrema reducers cannot order complex values")
+    default_reducer = reducer is _OMITTED
     sum_reducer = reducer is np.sum
     object_output = np.empty(output_shape, dtype=object)
-    for index in np.ndindex(output_shape):
+    indices = (
+        tuple(reversed(index))
+        for index in np.ndindex(tuple(reversed(output_shape)))
+    )
+    for index in indices:
         block = tuple(
             slice(i * width, (i + 1) * width)
             for i, width in zip(index, factors, strict=True)
         )
-        superpixel = array[block]
+        # Julia's ``x[I .+ box]`` is advanced indexing and allocates a dense
+        # block for each callback.  A Python basic slice is a mutable view;
+        # detach it so a reducer cannot mutate the caller's source array.
+        superpixel = np.array(array[block], copy=True, order="F")
         if default_reducer or sum_reducer:
             total = _julia_sum(superpixel)
             if default_reducer:
@@ -1934,56 +2729,99 @@ def coarsen(
                     with localcontext() as context:
                         _enable_decimal_nonfinite(context)
                         total = total / Decimal(superpixel.size)
+                elif isinstance(total, _MPZ):
+                    with _bigfloat_context():
+                        total = _to_mpfr(total) / _to_mpfr(superpixel.size)
                 else:
                     divided = _julia_array_scalar_operation(
-                        np.asarray(total),
+                        total,
                         np.int64(superpixel.size),
                         np.divide,
                     )
                     total = divided.reshape(())[()]
             object_output[index] = total
         else:
-            assert reducer is not None
             object_output[index] = reducer(superpixel)
-    sample_values = list(object_output.flat)
-    dtype = np.result_type(*[np.asarray(item).dtype for item in sample_values])
-    output = np.empty(output_shape, dtype=dtype)
-    for index in np.ndindex(output_shape):
-        output[index] = object_output[index]
-    return output
+    collected = _julia_collect_comprehension_results(
+        object_output.ravel(order="F")
+    )
+    return collected.reshape(output_shape, order="F")
 
 
 def upsample(
     value: Any,
     *arguments: Any,
-    interpolation: Callable[..., Any] = cubic_spline_interpolation,
-    bc: Any = None,
+    interpolation: Any = _OMITTED,
+    bc: Any = _OMITTED,
 ) -> Any:
     """Upsample an axis/lattice/array/field using Julia-compatible overloads."""
 
     if isinstance(value, LatticeField):
+        _require_julia_numeric_array(value.data, "upsample field")
         if len(arguments) != 1:
             raise TypeError("upsample(field, target_or_factor) expected.")
         specification = arguments[0]
+        if (
+            value.ndim == 0
+            and isinstance(specification, tuple)
+            and len(specification) == 0
+        ):
+            raise TypeError(
+                "zero-dimensional field resampling with an empty tuple is "
+                "ambiguous in Julia"
+            )
         target = (
             as_lattice(specification)
             if _looks_like_lattice(specification)
             else _upsample_lattice(value.L, specification)
         )
-        boundary = np.zeros((), dtype=value.dtype)[()] if bc is None else bc
-        data = _interpolate(value.data, value.L, target, interpolation, boundary)
+        boundary = _julia_zero_for_array(value.data) if bc is _OMITTED else bc
+        interpolation_factory = (
+            cubic_spline_interpolation
+            if interpolation is _OMITTED
+            else interpolation
+        )
+        data = _interpolate(
+            value.data,
+            value.L,
+            target,
+            interpolation_factory,
+            boundary,
+        )
         return LatticeField[value.field_type](data, target, value.flambda)
     if isinstance(value, (LatticeAxis, range)):
+        if interpolation is not _OMITTED:
+            raise TypeError(
+                "upsample(axis, factor) does not accept interpolation"
+            )
+        if bc is not _OMITTED:
+            raise TypeError("upsample(axis, factor) does not accept bc")
         if len(arguments) != 1:
             raise TypeError("upsample(axis, factor) expected.")
         return _upsample_axis(value, arguments[0])
     if _looks_like_lattice(value):
+        if interpolation is not _OMITTED:
+            raise TypeError(
+                "upsample(lattice, factor) does not accept interpolation"
+            )
+        if bc is not _OMITTED:
+            raise TypeError("upsample(lattice, factor) does not accept bc")
         if len(arguments) != 1:
             raise TypeError("upsample(lattice, factor) expected.")
         return _upsample_lattice(value, arguments[0])
 
-    array = np.asarray(value)
-    boundary = np.zeros((), dtype=array.dtype)[()] if bc is None else bc
+    if not isinstance(value, (list, np.ndarray)):
+        raise TypeError(
+            "upsample array input must be a dense array or list literal"
+        )
+
+    array = (
+        _julia_literal_array(value)
+        if isinstance(value, list)
+        else np.asarray(value)
+    )
+    _require_julia_numeric_array(array, "upsample array")
+    boundary = _julia_zero_for_array(array) if bc is _OMITTED else bc
     if len(arguments) == 1:
         source = _index_lattice(array.shape)
         target = _upsample_lattice(source, arguments[0])
@@ -1991,7 +2829,18 @@ def upsample(
         source, target = map(as_lattice, arguments)
     else:
         raise TypeError("upsample(array, factor) or (array, source, target).")
-    return _interpolate(array, source, target, interpolation, boundary)
+    interpolation_factory = (
+        cubic_spline_interpolation
+        if interpolation is _OMITTED
+        else interpolation
+    )
+    return _interpolate(
+        array,
+        source,
+        target,
+        interpolation_factory,
+        boundary,
+    )
 
 
 __all__ = [

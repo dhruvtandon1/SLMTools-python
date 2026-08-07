@@ -12,7 +12,7 @@ Julia checkout is the reference used for parity tests.
 
 ## Install
 
-Python 3.12 or newer is supported. From a source checkout:
+Python 3.13 or newer is supported. From a source checkout:
 
 ```bash
 python -m pip install .
@@ -94,9 +94,11 @@ Real phase is measured in cycles, not radians. `wrap(phi)` uses
 `exp(2πi*phi)`. `sft` and `isft` use the original shifted FFT definitions
 without adding a physical sampling factor to the values.
 
-Python indexing is zero-based. Operations that flatten or reshape lattice
-data use Fortran order so that Julia's column-major point enumeration remains
-unchanged.
+Ordinary Python array and field indices are zero-based. A few public
+dimension-number arguments remain one-based where that number is part of the
+Julia calculation; `PORTING.md` lists those exceptions. Operations that
+flatten or reshape lattice data use Fortran order so that Julia's
+column-major point enumeration remains unchanged.
 
 Direct Boolean and advanced indexing through `field.data` follows Julia's
 column-major indexing rules. When passing field values to a NumPy consumer

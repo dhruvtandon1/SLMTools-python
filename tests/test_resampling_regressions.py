@@ -45,14 +45,16 @@ class ResamplingRegressionTests(unittest.TestCase):
         self.assertEqual(np.asarray(wrapped_integer).dtype, np.dtype(np.float32))
         self.assertEqual(wrapped_integer, interpolator32[np.float32(2)])
 
-    def test_cubic_float32_and_complex64_explicit_grids_preserve_dtype(self) -> None:
+    def test_cubic_float32_and_complex64_calls_preserve_dtype(self) -> None:
         source = (np.linspace(1, 4, 4, dtype=np.float32),)
         target = (np.linspace(1, 4, 13, dtype=np.float32),)
 
         real = np.array([1, 4, 2, 8], dtype=np.float32)
         complex_values = real.astype(np.complex64) * np.complex64(1 + 2j)
-        real_result = upsample(real, source, target)
-        complex_result = upsample(complex_values, source, target)
+        real_result = CubicSplineInterpolation(source, real)(target[0])
+        complex_result = CubicSplineInterpolation(
+            source, complex_values
+        )(target[0])
 
         self.assertEqual(real_result.dtype, np.dtype(np.float32))
         self.assertEqual(complex_result.dtype, np.dtype(np.complex64))
@@ -85,6 +87,11 @@ class ResamplingRegressionTests(unittest.TestCase):
             rtol=2e-6,
             atol=2e-6,
         )
+        for values in (real, complex_values):
+            with self.assertRaisesRegex(
+                NotImplementedError, "does not produce defined values"
+            ):
+                upsample(values, source, target)
 
     def test_nonaffine_float64_matches_locked_julia_golden(self) -> None:
         values = np.array([1.0, 4.0, 2.0, 8.0])
@@ -460,29 +467,28 @@ class ResamplingRegressionTests(unittest.TestCase):
             bc=Periodic(OnCell()),
             extrapolation_bc=Linear(),
         )(targets)
-        self.assertEqual(periodic.dtype, np.dtype(np.float64))
-        # Periodic(OnCell()) introduces Float64 half-cell bounds in the
-        # locked dependency, so even Float16 coefficients evaluate as
-        # Float64 on this path.
+        self.assertEqual(periodic.dtype, np.dtype(np.float16))
+        # Scalar evaluation uses Float64 half-cell arithmetic, while Julia's
+        # vector/range indexing stores each completed result back to Float16.
         np.testing.assert_array_equal(
-            periodic.view(np.uint64),
+            periodic.view(np.uint16),
             np.asarray(
                 [
-                    0x4023204000000000,
-                    0x40131FDFFFFFFFFF,
-                    0x3FEFF55555555552,
-                    0x3FF025EFFFFFFFFF,
-                    0x4000386AAAAAAAAB,
-                    0x400A3E7D55555554,
-                    0x400FF5FFFFFFFFFF,
-                    0x4005BA4000000000,
-                    0x3FFFFFFFFFFFFFFE,
-                    0x4015E0CAAAAAAAAA,
-                    0x4020002AAAAAAAAB,
-                    0x40131FDFFFFFFFFF,
-                    0xBF48000000002000,
+                    0x48C8,
+                    0x44C8,
+                    0x3BFD,
+                    0x3C09,
+                    0x400E,
+                    0x4290,
+                    0x43FD,
+                    0x416F,
+                    0x4000,
+                    0x4578,
+                    0x4800,
+                    0x44C8,
+                    0x9200,
                 ],
-                dtype=np.uint64,
+                dtype=np.uint16,
             ),
         )
 

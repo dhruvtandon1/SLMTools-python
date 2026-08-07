@@ -491,10 +491,10 @@ def test_working_rational_and_bigfloat_misc_paths() -> None:
     assert SchroffError(exact_intensity, exact_intensity, threshold=0) == 0.0
 
     rational_signed = np.array([Fraction(-1), Fraction(2)], dtype=object)
-    assert all(isinstance(value, Fraction) for value in ramp(rational_signed))
+    assert all(isinstance(ramp(value), Fraction) for value in rational_signed)
     assert all(
-        isinstance(value, Fraction)
-        for value in clip(rational_signed, Fraction(0))
+        isinstance(clip(value, Fraction(0)), Fraction)
+        for value in rational_signed
     )
     clipped_field = LF[Intensity](rational_signed, (range(2),))
     assert isinstance(clipped_field.data[0], Fraction)
@@ -683,6 +683,25 @@ def test_phasor_has_only_julia_complexf64_scalar_domain() -> None:
     )
     with pytest.raises(TypeError, match="ComplexF64"):
         phasor(narrow)
+
+
+def test_phasor_preserves_multidimensional_field_positions() -> None:
+    source = np.reshape(
+        np.arange(1, 25, dtype=np.float64)
+        + 1j * np.arange(24, 0, -1, dtype=np.float64),
+        (6, 4),
+        order="F",
+    )
+    source[2, 1] = 0.0
+    amplitude = LF[ComplexAmplitude](source, (range(6), range(4)))
+
+    expected = np.ones_like(source)
+    np.divide(source, np.abs(source), out=expected, where=source != 0)
+    result = phasor(amplitude)
+
+    assert result.shape == source.shape
+    assert result.field_type is ComplexPhase
+    np.testing.assert_allclose(result.data.copy(), expected, rtol=1e-15)
 
 
 def test_unary_plus_matches_julia_supported_tags() -> None:

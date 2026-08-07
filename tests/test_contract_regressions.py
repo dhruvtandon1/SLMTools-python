@@ -11,6 +11,7 @@ import pytest
 
 import slmtools as slm
 from slmtools._bigfloat import _MPFR, _to_mpfr
+from slmtools.ift import _fftw_plan_pair
 from slmtools.lattice_utils import _step
 from slmtools.subimages import (
     arrange as subimage_arrange,
@@ -53,9 +54,12 @@ def test_concrete_array_bindings_reject_strided_non_ot_views() -> None:
         np.ones((2, 2), dtype=np.complex128)
     )
     dense_real = np.asfortranarray(np.ones((2, 2), dtype=np.float64))
-    assert slm.gsIter(dense_guess, dense_real, dense_real).shape == (2, 2)
+    ft, ift = _fftw_plan_pair(dense_guess.shape)
+    assert slm.gsIter(
+        dense_guess, dense_real, dense_real, ft, ift
+    ).shape == (2, 2)
     assert slm.pdgsIter(
-        dense_guess, (dense_guess,), (dense_real,)
+        dense_guess, (dense_guess,), (dense_real,), ft, ift
     ).shape == (2, 2)
 
     strided_guess = np.ones((2, 4), dtype=np.complex128)[:, ::2]
@@ -66,14 +70,14 @@ def test_concrete_array_bindings_reject_strided_non_ot_views() -> None:
         (dense_guess, dense_real, strided_real),
     ):
         with pytest.raises(TypeError, match="C- or Fortran-contiguous"):
-            slm.gsIter(*arguments)
+            slm.gsIter(*arguments, ft, ift)
     for guess, phases, moduli in (
         (strided_guess, (dense_guess,), (dense_real,)),
         (dense_guess, (strided_guess,), (dense_real,)),
         (dense_guess, (dense_guess,), (strided_real,)),
     ):
         with pytest.raises(TypeError, match="C- or Fortran-contiguous"):
-            slm.pdgsIter(guess, phases, moduli)
+            slm.pdgsIter(guess, phases, moduli, ft, ift)
 
     with pytest.raises(TypeError, match="C- or Fortran-contiguous"):
         slm.lfStandardOutputFormat(
@@ -313,13 +317,14 @@ def test_publication_metadata_has_tested_minimums_and_matching_version() -> None
     project = tomllib.loads((root / "pyproject.toml").read_text())
 
     assert project["project"]["version"] == slm.__version__
-    assert project["project"]["requires-python"] == ">=3.12"
+    assert project["project"]["requires-python"] == ">=3.13"
     assert project["build-system"]["requires"] == ["setuptools>=83.0.0"]
     assert project["project"]["dependencies"] == [
         "gmpy2>=2.3.1",
         "numpy>=2.5.1",
         "Pillow>=12.3.0",
         "pyFFTW>=0.15.1",
+        "scipy>=1.18.0",
     ]
     assert project["project"]["optional-dependencies"] == {
         "test": ["pytest>=9.1.1"],
@@ -338,6 +343,7 @@ def test_publication_metadata_has_tested_minimums_and_matching_version() -> None
         "numpy==2.5.1",
         "Pillow==12.3.0",
         "pyFFTW==0.15.1",
+        "scipy==1.18.0",
         "matplotlib==3.11.1",
         "pytest==9.1.1",
         "pip==26.1.2",
@@ -673,10 +679,8 @@ def test_clip_and_centroid_use_julia_strong_scalar_comparisons() -> None:
     # NumPy weak-scalar comparison instead narrows the literal and sees them
     # as equal.
     assert slm.clip(boundary, 0.1) == boundary
-    np.testing.assert_array_equal(
-        slm.clip(np.asarray([boundary], dtype=np.float32), 0.1),
-        [boundary],
-    )
+    with pytest.raises(TypeError):
+        slm.clip(np.asarray([boundary], dtype=np.float32), 0.1)
 
     field = slm.LF[slm.Intensity](
         np.asarray([boundary, 1], dtype=np.float32), (range(2),)
@@ -1106,14 +1110,14 @@ def test_dualate_default_boundary_uses_concrete_object_zero() -> None:
     assert type(captured["boundary"]) is Fraction
     assert captured["boundary"] == Fraction(0)
     assert result.dtype == np.dtype(object)
-    assert all(type(value) is Fraction for value in result.data.flat)
-    np.testing.assert_array_equal(
-        result.data,
-        np.full((2, 2), Fraction(0), dtype=object),
-    )
+    for value in result.data.copy().flat:
+        assert isinstance(value, np.ndarray)
+        assert value.shape == ()
+        assert type(value.item()) is Fraction
+        assert value.item() == Fraction(0)
 
 
-def test_dualate_wrong_shape_vectorized_result_falls_back_pointwise() -> None:
+def test_dualate_custom_factory_is_evaluated_pointwise() -> None:
     lattice = (range(2), range(2))
     source = slm.LF[slm.Generic](np.zeros((2, 2)), lattice)
 
@@ -1150,7 +1154,7 @@ def test_float32_template_coordinates_remain_float32() -> None:
         slm.Generic,
         lattice,
         np.float32(2),
-        lin=(np.float32(0),),
+        (np.float32(0),),
         center=center,
     )
     gaussian = slm.lfGaussian(
@@ -1186,16 +1190,16 @@ def test_template_scalar_promotion_and_complex_wrapping_match_julia() -> None:
     # Julia's default center and Python floats are Float64 and therefore
     # widen Float32 coordinates. Ordinary integers do not.
     default_center = slm.lfParabola(
-        slm.Generic, lattice, np.float32(2), lin=lin32
+        slm.Generic, lattice, np.float32(2), lin32
     )
     integer_linear = slm.lfParabola(
-        slm.Generic, lattice, np.float32(2), lin=(0,), center=center32
+        slm.Generic, lattice, np.float32(2), (0,), center=center32
     )
     integer_matrix = slm.lfParabola(
         slm.Generic,
         lattice,
         np.asarray([[2]], dtype=np.int64),
-        lin=lin32,
+        lin32,
         center=center32,
     )
     assert default_center.dtype == np.dtype(np.float64)
@@ -1229,7 +1233,7 @@ def test_template_scalar_promotion_and_complex_wrapping_match_julia() -> None:
         slm.ComplexPhase,
         lattice,
         np.float32(2),
-        lin=lin32,
+        lin32,
         center=center32,
     )
     assert wrapped.dtype == np.dtype(np.complex128)
@@ -1271,7 +1275,7 @@ def test_template_rational_and_bigfloat_counterparts_match_julia() -> None:
         slm.Generic,
         rational_lattice,
         Fraction(2, 5),
-        lin=(Fraction(0),),
+        (Fraction(0),),
         center=(Fraction(0),),
     )
     exact_cap = slm.lfCap(
@@ -1558,8 +1562,9 @@ def test_centroid_and_schroff_error_match_julia_dispatch_boundaries() -> None:
     np.testing.assert_allclose(slm.centroid(intensity), [0.0, 0.0])
     with pytest.raises(TypeError):
         slm.centroid(modulus)
-    with pytest.raises(TypeError):
-        slm.centroid([[0.0, 1.0], [0.0, 0.0]])
+    np.testing.assert_array_equal(
+        slm.centroid([[0.0, 1.0], [0.0, 0.0]]), [1.0, 2.0]
+    )
     with pytest.raises(TypeError):
         slm.centroid(intensity, threshold=0.1 + 0.2j)
     with pytest.raises(TypeError):

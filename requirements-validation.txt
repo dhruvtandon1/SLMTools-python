@@ -7,6 +7,7 @@ gmpy2==2.3.1
 numpy==2.5.1
 Pillow==12.3.0
 pyFFTW==0.15.1
+scipy==1.18.0
 
 # Optional plotting dependency
 matplotlib==3.11.1

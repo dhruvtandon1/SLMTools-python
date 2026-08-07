@@ -17,6 +17,16 @@ from typing import Any, Callable
 
 import numpy as np
 
+from ._bigfloat import (
+    _MPC,
+    _MPFR,
+    _MPFRComplex,
+    _MPQ,
+    _MPZ,
+    _bigfloat_context,
+    _to_mpfr,
+)
+from ._omission import _OMITTED
 from .lattice_field import (
     Amplitude,
     ComplexAmp,
@@ -41,12 +51,17 @@ from .lattice_field import (
     UnwrappedPhase,
     _axis,
     _is_real_number,
+    _is_julia_number,
     _is_julia_platform_int,
+    _julia_fill,
     _julia_literal_array,
+    _julia_typed_zero,
     _julia_assignment_values,
     _julia_array_array_operation,
     _julia_array_scalar_operation,
     _logical_axis_scalar_operation,
+    _with_axis_length_kind,
+    _object_contains_mpfr,
     _require_dense_ndarray,
     as_lattice,
     elq,
@@ -84,12 +99,23 @@ def _step(axis: Any) -> Any:
 
     if values.dtype.kind == "O":
         coordinates = values.tolist()
-        if not all(_is_real_number(value) for value in coordinates):
-            raise TypeError("Lattice axes must contain real numeric coordinates.")
-        differences = [
-            right - left
-            for left, right in zip(coordinates[:-1], coordinates[1:], strict=True)
-        ]
+        if not all(_is_julia_number(value) for value in coordinates):
+            raise TypeError("Lattice axes must contain numeric coordinates.")
+        if _object_contains_mpfr(values):
+            with _bigfloat_context():
+                differences = [
+                    right - left
+                    for left, right in zip(
+                        coordinates[:-1], coordinates[1:], strict=True
+                    )
+                ]
+        else:
+            differences = [
+                right - left
+                for left, right in zip(
+                    coordinates[:-1], coordinates[1:], strict=True
+                )
+            ]
         if hint is not None and all(difference == hint for difference in differences):
             return hint
         step = differences[0]
@@ -97,6 +123,11 @@ def _step(axis: Any) -> Any:
             raise ValueError("Lattice axes must be regularly spaced.")
         return step
 
+    if values.dtype == np.dtype(np.bool_):
+        differences = np.diff(values.astype(np.int8))
+        if not np.all(differences == 1):
+            raise ValueError("Lattice axes must be regularly spaced.")
+        return np.bool_(True)
     differences = np.diff(values)
     real_dtype = values.real.dtype
     eps = (
@@ -208,7 +239,7 @@ def _pad_axis(axis: Any, pair: tuple[int, int]) -> LatticeAxis:
         np.asarray(before, dtype=np.int64), step, np.multiply
     )[()]
     start = _julia_array_scalar_operation(
-        np.asarray(values[0]), before_offset, np.subtract
+        values[0], before_offset, np.subtract
     )[()]
     # Preserve the source expression's exact operation family:
     # ``(0:m-1) .* step(L) .+ start``.  In particular, multiplying an ordinal
@@ -217,7 +248,10 @@ def _pad_axis(axis: Any, pair: tuple[int, int]) -> LatticeAxis:
     # reference/step.
     offsets = _axis(range(length))
     scaled = _logical_axis_scalar_operation(offsets, step, np.multiply)
-    return _logical_axis_scalar_operation(scaled, start, np.add)
+    result = _logical_axis_scalar_operation(scaled, start, np.add)
+    return _with_axis_length_kind(
+        result, getattr(_axis(axis), "_length_kind", "int64")
+    )
 
 
 def _looks_like_lattice(value: Any) -> bool:
@@ -233,7 +267,7 @@ def _looks_like_lattice(value: Any) -> bool:
 def padout(
     value: Any,
     padding: int | tuple[int, ...],
-    filler: Any | None = None,
+    filler: Any = _OMITTED,
 ) -> Any:
     """Pad an axis, lattice, dense array, or lattice field.
 
@@ -255,6 +289,8 @@ def padout(
             expected_dtype=value.dtype,
         )
     if isinstance(value, (LatticeAxis, range)):
+        if filler is not _OMITTED:
+            raise TypeError("padout(axis, padding) does not accept a filler")
         if type(padding) is int or isinstance(padding, np.int64):
             pair = (int(padding), int(padding))
         else:
@@ -274,41 +310,45 @@ def padout(
             pair = values
         return _pad_axis(value, pair)
     if _looks_like_lattice(value):
+        if filler is not _OMITTED:
+            raise TypeError("padout(lattice, padding) does not accept a filler")
         lattice = as_lattice(value)
         pairs = _normalize_padding(padding, len(lattice))
         return tuple(_pad_axis(axis, pair) for axis, pair in zip(lattice, pairs))
 
-    array = _require_dense_ndarray(value, "padout array")
+    array = (
+        _julia_literal_array(value)
+        if isinstance(value, list)
+        else _require_dense_ndarray(value, "padout array")
+    )
     pairs = _normalize_padding(padding, array.ndim)
     if any(before < 0 or after < 0 for before, after in pairs):
         # Julia's AbstractRange overload supports negative coordinate cropping,
         # but its dense-array assignment indexes out of bounds.  Keep that
         # distinction instead of inventing dense-array cropping semantics.
         raise IndexError("Negative dense-array padding is out of bounds.")
-    if filler is None:
+    if filler is _OMITTED:
         if array.dtype.kind == "O" and array.size:
-            filler = type(array.flat[0])(0)
+            filler = _julia_typed_zero(array.flat[0])
         else:
             filler = np.zeros((), dtype=array.dtype)[()]
-    dtype = np.asarray(filler).dtype
     shape = tuple(
         size + before + after
         for size, (before, after) in zip(array.shape, pairs, strict=True)
     )
-    output = np.full(shape, filler, dtype=dtype)
+    output = _julia_fill(filler, shape)
+    dtype = output.dtype
+    if filler is None and any(item is not None for item in array.flat):
+        raise TypeError("cannot convert a value to nothing for assignment")
     interior = tuple(
         slice(before, before + size)
         for size, (before, _after) in zip(array.shape, pairs, strict=True)
     )
-    # Pass the initialized destination—not merely its erased NumPy object
-    # dtype—so Rational/BigFloat-like fillers keep their concrete Julia
-    # element type while interior values are converted.
-    converted = _julia_assignment_values(array, output)
+    if isinstance(filler, (tuple, list, np.ndarray)):
+        converted = _convert_pad_composite_array(array, filler)
+    else:
+        converted = _julia_assignment_values(array, output)
     if dtype == np.dtype(object) and isinstance(filler, Fraction):
-        # NumPy's object dtype does not retain Julia's concrete
-        # ``Rational{Int64}`` element type.  Convert every assigned element to
-        # the filler's represented scalar type rather than producing a
-        # heterogeneous object array.
         rational_values = np.empty(converted.shape, dtype=object)
         for index in np.ndindex(converted.shape):
             item = converted[index]
@@ -318,6 +358,60 @@ def padout(
         converted = rational_values
     output[interior] = converted
     return output
+
+
+def _convert_pad_composite_scalar(value: Any, filler: Any) -> Any:
+    """Convert one composite cell to ``typeof(filler)`` as Julia does."""
+
+    if isinstance(filler, tuple):
+        if not isinstance(value, tuple) or len(value) != len(filler):
+            raise TypeError("padout interior cannot convert to tuple filler type")
+        return tuple(
+            _convert_pad_composite_scalar(item, prototype)
+            for item, prototype in zip(value, filler, strict=True)
+        )
+
+    if isinstance(filler, (list, np.ndarray)):
+        if not isinstance(value, (list, np.ndarray)):
+            raise TypeError("padout interior cannot convert to array filler type")
+        filler_values = (
+            _julia_literal_array(filler)
+            if isinstance(filler, list)
+            else np.asarray(filler)
+        )
+        source_values = (
+            _julia_literal_array(value)
+            if isinstance(value, list)
+            else np.asarray(value)
+        )
+        if source_values.ndim != filler_values.ndim:
+            raise TypeError("padout interior array rank differs from filler type")
+        converted = _julia_assignment_values(source_values, filler_values)
+        if (
+            type(value) is type(filler)
+            and source_values.dtype == filler_values.dtype
+        ):
+            # ``convert(T, x)::T`` returns the original mutable array when it
+            # already has exactly the destination array type.
+            return value
+        if isinstance(filler, list):
+            return np.asarray(converted, dtype=filler_values.dtype).tolist()
+        return np.asarray(converted, dtype=filler_values.dtype)
+
+    if value is None or filler is None:
+        if value is filler:
+            return value
+        raise TypeError("padout interior cannot convert to Nothing")
+    prototype = _julia_fill(filler, ())
+    converted = _julia_assignment_values(np.asarray(value), prototype)
+    return np.asarray(converted, dtype=prototype.dtype).reshape(())[()]
+
+
+def _convert_pad_composite_array(array: np.ndarray, filler: Any) -> np.ndarray:
+    converted = np.empty(array.shape, dtype=object)
+    for index in np.ndindex(array.shape):
+        converted[index] = _convert_pad_composite_scalar(array[index], filler)
+    return converted
 
 
 def latticeDisplacement(lattice: Any) -> np.ndarray:
@@ -337,7 +431,29 @@ def latticeDisplacement(lattice: Any) -> np.ndarray:
             # deliberately forbids float * Decimal, so spell out that exact
             # promotion for the BigFloat counterpart only.
             multiplier = Decimal.from_float(float(multiplier))
-        centers.append(axis[0] + multiplier * step)
+        if isinstance(step, (_MPC, _MPFRComplex)):
+            with _bigfloat_context():
+                promoted_step = _MPC(
+                    _to_mpfr(step.real), _to_mpfr(step.imag)
+                )
+                promoted_multiplier = _to_mpfr(multiplier)
+                first = axis[0]
+                promoted_first = _MPC(
+                    _to_mpfr(first.real), _to_mpfr(first.imag)
+                )
+                centers.append(
+                    promoted_first + promoted_multiplier * promoted_step
+                )
+        elif isinstance(step, (_MPFR, _MPQ, _MPZ)):
+            with _bigfloat_context():
+                promoted_step = _to_mpfr(step)
+                promoted_multiplier = _to_mpfr(multiplier)
+                centers.append(
+                    _to_mpfr(axis[0])
+                    + promoted_multiplier * promoted_step
+                )
+        else:
+            centers.append(axis[0] + multiplier * step)
     return np.asarray(centers)
 
 
@@ -356,7 +472,21 @@ def toDim(vector: Any, dimension: int, total_dimensions: int) -> np.ndarray:
         raise TypeError("toDim expects a Julia array or AbstractRange value.")
     dimension = int(dimension)
     total_dimensions = int(total_dimensions)
-    values = np.asarray(vector)
+    # Base.reshape returns an AbstractRange unchanged when its requested
+    # one-dimensional shape already matches.  Besides preserving object
+    # identity, this keeps StepRangeLen's high-precision reference/step and
+    # arbitrary-precision range metadata available to one-dimensional ldot.
+    if (
+        isinstance(vector, LatticeAxis)
+        and dimension == 1
+        and total_dimensions == 1
+    ):
+        return vector
+    values = (
+        _julia_literal_array(vector)
+        if isinstance(vector, list)
+        else np.asarray(vector)
+    )
     if values.ndim != 1:
         values = values.reshape(-1, order="F")
     # The Julia source does not bounds-check d against n. If d lies outside
@@ -475,7 +605,7 @@ def Nyquist(lattice: Any) -> tuple[Any, ...]:
     for axis in as_lattice(lattice):
         with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
             doubled = _julia_array_scalar_operation(
-                np.asarray(_step(axis)), np.int64(2), np.multiply
+                _step(axis), np.int64(2), np.multiply
             ).reshape(())[()]
             output.append(
                 _julia_array_scalar_operation(

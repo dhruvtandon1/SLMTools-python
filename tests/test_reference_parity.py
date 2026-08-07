@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import subprocess
 import unittest
 
@@ -20,14 +21,45 @@ from slmtools import subimages
 
 
 _AUDITED_JULIA_COMMIT = "ea1c1c9c06b4b2dc46372ac7ee031301b604a007"
+_EXPORT_FIXTURE = Path(__file__).with_name("julia_exports.txt")
+
+
+def _fixture_exports() -> tuple[str, ...]:
+    return tuple(
+        line
+        for raw_line in _EXPORT_FIXTURE.read_text(encoding="utf-8").splitlines()
+        if (line := raw_line.strip()) and not line.startswith("#")
+    )
+
+
+def _source_exports(julia_repo: Path) -> tuple[str, ...]:
+    module_source = (
+        julia_repo / "src" / "SLMTools.jl"
+    ).read_text(encoding="utf-8")
+    include_paths = re.findall(r'^\s*include\("([^"]+)"\)', module_source, re.M)
+    exports: list[str] = []
+    for include_path in include_paths:
+        source = (
+            julia_repo / "src" / include_path
+        ).read_text(encoding="utf-8")
+        for declaration in re.findall(
+            r"^\s*export\s+([^\r\n]+)", source, re.M
+        ):
+            for name in declaration.split(","):
+                clean_name = name.strip()
+                if clean_name and clean_name not in exports:
+                    exports.append(clean_name)
+    return tuple(exports)
 
 
 class ReferenceParityTests(unittest.TestCase):
     def test_exact_julia_export_surface(self) -> None:
-        self.assertEqual(len(slm.JULIA_EXPORTS), 100)
-        self.assertEqual(len(set(slm.JULIA_EXPORTS)), 100)
-        self.assertEqual(slm.__all__, list(slm.JULIA_EXPORTS))
-        self.assertTrue(all(hasattr(slm, name) for name in slm.JULIA_EXPORTS))
+        expected = _fixture_exports()
+        self.assertEqual(len(expected), 100)
+        self.assertEqual(len(set(expected)), 100)
+        self.assertEqual(tuple(slm.JULIA_EXPORTS), expected)
+        self.assertEqual(tuple(slm.__all__), expected)
+        self.assertTrue(all(hasattr(slm, name) for name in expected))
         self.assertIs(slm.LF, slm.LatticeField)
         self.assertIs(slm.UPhase, slm.RealPhase)
         self.assertIs(slm.UnwrappedPhase, slm.RealPhase)
@@ -52,17 +84,65 @@ class ReferenceParityTests(unittest.TestCase):
         self.assertFalse(hasattr(slm, "julia_add"))
         self.assertFalse(hasattr(slm, "julia_mul"))
 
+    @unittest.skipUnless(
+        os.environ.get("SLMTOOLS_JULIA_REPO"),
+        "set SLMTOOLS_JULIA_REPO for live Julia export extraction",
+    )
+    def test_export_fixture_is_derived_from_audited_julia_source(self) -> None:
+        julia_repo = Path(os.environ["SLMTOOLS_JULIA_REPO"])
+        self.assertEqual(_source_exports(julia_repo), _fixture_exports())
+
+    def test_exported_julia_abstract_tags_are_not_instantiable(self) -> None:
+        tags = (
+            slm.FieldVal,
+            slm.Generic,
+            slm.Phase,
+            slm.RealPhase,
+            slm.ComplexPhase,
+            slm.Intensity,
+            slm.Amplitude,
+            slm.Modulus,
+            slm.ComplexAmplitude,
+        )
+        for tag in tags:
+            with self.subTest(tag=tag.__name__):
+                with self.assertRaisesRegex(TypeError, "abstract field tag"):
+                    tag()
+
+    def test_user_field_tag_subclass_is_concrete_and_instantiable(self) -> None:
+        class UserFieldTag(slm.FieldVal):
+            def __init__(self, label: str) -> None:
+                self.label = label
+
+        class UserPhaseTag(slm.Phase):
+            pass
+
+        tag = UserFieldTag("custom")
+        self.assertIsInstance(tag, slm.FieldVal)
+        self.assertEqual(tag.label, "custom")
+        self.assertIsInstance(UserPhaseTag(), slm.Phase)
+
+        field = slm.LF[UserFieldTag](
+            np.ones(2), (range(2),)
+        )
+        self.assertIs(field.field_type, UserFieldTag)
+
     def test_remaining_template_and_scalar_entry_points(self) -> None:
         lattice = slm.natlat((12, 12))
         np.random.seed(7)
         random_field = slm.lfRand(slm.Intensity, lattice)
-        text_field = slm.lfText(
-            slm.Intensity,
-            lattice,
-            "A",
-            fnt=ImageFont.load_default(),
-            pixelsize=8,
-        )
+        from unittest.mock import patch
+
+        with patch(
+            "slmtools.templates._load_font",
+            return_value=ImageFont.load_default(),
+        ):
+            text_field = slm.lfText(
+                slm.Intensity,
+                lattice,
+                "A",
+                pixelsize=8,
+            )
         generic = slm.LF(np.zeros((12, 12)), lattice)
         self.assertEqual(random_field.shape, (12, 12))
         self.assertGreater(np.max(text_field.data), 0)

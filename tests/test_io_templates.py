@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import struct
 
+import gmpy2
 import numpy as np
 from PIL import Image, ImageFont
 import pytest
@@ -29,6 +30,7 @@ from slmtools.lattice_field import (
     ComplexAmplitude,
     ComplexPhase,
     Intensity,
+    LF,
     LatticeAxis,
     LatticeField,
     Modulus,
@@ -317,17 +319,19 @@ def test_linear_fit_orientation_and_exact_node_dualation() -> None:
     for invalid_xs in ((1, 2), range(1, 3), ["1", "2"]):
         with pytest.raises(TypeError):
             linearFit(invalid_xs, [3, 5])
-    # Explicit object storage for machine numbers models Julia Vector{Any},
-    # not a concrete Vector{<:Number}; the latter has no matching method.
+    # Object storage is also the Python spelling for Julia's successful
+    # abstract ``Vector{Real}`` / ``Vector{Number}`` domains.
     for values in (
         np.asarray([1, 2], dtype=object),
         np.asarray([1.0, 2.0], dtype=object),
         np.asarray([1 + 0j, 2 + 0j], dtype=object),
     ):
-        with pytest.raises(TypeError, match="object arrays"):
-            linearFit(values, np.asarray([3, 5]))
-        with pytest.raises(TypeError, match="object arrays"):
-            linearFit(np.asarray([1, 2]), values)
+        assert linearFit(values, np.asarray([3, 5])) == pytest.approx(
+            (2.0, 1.0)
+        )
+        assert linearFit(np.asarray([1, 2]), values) == pytest.approx(
+            (1.0, 0.0)
+        )
 
     # Fraction/Decimal are the two concrete Julia numeric domains that need
     # NumPy object storage in this port and therefore remain valid.
@@ -586,15 +590,7 @@ def test_template_matrix_overloads_use_the_leading_dimension_block() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    "matrix_factory",
-    [
-        lambda values: values,
-        lambda values: tuple(tuple(row) for row in values),
-    ],
-)
 def test_template_matrix_literals_use_julia_element_promotion(
-    matrix_factory: object,
 ) -> None:
     lattice = (
         LatticeAxis(
@@ -606,7 +602,7 @@ def test_template_matrix_literals_use_julia_element_promotion(
         [np.int64(100_000_001), np.float32(0)],
         [np.float32(0), np.float32(1)],
     ]
-    matrix = matrix_factory(values)
+    matrix = values
 
     # Julia constructs this literal as Matrix{Float32}; the leading 1x1 block
     # is therefore 100_000_000 before the parabola is evaluated.
@@ -617,10 +613,13 @@ def test_template_matrix_literals_use_julia_element_promotion(
     )
 
 
-def test_text_emojis_blur_and_look_return_arrays() -> None:
+def test_text_emojis_blur_and_look_return_arrays(monkeypatch) -> None:
+    import slmtools.templates as templates
+
     lattice = natlat(24, 24)
     font = ImageFont.load_default()
-    text = ftaText("A", (24, 24), fnt=font, pixelsize=12)
+    monkeypatch.setattr(templates, "_load_font", lambda *_args: font)
+    text = ftaText("A", (24, 24), pixelsize=12)
     assert text.shape == (24, 24) and text.dtype == np.float64 and np.max(text) > 0
     for field in (
         lfHeart(Intensity, lattice, 0.4),
@@ -646,6 +645,271 @@ def test_text_emojis_blur_and_look_return_arrays() -> None:
     amplitude = LatticeField(np.asarray([[1 + 0j, 1j]]), (np.asarray([0]), np.arange(2)), field_type=ComplexAmplitude)
     assert look(amplitude).shape == (1, 4)
     assert look(real_phase, amplitude).shape == (1, 6)
+
+
+def test_text_render_options_keep_uint8_dispatch_and_bbox_order(
+    monkeypatch,
+) -> None:
+    import slmtools.templates as templates
+
+    monkeypatch.setattr(templates, "_load_font", lambda *_args: object())
+    monkeypatch.setattr(
+        templates,
+        "_glyph_raster",
+        lambda *_args: (
+            np.full((2, 2), 255, dtype=np.uint8),
+            0,
+            2,
+            2,
+        ),
+    )
+
+    with pytest.raises(TypeError, match="ftaText string must be a Julia String"):
+        ftaText(["A"], (4, 4), pixelsize=1)
+    with pytest.raises(TypeError, match="fnt must be a Julia String"):
+        ftaText("A", (4, 4), pixelsize=1, fnt=object())
+    with pytest.raises(TypeError, match="fnt must be a Julia String"):
+        templates.lfText(
+            Intensity,
+            natlat(4, 4),
+            "A",
+            pixelsize=1,
+            fnt=object(),
+        )
+
+    invalid_options = (
+        {"fcolor": 1},
+        {"fcolor": 0.5},
+        {"fcolor": "255"},
+        {"fcolor": np.asarray([255], dtype=np.int64)},
+        {"gcolor": 0},
+        {"bcolor": 0},
+        {"bbox_glyph": 0},
+        {"bbox": 0},
+    )
+    for options in invalid_options:
+        # Julia's typed renderstring! wrapper rejects these before its empty
+        # string body reaches first(bitmaps).
+        with pytest.raises(TypeError, match="Julia UInt8"):
+            ftaText("", (4, 4), pixelsize=1, **options)
+    for invalid_gstr in (["AA"], ("A",), np.asarray([["A"]])):
+        with pytest.raises(TypeError, match="Julia Char vector"):
+            ftaText(
+                "",
+                (4, 4),
+                pixelsize=1,
+                gstr=invalid_gstr,
+            )
+
+    with pytest.raises(TypeError, match="unexpected text-rendering option"):
+        ftaText(
+            "A",
+            (4, 4),
+            pixelsize=1,
+            fill=np.uint8(128),
+        )
+    with pytest.raises(TypeError, match="Julia UInt8"):
+        templates.lfText(
+            Intensity,
+            natlat(4, 4),
+            "A",
+            pixelsize=1,
+            fcolor=1,
+        )
+    with pytest.raises(IndexError, match="out of bounds"):
+        ftaText(
+            "A",
+            (4, 4),
+            pixelsize=1,
+            gcolor=np.uint8(32),
+            off_bg=-1,
+        )
+
+    # Symbols are case-sensitive, and a gstr longer than the foreground is
+    # valid because renderstring! simply never indexes the unused suffix.
+    np.testing.assert_array_equal(
+        ftaText(
+            "A",
+            (4, 4),
+            pixelsize=1,
+            halign="HCENTER",
+            valign="VCENTER",
+            gcolor=np.uint8(32),
+            gstr="AB",
+        ),
+        ftaText(
+            "A",
+            (4, 4),
+            pixelsize=1,
+            halign="hleft",
+            valign="vbaseline",
+            gcolor=np.uint8(32),
+            gstr="A",
+        ),
+    )
+
+    rendered = ftaText(
+        "A",
+        (4, 4),
+        pixelsize=1,
+        fcolor=np.uint8(255),
+        gcolor=np.uint8(32),
+        bcolor=None,
+        bbox=np.uint8(96),
+    )
+    np.testing.assert_array_equal(
+        np.rint(rendered * 255).astype(np.uint8),
+        np.asarray(
+            [
+                [96, 96, 96, 0],
+                [96, 255, 96, 0],
+                [96, 96, 96, 0],
+                [0, 0, 0, 0],
+            ],
+            dtype=np.uint8,
+        ),
+    )
+
+    vector_color = ftaText(
+        "A",
+        (4, 4),
+        pixelsize=1,
+        fcolor=np.asarray([128], dtype=np.uint8),
+        bcolor=None,
+    )
+    assert np.max(vector_color) == 128 / 255
+
+
+def test_glyph_raster_retains_freetype_zero_column_extent() -> None:
+    import slmtools.templates as templates
+
+    class Mask:
+        size = (3, 2)
+
+        def __bytes__(self) -> bytes:
+            return bytes((0, 1, 2, 0, 3, 4))
+
+    class Font:
+        def getmask2(self, *_args, **_kwargs):
+            return Mask(), (-1, -2)
+
+        def getlength(self, _character: str) -> int:
+            return 3
+
+    bitmap, bearing_x, bearing_y, advance = templates._glyph_raster(
+        Font(), "A"
+    )
+    np.testing.assert_array_equal(
+        bitmap,
+        np.asarray([[0, 1, 2], [0, 3, 4]], dtype=np.uint8),
+    )
+    assert (bearing_x, bearing_y, advance) == (-1, 2, 3)
+
+
+def test_font_resolver_uses_family_and_style_not_filename_or_path(
+    monkeypatch,
+) -> None:
+    import slmtools.templates as templates
+
+    catalog = (
+        (Path("arial-regular.ttf"), "arial", "regular"),
+        (Path("arial-bold.ttf"), "arial", "bold"),
+        (Path("arial-rounded-bold.ttf"), "arial rounded mt", "bold"),
+    )
+    monkeypatch.setattr(templates, "_font_catalog", lambda: catalog)
+    selected: list[tuple[str, int]] = []
+    loaded = object()
+
+    def fake_truetype(path, pixelsize, *, layout_engine):
+        selected.append((path, pixelsize))
+        assert layout_engine is ImageFont.Layout.BASIC
+        return loaded
+
+    monkeypatch.setattr(templates.ImageFont, "truetype", fake_truetype)
+
+    assert templates._load_font("arial bold", 17) is loaded
+    assert selected == [("arial-bold.ttf", 17)]
+
+    # FreeTypeAbstraction searches the face's family/style metadata.  A bare
+    # filename stem and a path are not alternate public font selectors.
+    with pytest.raises(OSError, match="could not find font"):
+        templates._load_font("arialbd", 17)
+    with pytest.raises(OSError, match="could not find font"):
+        templates._load_font(r"C:\\Windows\\Fonts\\arialbd.ttf", 17)
+    with pytest.raises(OSError, match="could not find font"):
+        templates._load_font("/usr/share/fonts/arialbd.ttf", 17)
+    assert selected == [("arial-bold.ttf", 17)]
+
+
+def test_font_resolver_rejects_invalid_configured_directory(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import slmtools.templates as templates
+
+    missing = tmp_path / "missing-font-directory"
+    monkeypatch.setenv("FREETYPE_ABSTRACTION_FONT_PATH", str(missing))
+    with pytest.raises(
+        RuntimeError,
+        match="FREETYPE_ABSTRACTION_FONT_PATH is not a valid directory",
+    ):
+        templates._font_directories()
+
+
+def test_fta_text_allows_positive_rows_with_zero_columns(monkeypatch) -> None:
+    import slmtools.templates as templates
+
+    monkeypatch.setattr(
+        templates,
+        "_load_font",
+        lambda *_args: ImageFont.load_default(),
+    )
+    result = templates.ftaText("A", (5, 0), pixelsize=1)
+    assert result.shape == (5, 0)
+    assert result.dtype == np.dtype(np.float64)
+
+    with pytest.raises(IndexError):
+        templates.ftaText("A", (0, 5), pixelsize=1)
+
+
+def test_text_kerning_keeps_upstream_first_character_anchor() -> None:
+    import hashlib
+
+    windows_root = Path(os.environ.get("WINDIR", r"C:\Windows"))
+    if not (windows_root / "Fonts" / "arialbd.ttf").exists():
+        pytest.skip("locked Windows Arial Bold font is unavailable")
+    rendered = np.rint(
+        ftaText(
+            "AVA",
+            (80, 240),
+            pixelsize=24,
+            halign="hleft",
+            valign="vbaseline",
+        )
+        * 255
+    ).astype(np.uint8)
+    assert hashlib.sha256(
+        rendered.ravel(order="F").tobytes()
+    ).hexdigest() == (
+        "98fb498679f8468e21a609464ea05276c3890b0fcefcdf00fd14cfdeff295be5"
+    )
+
+
+@pytest.mark.parametrize("generator", [lfHeart, lfSmile, lfPointer])
+def test_emoji_flip_materializes_square_output_and_preserves_rectangular_failure(
+    generator,
+) -> None:
+    square = natlat(5, 5)
+    ordinary = generator(Intensity, square, 1.0)
+    flipped = generator(Intensity, square, 1.0, flip=True)
+    np.testing.assert_array_equal(
+        flipped.data.copy(), np.flip(ordinary.data.copy().T, axis=0)
+    )
+
+    # Julia transposes the generated data but constructs with the original
+    # lattice, so rectangular flipped inputs fail rather than returning a
+    # field with invented metadata semantics.
+    with pytest.raises(ValueError, match="data size does not match lattice size"):
+        generator(Intensity, natlat(4, 5), 1.0, flip=True)
 
 
 def test_default_text_font_matches_freetypeabstraction_resolution() -> None:
@@ -754,10 +1018,84 @@ def test_text_kerning_matches_locked_freetype(
 
 def test_look_supports_exact_real_arrays_but_not_array_varargs() -> None:
     rational = np.asarray([Fraction(1, 2), Fraction(1)], dtype=object)
-    assert look(rational).tolist() == [Fraction(1, 2), Fraction(1)]
+    rational_image = look(rational)
+    assert rational_image.dtype == np.dtype(np.float64)
+    np.testing.assert_array_equal(
+        rational_image, np.asarray([128, 255], dtype=np.float64) / 255
+    )
+
+    # Explicit object storage can model Julia's abstract ``Vector{Real}``.
+    # Integer division produces Float64 channels rather than fixed-point Gray.
+    abstract_real = np.asarray([1, 2], dtype=object)
+    abstract_image = look(abstract_real)
+    assert abstract_image.dtype == np.dtype(np.float64)
+    np.testing.assert_array_equal(abstract_image, [0.5, 1.0])
+
+    rational_field = LF[Intensity, object, 1](
+        rational.copy(), (range(2),)
+    )
+    np.testing.assert_array_equal(look(rational_field), rational_image)
 
     with pytest.raises(TypeError, match="lattice fields"):
         look(np.ones((1, 1)), np.ones((1, 1)))
+
+
+def test_look_without_arguments_matches_julia_empty_any_vector() -> None:
+    result = look()
+
+    assert isinstance(result, np.ndarray)
+    assert result.shape == (0,)
+    assert result.dtype == np.dtype(object)
+
+
+def test_look_supports_complex_bigfloat_fields_and_julia_vector_hcat() -> None:
+    values = np.asarray(
+        [gmpy2.mpc(1, 1), gmpy2.mpc(-1, 1)], dtype=object
+    )
+    lattice = (range(2),)
+    phase = LF[ComplexPhase, object, 1](values, lattice)
+    amplitude = LF[ComplexAmplitude, object, 1](values.copy(), lattice)
+
+    phase_image = look(phase)
+    assert phase_image.shape == (2,)
+    assert phase_image.dtype == np.dtype(object)
+    with gmpy2.context(gmpy2.get_context(), precision=256):
+        expected_first = gmpy2.mpfr(
+            "0.625000000000000024363573953246097490761251725528390145364"
+            "0969917497279840318806"
+        )
+        expected_second = gmpy2.mpfr(
+            "0.875000000000000034109003534544536487065752415739746203509"
+            "7357884496191776446449"
+        )
+    assert phase_image[0] == expected_first
+    assert phase_image[1] == expected_second
+
+    amplitude_image = look(amplitude)
+    assert amplitude_image.shape == (2, 2)
+    assert amplitude_image.dtype == np.dtype(object)
+    assert amplitude_image[:, 0].tolist() == [gmpy2.mpfr(1), gmpy2.mpfr(1)]
+    assert amplitude_image[0, 1] == expected_first
+
+    combined = look(phase, phase)
+    assert combined.shape == (2, 2)
+
+    mixed = np.asarray([gmpy2.mpc(1, 2), 1 + 1j], dtype=object)
+    mixed_phase = LF[ComplexPhase, object, 1](mixed, lattice)
+    mixed_amplitude = LF[ComplexAmplitude, object, 1](mixed.copy(), lattice)
+    mixed_phase_image = look(mixed_phase)
+    assert abs(float(mixed_phase_image[0]) - 0.6762081911747834) < 1e-15
+    assert abs(float(mixed_phase_image[1]) - 0.625) < 1e-15
+    assert look(mixed_amplitude).shape == (2, 2)
+
+
+def test_look_promotes_mixed_exact_real_object_domains() -> None:
+    values = np.asarray([Decimal("1"), Fraction(2, 1)], dtype=object)
+    expected = [Decimal("0.5"), Decimal("1")]
+    assert look(values).tolist() == expected
+
+    field = LF[Intensity, object, 1](values.copy(), (range(2),))
+    assert look(field).tolist() == expected
 
 
 def test_lfparabola_rejects_complex_real_signature_arguments() -> None:

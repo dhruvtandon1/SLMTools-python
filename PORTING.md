@@ -13,6 +13,7 @@ exceptions.
 - Audited Julia environment: Julia `1.11.6` with the upstream
   `Project.toml` and `Manifest.toml`
 - Python package version: `0.3.0`
+- Supported Python runtime: CPython `3.13` or newer
 
 The commit above is the behavioral source of truth. A future upstream sync
 updates the commit, implementation, tests, and package version together.
@@ -23,7 +24,9 @@ used for the release audit without acting as a cross-platform dependency lock.
 
 The package root exposes the same 100 unique names exported by the audited
 Julia module. The ordered list is `slmtools.JULIA_EXPORTS` in
-`src/slmtools/__init__.py` and is checked by the test suite.
+`src/slmtools/__init__.py`. Tests compare it with a separately stored fixture
+and, when the audited checkout is available, independently parse the Julia
+`include`/`export` declarations and verify that fixture.
 
 `src/SubImages.jl` exists in the upstream repository but is not included by
 `SLMTools.jl`. Its translation therefore remains the optional
@@ -52,7 +55,14 @@ Julia module. The ordered list is `slmtools.JULIA_EXPORTS` in
 1. Preserve public function names and aliases, including Julia camel case.
 2. Preserve field tags, lattice values, `flambda`, shapes, dtypes, mutation
    behavior, numerical operation order, and FFT/phase conventions.
-3. Translate Julia's one-based user indices to zero-based Python indices.
+3. Translate positional array, field, and plain-sequence indices from Julia's
+   one-based convention to Python's zero-based convention. Dimension-number
+   arguments retain their source convention when that number is part of the
+   public calculation: `collapse(..., i)` and `toDim(..., d, n)` remain
+   Julia-style one-based, including their upstream out-of-range behavior.
+   OT plain-sequence `originIdx`/`idx` positions are zero-based, while
+   `sumDim`, `fixDims`, and `dimOrder` are one-based; OT dimension selectors
+   additionally accept zero as an explicit Python alias for the first axis.
    Preserve Julia's column-major enumeration with Fortran-order reshape and
    flatten operations.
 4. Keep field `+` and `*` eager, binary, non-mutating, and value-semantic.
@@ -64,26 +74,37 @@ Julia module. The ordered list is `slmtools.JULIA_EXPORTS` in
    arrays locally with Julia-compatible dtype and order, and construct one
    field afterward.
 5. Map Julia arrays and ranges to NumPy arrays plus retained range metadata.
-   Map Julia's FFTW, image, font, interpolation, and optimal-transport
-   operations to the declared Python dependencies.
+   Map Julia's FFTW, linear algebra, image, font, interpolation, and
+   optimal-transport operations to the declared Python dependencies.
 6. Represent a Julia failure with the corresponding Python error type. A
    source path that does not execute successfully at the audited commit is
    outside the source's defined functionality and receives no new semantics
    in the translation.
 7. Keep Python binding mechanics small and local while preserving each
    translated algorithm's observable result.
-8. An empty `coarsen` result never evaluates its reducer. The default and
+8. Treat Python `None` as Julia `nothing`, not as a universal spelling of
+   "argument omitted." Where Julia overload selection or a non-`nothing`
+   default distinguishes those cases, public functions use a private sentinel
+   so omission selects the source default while explicit `None` follows the
+   source's explicit-`nothing` result or failure. A merged Python dispatcher
+   also rejects a supplied keyword when the selected Julia overload does not
+   declare it; positional Julia parameters are not silently added as
+   keyword-only API extensions.
+9. An empty `coarsen` result never evaluates its reducer. The default and
    supported NumPy reductions (`sum`, `mean`, `min`/`amin`, and `max`/`amax`)
    derive their result dtype from the input dtype.
    Python cannot recover Julia's compiler-inferred return type for an arbitrary
    callable without executing or inspecting user code, so an empty result with
-   a custom reducer uses object storage without calling the reducer.
-9. No successful source behavior is intentionally changed in this release.
-   The Python binding mechanics documented here—checked detached raw array
-   snapshots, eager range storage, and the unknowable dtype of an empty
-   arbitrary-reducer result—do not create new numerical functionality. Any
-   future algorithmic divergence is a deliberate versioned change with a
-   focused test and an update to this contract.
+   a custom reducer uses object storage without calling the reducer. Explicit
+   `reducer=None` on an empty result likewise uses object storage as NumPy's
+   representable counterpart of Julia's empty `Array{Union{}}`.
+10. Successful source behavior is preserved except for the explicit
+   uninitialized-resampling safety boundary below. The Python binding
+   mechanics documented here—checked detached raw array snapshots, eager
+   range storage, and the unknowable dtype of an empty arbitrary-reducer
+   result—do not create new numerical functionality. Any other algorithmic
+   divergence is a deliberate versioned change with a focused test and an
+   update to this contract.
 
 Function docstrings and tests carry detailed input contracts and regression
 examples; they are preferable to a duplicate hand-maintained API catalog.
@@ -95,16 +116,42 @@ port records and preserves their lack of functionality rather than inventing
 an algorithmic repair:
 
 - default-phase `gs`/`gsLog` for `Intensity`, positive-iteration Float32
-  `gs`, and several concrete phase/helper dispatch combinations;
+  `gs`, arbitrary-precision `gs`/`gsLog` phasors, and exact-number PDGS work
+  tuples that cannot satisfy the source's `Float64`/`ComplexF64` assertions;
 - `hermiteBasis` and, transitively, `FrFTBasis`;
 - rectangular `otPhase2`, its ignored wavelength behavior, singleton
   `scalarPotentialN` without an explicit anchor, and dense-OT target axes of
   length two;
+- `dualToGradients` with arbitrary-precision FFT inputs, `dualPhase` on a
+  BigInt range, and Float64 `StepRangeLen` multiplication by an
+  arbitrary-precision coefficient (including the affected `ldot` and
+  centered `lfParabola` paths);
+- every `LatticeField` constructor whose lattice range reports a non-platform
+  length type, including endpoint-built BigInt, Rational{BigInt}, UInt64, and
+  Int128 ranges: the source compares `size(data)` and `length.(L)` with
+  type-sensitive `!==`, so matching numeric lengths still fail;
+- default maximum normalization of complex OT cost matrices, complex
+  `minimum`/`maximum` coarsening reducers, and visualization/template paths
+  that try to order complex values;
 - recognized `saveBeam` outputs, matched directory loading without the
   source's required trailing separator, and unsupported
   `pdotBeamEstimate(..., LFine=...)` range families;
 - positive-iteration convolutional Sinkhorn with a non-Float64 target;
-- the optional `SubImages.padmultiple(..., padall=...)` source bug.
+- `lfHeart`, `lfSmile`, and `lfPointer` with `flip=true` on a rectangular
+  lattice, because the generated data is transposed and paired with the
+  original lattice;
+- text rendering when the selected FreeType strike is monochrome, including
+  Windows Calibri at 12 and 16 pixels, because FreeTypeAbstraction asserts
+  that every glyph bitmap is grayscale;
+- the upstream `Pkg.test()` entry point, whose test sources still import the
+  removed `SLMTools.LatticeTools` submodule.
+
+Pillow normalizes monochrome strikes to grayscale before exposing their pixel
+data, so the Python backend cannot identify that upstream failure without
+also rejecting valid grayscale glyphs that happen to contain only binary
+values. Such host-font calls may therefore render in Python and remain a
+documented backend limitation; the port does not special-case font names or
+pixel sizes.
 
 Where literal translation would hang, depend on uninitialized memory, or
 attempt an unbounded allocation, Python raises a focused corresponding error.
@@ -112,6 +159,37 @@ It still does not return a fabricated successful result. Each boundary has a
 regression test and an explanatory implementation docstring; future fixes
 belong in the Julia authority first and are ported only after the audited
 commit is advanced.
+
+### Intentional safety deviation
+
+Some successful array and field `downsample`/`upsample` calls route
+non-integral target lattices through `Interpolations.jl` and return zeros,
+subnormals, or other uninitialized-looking values in the audited Julia
+environment. Python intentionally raises a focused error for those nonempty
+built-in paths instead of exposing nondeterministic memory-derived output.
+This is a successful-call behavior change, not an inherited Julia exception.
+Supported integer target ranges, empty targets, axis/lattice overloads, block
+`coarsen`, and custom indexable interpolation factories retain Julia behavior.
+
+### Successful upstream bugs retained
+
+The optional `SubImages.padmultiple(..., padall=...)` call completes in Julia
+but accidentally reapplies the four directional padding widths and ignores
+the magnitude of a positive `padall`. Python preserves that result: positive
+`padall` doubles positive directional pads and has no effect when they are
+zero.
+
+### Python representation boundary
+
+Julia's parametric runtime alias `Lattice{N}` is represented by the Python
+typing alias `tuple[LatticeAxis, ...]`; ordinary values remain tuples of
+regular axes. Python has no direct runtime equivalent of Julia's
+dimension-parameterized tuple alias. Exported field-tag classes, like their
+Julia abstract-type counterparts, cannot be instantiated. A user-defined
+`FieldVal` subclass is concrete and instantiable by default, paralleling a
+user-declared Julia `struct <: FieldVal`.
+Julia's non-exported `AbstractFFTs.ScaledPlan` wrapper is represented by
+`slmtools.ift.ScaledFFTWPlan`; it remains outside the package-root export list.
 
 ### Lattice-field storage
 
@@ -185,6 +263,15 @@ validation gate; Linux CI skips those cases when that system font is not
 available. Linux CI likewise cannot certify the audited macOS-arm64 FFTW
 planner/codelet behavior; that numerical gate must run separately on the
 audited architecture with the matching SIMD-enabled FFTW backend.
+Cancellation-heavy IFT cases can assign different phases to bins whose exact
+value is zero when FFT backends leave different last-bit residuals there;
+nondegenerate bins are compared with dtype-appropriate numerical tolerances.
+Julia and NumPy use different random-number engines and array-filling
+conventions. Reusing the same integer seed across languages therefore does not
+promise identical samples from `lfRand` or from the randomized `gs`/`gsLog`
+overloads. Cross-language numerical comparisons supply an explicit initial
+phase; seeded stochastic tests assert the Python behavior without treating a
+Julia seed as a portable random stream.
 
 Artifact construction is a separate CI/release gate, not a claim made by the
 unit-test suite. Before release, build and validate both package artifacts:

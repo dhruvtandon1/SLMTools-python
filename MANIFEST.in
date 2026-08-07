@@ -1,3 +1,4 @@
 include requirements-validation.txt
 include PORTING.md
+include tests/julia_exports.txt
 recursive-include examples *.py

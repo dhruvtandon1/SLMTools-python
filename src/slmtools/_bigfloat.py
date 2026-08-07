@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 from fractions import Fraction
+import operator
 from typing import Any
 
 import gmpy2
@@ -24,6 +25,7 @@ JULIA_BIGFLOAT_PRECISION = 256
 _MPFR = gmpy2.mpfr
 _MPC = gmpy2.mpc
 _MPQ = gmpy2.mpq
+_MPZ = gmpy2.mpz
 
 # gmpy2's exponent limits are already much wider than Decimal's and cover the
 # locked Julia probes.  Copy them into the dedicated context rather than
@@ -83,6 +85,8 @@ def _to_mpfr(value: Any) -> gmpy2.mpfr:
             return _MPFR(str(value))
         if isinstance(value, Fraction):
             return _MPFR(_MPQ(value.numerator, value.denominator))
+        if isinstance(value, (_MPQ, _MPZ)):
+            return _MPFR(value)
         if isinstance(value, (bool, int, np.integer)):
             return _MPFR(int(value))
         if isinstance(value, (float, np.floating)):
@@ -117,6 +121,14 @@ def _mpfr_sqrt(value: Any) -> gmpy2.mpfr:
         return _MPFR(gmpy2.sqrt(_to_mpfr(value)))
 
 
+def _mpfr_rtol() -> gmpy2.mpfr:
+    """Return Julia's default ``isapprox`` tolerance for ``BigFloat``."""
+
+    with _bigfloat_context():
+        epsilon = gmpy2.exp2(1 - JULIA_BIGFLOAT_PRECISION)
+        return _MPFR(gmpy2.sqrt(epsilon))
+
+
 def _mpfr_abs(value: Any) -> gmpy2.mpfr:
     with _bigfloat_context():
         return _MPFR(abs(_to_mpfr(value)))
@@ -127,8 +139,112 @@ def _mpfr_object_operation(
 ) -> np.ndarray:
     """Apply an object-array ufunc inside the 256-bit MPFR context."""
 
+    raw_left = np.asarray(left, dtype=object)
+    raw_right = np.asarray(right, dtype=object)
+    items = (*raw_left.flat, *raw_right.flat)
+    has_mpc = any(isinstance(value, _MPC) for value in items)
+    has_wrapped_complex = any(
+        isinstance(value, _MPFRComplex) for value in items
+    )
+    has_machine_complex = any(
+        isinstance(value, (complex, np.complexfloating)) for value in items
+    )
+    has_mpfr = any(
+        isinstance(value, (_MPFR, Decimal)) for value in items
+    )
+    has_machine_float = any(
+        isinstance(value, (float, np.floating)) for value in items
+    )
+    has_rational = any(
+        isinstance(value, (_MPQ, Fraction)) for value in items
+    )
+
+    def convert(value: Any) -> Any:
+        if isinstance(value, np.generic):
+            value = value.item()
+        if has_mpc or has_machine_complex:
+            if isinstance(value, _MPC):
+                return _MPC(value)
+            if isinstance(value, _MPFRComplex):
+                return _MPC(value.real, value.imag)
+            if isinstance(value, (complex, np.complexfloating)):
+                return _MPC(_to_mpfr(value.real), _to_mpfr(value.imag))
+            # Keep real operands real. Julia distinguishes Complex/Real
+            # division from Complex/Complex division at zero: the former
+            # yields component-wise infinities while the latter is NaN.
+            return _to_mpfr(value)
+        if has_wrapped_complex:
+            return (
+                value
+                if isinstance(value, _MPFRComplex)
+                else _to_mpfr(value)
+            )
+        if has_mpfr or has_machine_float:
+            return _to_mpfr(value)
+        if has_rational:
+            if isinstance(value, _MPQ):
+                return value
+            if isinstance(value, Fraction):
+                return _MPQ(value.numerator, value.denominator)
+            return _MPQ(value)
+        return value if isinstance(value, _MPZ) else _MPZ(value)
+
+    if operation is np.matmul:
+        converted_left = np.empty(raw_left.shape, dtype=object)
+        converted_right = np.empty(raw_right.shape, dtype=object)
+        with _bigfloat_context():
+            for index in np.ndindex(raw_left.shape):
+                converted_left[index] = convert(raw_left[index])
+            for index in np.ndindex(raw_right.shape):
+                converted_right[index] = convert(raw_right[index])
+            result = np.matmul(converted_left, converted_right)
+        if isinstance(result, np.ndarray):
+            return np.asarray(result, dtype=object)
+        output = np.empty((), dtype=object)
+        output[()] = result
+        return output
+
+    left_array, right_array = np.broadcast_arrays(raw_left, raw_right)
+
+    scalar_operations = {
+        np.add: operator.add,
+        np.subtract: operator.sub,
+        np.multiply: operator.mul,
+        np.divide: operator.truediv,
+        np.true_divide: operator.truediv,
+        np.remainder: operator.mod,
+        np.power: operator.pow,
+        np.greater: operator.gt,
+        np.greater_equal: operator.ge,
+        np.less: operator.lt,
+        np.less_equal: operator.le,
+        np.equal: operator.eq,
+        np.not_equal: operator.ne,
+    }
+    scalar_operation = scalar_operations.get(operation)
+    if scalar_operation is None:
+        raise TypeError(
+            f"unsupported Julia BigFloat object operation {operation.__name__}"
+        )
+    comparison = operation in {
+        np.greater,
+        np.greater_equal,
+        np.less,
+        np.less_equal,
+        np.equal,
+        np.not_equal,
+    }
+    output = np.empty(
+        left_array.shape,
+        dtype=np.bool_ if comparison else object,
+    )
     with _bigfloat_context():
-        return np.asarray(operation(left, right))
+        for index in np.ndindex(left_array.shape):
+            output[index] = scalar_operation(
+                convert(left_array[index]),
+                convert(right_array[index]),
+            )
+    return output
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +267,8 @@ class _MPFRComplex:
             (
                 Decimal,
                 _MPFR,
+                _MPQ,
+                _MPZ,
                 Fraction,
                 bool,
                 int,

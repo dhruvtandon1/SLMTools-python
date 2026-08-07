@@ -17,6 +17,16 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from ._bigfloat import (
+    _MPC,
+    _MPFR,
+    _MPFRComplex,
+    _MPQ,
+    _MPZ,
+    _bigfloat_context,
+    _mpfr_sqrt,
+    _to_mpfr,
+)
 from .lattice_field import (
     Intensity,
     LatticeField,
@@ -27,12 +37,18 @@ from .lattice_field import (
     _fraction_int64_multiply,
     _fraction_int64_negate,
     _is_real_number,
+    _is_julia_number,
     _julia_sum,
+    _julia_typed_zero,
     _julia_assignment_values,
+    _julia_asarray,
     _julia_array_array_operation,
     _julia_array_scalar_operation,
+    _julia_literal_array,
     _julia_promote_numeric_dtypes,
     _julia_scalar_dtype,
+    _object_contains_mpfr,
+    _require_julia_numeric_array,
     _require_dense_ndarray,
 )
 
@@ -136,40 +152,65 @@ def _enable_decimal_nonfinite(context: Any) -> None:
 
 
 def ramp(x: Any) -> Any:
-    """Return zero for a negative number and the number otherwise.
+    """Return zero for a negative scalar number and the number otherwise."""
 
-    Array inputs are accepted as a NumPy convenience and follow the same
-    element-wise rule as Julia broadcasting ``ramp.(x)``.
-    """
-
-    if np.ndim(x) != 0:
-        arr = np.asarray(x)
-        if arr.dtype.kind == "c" or (
-            arr.dtype.kind == "O"
-            and not all(_is_real_number(value) for value in arr.flat)
-        ):
-            raise TypeError("ramp values must support real ordering")
-        if arr.dtype.kind == "O":
-            output = np.array(arr, dtype=object, copy=True)
-            for index in np.ndindex(output.shape):
-                value = output[index]
-                if isinstance(value, Decimal) and value.is_nan():
-                    continue
-                if value < 0:
-                    output[index] = type(value)(0)
-            return output
-        return np.where(arr < 0, np.zeros((), dtype=arr.dtype), arr)
     if not _is_real_number(x):
-        raise TypeError("ramp value must support real ordering")
+        raise TypeError("ramp requires a scalar Julia Number with real ordering")
     if isinstance(x, Decimal) and x.is_nan():
         return x
-    return type(x)(0) if x < 0 else x
+    return _julia_typed_zero(x) if x < 0 else x
 
 
-def nabs(v: Any) -> np.ndarray:
+def nabs(v: Any) -> Any:
     """Absolute value of *v*, normalized by its Euclidean norm."""
 
-    arr = np.asarray(v)
+    tuple_input = isinstance(v, tuple)
+    scalar_input = not isinstance(v, (list, tuple, np.ndarray))
+    arr = (
+        _julia_literal_array(v)
+        if isinstance(v, (list, tuple))
+        else _julia_asarray(v)
+    )
+
+    def finish(result: Any) -> Any:
+        result_array = np.asarray(result)
+        if tuple_input:
+            return tuple(result_array.flat)
+        if scalar_input and result_array.ndim == 0:
+            return result_array.reshape(())[()]
+        return result_array
+
+    if _object_contains_mpfr(arr):
+        with _bigfloat_context():
+            magnitude = np.empty(arr.shape, dtype=object)
+            squared = np.empty(arr.shape, dtype=object)
+            for index in np.ndindex(arr.shape):
+                magnitude[index] = abs(arr[index])
+                squared[index] = magnitude[index] * magnitude[index]
+            norm = _mpfr_sqrt(_julia_sum(squared))
+            return finish(
+                _julia_array_scalar_operation(
+                    magnitude, norm, np.divide
+                )
+            )
+    if arr.dtype.kind == "O" and arr.size and all(
+        isinstance(value, (_MPQ, _MPZ))
+        or (type(value) is int and not -(1 << 63) <= value < (1 << 63))
+        for value in arr.flat
+    ):
+        with _bigfloat_context():
+            magnitude = np.empty(arr.shape, dtype=object)
+            squared = np.empty(arr.shape, dtype=object)
+            for index in np.ndindex(arr.shape):
+                magnitude[index] = abs(arr[index])
+                squared[index] = magnitude[index] * magnitude[index]
+            norm = _mpfr_sqrt(_julia_sum(squared))
+            return finish(
+                np.asarray(
+                    [_to_mpfr(value) / norm for value in magnitude.flat],
+                    dtype=object,
+                ).reshape(arr.shape)
+            )
     if arr.dtype.kind == "O" and any(
         isinstance(value, Decimal) for value in arr.flat
     ):
@@ -185,7 +226,7 @@ def nabs(v: Any) -> np.ndarray:
             output = np.empty(arr.shape, dtype=object)
             for index in np.ndindex(arr.shape):
                 output[index] = magnitude[index] / norm
-            return output
+            return finish(output)
 
     if _homogeneous_fraction_array(arr):
         magnitude = np.empty(arr.shape, dtype=object)
@@ -199,31 +240,52 @@ def nabs(v: Any) -> np.ndarray:
             squared.ravel(order="F")
         )
         norm = math.sqrt(squared_norm)
-        return np.asarray(
-            [float(value) / norm for value in magnitude.flat],
-            dtype=np.float64,
-        ).reshape(magnitude.shape)
+        return finish(
+            np.asarray(
+                [float(value) / norm for value in magnitude.flat],
+                dtype=np.float64,
+            ).reshape(magnitude.shape)
+        )
 
     magnitude = np.abs(arr)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        return magnitude / np.sqrt(_julia_sum(magnitude**2))
+    with np.errstate(
+        divide="ignore",
+        invalid="ignore",
+        over="ignore",
+        under="ignore",
+    ):
+        return finish(magnitude / np.sqrt(_julia_sum(magnitude**2)))
 
 
 def safeInverse(x: Number) -> Number:
     """Return ``1 / x``, or a zero of the input type when ``x == 0``."""
 
+    if not _is_julia_number(x):
+        raise TypeError("safeInverse requires a scalar Julia Number")
     if x == 0:
-        try:
-            return type(x)(0)
-        except TypeError:
-            return 0
+        return _julia_typed_zero(x)
+    if isinstance(x, (_MPFR, _MPC, _MPFRComplex)):
+        with _bigfloat_context():
+            return _julia_array_scalar_operation(
+                np.asarray(x), _to_mpfr(1), np.divide, reflected=True
+            ).reshape(())[()]
+    if isinstance(x, _MPZ) or (
+        type(x) is int and not -(1 << 63) <= x < (1 << 63)
+    ):
+        with _bigfloat_context():
+            return _to_mpfr(1) / _to_mpfr(x)
     return 1 / x
 
 
 def collapse(x: Any, i: int) -> np.ndarray:
     """Sum every dimension except Julia-style, one-based dimension *i*."""
 
-    arr = np.asarray(x)
+    if not isinstance(x, (list, range, np.ndarray)):
+        raise TypeError(
+            "collapse input must be a Julia-like numeric AbstractArray"
+        )
+    arr = _julia_literal_array(x) if isinstance(x, list) else np.asarray(x)
+    _require_julia_numeric_array(arr, "collapse")
     if isinstance(i, (bool, np.bool_)) or not (
         type(i) is int or isinstance(i, np.int64)
     ):
@@ -240,6 +302,13 @@ def collapse(x: Any, i: int) -> np.ndarray:
         and (
             all(isinstance(value, Fraction) for value in arr.flat)
             or all(isinstance(value, Decimal) for value in arr.flat)
+            or all(
+                isinstance(
+                    value,
+                    (_MPFR, _MPC, _MPQ, _MPZ, _MPFRComplex),
+                )
+                for value in arr.flat
+            )
         )
     )
     if exact_object_domain:
@@ -270,31 +339,12 @@ def clip(x: Any, threshold: Number) -> Any:
 
     if not _is_real_number(threshold):
         raise TypeError("threshold must be a real scalar")
-    if np.ndim(x) != 0:
-        arr = np.asarray(x)
-        if arr.dtype.kind == "c" or (
-            arr.dtype.kind == "O"
-            and not all(_is_real_number(value) for value in arr.flat)
-        ):
-            raise TypeError("clip values must support real ordering")
-        keep = _julia_array_scalar_operation(
-            arr, threshold, np.greater
-        )
-        if arr.dtype.kind == "O":
-            output = np.empty(arr.shape, dtype=object)
-            for index in np.ndindex(arr.shape):
-                value = arr[index]
-                output[index] = (
-                    value if keep[index] else type(value)(0)
-                )
-            return output
-        return np.where(keep, arr, np.zeros((), dtype=arr.dtype))
     if not _is_real_number(x):
-        raise TypeError("clip value must support real ordering")
+        raise TypeError("clip requires scalar Julia Numbers with real ordering")
     keep = _julia_array_scalar_operation(
-        np.asarray(x), threshold, np.greater
+        x, threshold, np.greater
     ).reshape(())[()]
-    return x if keep else type(x)(0)
+    return x if keep else _julia_typed_zero(x)
 
 
 def _julia_vector_literal(values: Sequence[Any]) -> np.ndarray:
@@ -309,47 +359,7 @@ def _julia_vector_literal(values: Sequence[Any]) -> np.ndarray:
     items = tuple(values)
     if not items:
         return np.empty(0, dtype=object)
-    if any(isinstance(value, Decimal) for value in items):
-        return np.asarray(
-            [_as_decimal_approx(value) for value in items], dtype=object
-        )
-    if any(isinstance(value, Fraction) for value in items):
-        machine = [
-            value
-            for value in items
-            if not isinstance(value, (Fraction, int, np.integer, bool, np.bool_))
-        ]
-        if not machine:
-            return np.asarray(
-                [
-                    value
-                    if isinstance(value, Fraction)
-                    else Fraction(int(value), 1)
-                    for value in items
-                ],
-                dtype=object,
-            )
-        dtype = _julia_scalar_dtype(machine[0])
-        for value in machine[1:]:
-            dtype = _julia_promote_numeric_dtypes(
-                dtype, _julia_scalar_dtype(value)
-            )
-        output = np.empty(len(items), dtype=dtype)
-        for index, value in enumerate(items):
-            output[index] = _julia_assignment_values(
-                value, dtype
-            ).reshape(())[()]
-        return output
-
-    dtype = _julia_scalar_dtype(items[0])
-    for value in items[1:]:
-        dtype = _julia_promote_numeric_dtypes(
-            dtype, _julia_scalar_dtype(value)
-        )
-    output = np.empty(len(items), dtype=dtype)
-    for index, value in enumerate(items):
-        output[index] = _julia_assignment_values(value, dtype).reshape(())[()]
-    return output
+    return _julia_literal_array(items)
 
 
 def _centroid_calculation(
@@ -363,7 +373,7 @@ def _centroid_calculation(
         threshold
         if is_field
         else _julia_array_scalar_operation(
-            np.asarray(np.max(data)),
+            np.max(data),
             threshold,
             np.multiply,
         ).reshape(())[()]
@@ -374,7 +384,9 @@ def _centroid_calculation(
         clipped = np.empty(data.shape, dtype=object)
         for index in np.ndindex(data.shape):
             value = data[index]
-            clipped[index] = value if keep[index] else type(value)(0)
+            clipped[index] = (
+                value if keep[index] else _julia_typed_zero(value)
+            )
     else:
         clipped = np.where(keep, data, np.zeros((), dtype=data.dtype))
 
@@ -460,9 +472,14 @@ def centroid(img: Any, threshold: float = 0.1) -> np.ndarray:
         if img.field_type is not Intensity:
             raise TypeError("centroid(field) requires an Intensity lattice field")
         data = _require_real_ordered_array(img.data, "centroid input")
-    elif isinstance(img, np.ndarray):
+    elif isinstance(img, (np.ndarray, list)):
+        array = (
+            _julia_literal_array(img)
+            if isinstance(img, list)
+            else _require_dense_ndarray(img, "centroid input")
+        )
         data = _require_real_ordered_array(
-            _require_dense_ndarray(img, "centroid input"),
+            array,
             "centroid input",
         )
     else:
@@ -498,7 +515,11 @@ def window(img: Any, w: int | Sequence[int]) -> tuple[np.ndarray, ...]:
     data = (
         np.asarray(img.data)
         if is_field
-        else _require_dense_ndarray(img, "window image")
+        else (
+            _julia_literal_array(img)
+            if isinstance(img, list)
+            else _require_dense_ndarray(img, "window image")
+        )
     )
     if isinstance(w, (int, np.integer)):
         # The field overload is concretely typed with Julia's platform Int;
@@ -575,8 +596,14 @@ def _normalize_schroff_values(values: np.ndarray) -> np.ndarray:
             raise ValueError("Inexact normalization of integer intensity data")
         output[...] = converted
         return output
-    with np.errstate(divide="ignore", invalid="ignore"):
-        output /= total
+    if output.dtype.kind == "O":
+        quotient = _julia_array_scalar_operation(
+            output, total, np.divide
+        )
+        output[...] = _julia_assignment_values(quotient, output)
+    else:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            output /= total
     return output
 
 
@@ -596,7 +623,7 @@ def SchroffError(target: Any, reality: Any, threshold: float = 0.5) -> Any:
     ydata = _require_real_ordered_array(reality.data, "Schroff reality")
     maximum = np.max(xdata)
     cutoff = _julia_array_scalar_operation(
-        np.asarray(maximum), threshold, np.multiply
+        maximum, threshold, np.multiply
     ).reshape(())[()]
     mask = _julia_array_scalar_operation(xdata, cutoff, np.greater)
     # Julia's logical indexing follows column-major linear order.
@@ -636,13 +663,16 @@ def SchroffError(target: Any, reality: Any, threshold: float = 0.5) -> Any:
         )
         relative_sum = _julia_sum(relative_squared)
         radicand = _julia_array_scalar_operation(
-            np.asarray(relative_sum),
+            relative_sum,
             n_pixels,
             np.divide,
         ).reshape(())[()]
-        value = (
-            math.sqrt(radicand)
-            if isinstance(radicand, Fraction)
-            else np.sqrt(radicand)
-        )
+        if isinstance(radicand, (_MPFR, _MPQ, _MPZ)):
+            value = _mpfr_sqrt(radicand)
+        else:
+            value = (
+                math.sqrt(radicand)
+                if isinstance(radicand, Fraction)
+                else np.sqrt(radicand)
+            )
     return value

@@ -8,6 +8,7 @@ values represented by :class:`RealPhase` are measured in cycles, not radians;
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
+from decimal import Decimal
 from fractions import Fraction
 from typing import Any
 
@@ -15,6 +16,15 @@ import numpy as np
 import pyfftw
 from pyfftw.interfaces import numpy_fft as _fftw_fft
 
+from ._bigfloat import (
+    _MPC,
+    _MPFR,
+    _MPFRComplex,
+    _MPQ,
+    _MPZ,
+    _mpfr_sqrt,
+)
+from ._omission import _OMITTED
 from .lattice_field import (
     ComplexAmp,
     ComplexPhase,
@@ -26,9 +36,11 @@ from .lattice_field import (
     RealPhase,
     _is_real_number,
     _julia_add_sum,
+    _julia_abs,
     _julia_array_array_operation,
     _julia_array_scalar_operation,
     _julia_sum,
+    _real_phase_phasors,
     _require_dense_ndarray,
     as_lattice,
     elq,
@@ -101,6 +113,46 @@ def _is_real_numeric_data(value: Any) -> bool:
             _is_real_number(item) for item in array.flat
         )
     return _is_numeric_data(value) and not np.issubdtype(dtype, np.complexfloating)
+
+
+def _has_arbitrary_precision_data(value: Any) -> bool:
+    array = np.asarray(value)
+    if array.dtype.kind != "O":
+        return False
+    limits = np.iinfo(np.int64)
+    return any(
+        isinstance(
+            item,
+            (Decimal, _MPFR, _MPC, _MPFRComplex, _MPQ, _MPZ),
+        )
+        or (
+            type(item) is int and not limits.min <= item <= limits.max
+        )
+        or (
+            isinstance(item, Fraction)
+            and (
+                not limits.min <= item.numerator <= limits.max
+                or not 1 <= item.denominator <= limits.max
+            )
+        )
+        for item in array.flat
+    )
+
+
+def _has_arbitrary_precision_modulus(value: Any) -> bool:
+    return _has_arbitrary_precision_data(value)
+
+
+def _is_complex_numeric_data(value: Any) -> bool:
+    """Return whether an array has a concrete Julia ``<:Complex`` element."""
+
+    array = np.asarray(value)
+    if array.dtype.kind == "c":
+        return True
+    return bool(array.size) and array.dtype.kind == "O" and all(
+        isinstance(item, (complex, np.complexfloating, _MPC, _MPFRComplex))
+        for item in array.flat
+    )
 
 
 def _require_real_field_data(field: LatticeField, name: str) -> None:
@@ -199,8 +251,12 @@ def _phase_array(phase: LatticeField) -> np.ndarray:
         # by Float64 ``2pi`` in Julia makes the work array ComplexF64 for all
         # ordinary integer/Float16/Float32 inputs, hence the explicit
         # Complex128 conversion here.
+        if _has_arbitrary_precision_data(phase.data):
+            return _real_phase_phasors(phase.data)
         return np.exp(2j * np.pi * np.asarray(phase.data, dtype=np.complex128))
     if _tag_is(phase, ComplexPhase):
+        if _has_arbitrary_precision_data(phase.data):
+            return np.asarray(phase.data)
         return np.asarray(phase.data, dtype=np.complex128)
     if _is_phase(phase):
         data = np.asarray(phase.data)
@@ -217,19 +273,7 @@ def _modulus_field(field: LatticeField) -> LatticeField:
             raise TypeError("intensity values must be numeric")
         if _is_real_numeric_data(data) and np.any(data < 0):
             raise ValueError("intensity values must be nonnegative")
-        # Julia's scalar sqrt methods widen every machine integer (including
-        # Bool and UInt8/Int8) to Float64 before the broadcast allocates its
-        # result.  NumPy instead selects Float16 for 8-bit integers and
-        # Float32 for 16-bit integers, which changes both numerical results
-        # and downstream concrete-method dispatch.
-        sqrt_input = (
-            data.astype(np.float64)
-            if data.dtype.kind in "bui"
-            else data
-        )
-        return _make_field(
-            Modulus, np.sqrt(sqrt_input), field.L, field.flambda
-        )
+        return field.sqrt()
     raise TypeError("expected a Modulus or Intensity LatticeField")
 
 
@@ -316,7 +360,7 @@ def _int64_keyword(value: Any, name: str) -> int:
 def _scalar_operation(left: Any, right: Any, operation: np.ufunc) -> Any:
     """Apply Julia scalar promotion through the shared array/scalar helper."""
 
-    result = _julia_array_scalar_operation(np.asarray(left), right, operation)
+    result = _julia_array_scalar_operation(left, right, operation)
     return np.asarray(result).reshape(())[()]
 
 
@@ -345,24 +389,59 @@ def _quadratic_linear_phase(
     return _julia_array_array_operation(quadratic, linear, np.add)
 
 
-def _fft_with_plan(values: np.ndarray, plan: Any, *, inverse: bool) -> np.ndarray:
-    if plan is None:
-        return np.fft.ifftn(values) if inverse else np.fft.fftn(values)
-    if callable(plan):
-        return np.asarray(plan(values))
-    try:
-        return np.asarray(plan @ values)
-    except (TypeError, ValueError):
-        try:
-            return np.asarray(plan * values)
-        except (TypeError, ValueError) as exc:
-            raise TypeError("FFT plan must be callable or support applying itself to an array") from exc
+def _apply_bare_pyfftw_plan(
+    plan: pyfftw.FFTW, values: np.ndarray
+) -> np.ndarray:
+    """Apply a pyFFTW plan without normalizing either transform direction."""
+
+    # pyFFTW couples forward/backward normalization: disabling inverse
+    # normalization scales a forward transform by 1/N. Select the flag by
+    # direction so both Julia cFFTWPlan directions remain unnormalized.
+    normalize_inverse = plan.direction == "FFTW_FORWARD"
+    return np.asarray(
+        plan(values, normalise_idft=normalize_inverse)
+    )
+
+
+def _fft_with_plan(
+    values: np.ndarray, plan: Any, *, scaled: bool
+) -> np.ndarray:
+    """Apply Julia's bare- versus scaled-FFTW plan dispatch families."""
+
+    if not scaled:
+        if isinstance(plan, _FFTWComplexPlan):
+            if plan.scaled:
+                raise TypeError("ft must be a bare pyFFTW FFTW plan")
+            return plan(values)
+        if isinstance(plan, pyfftw.FFTW):
+            # A Julia cFFTWPlan may be forward or backward. Applying the bare
+            # plan never adds inverse normalization.
+            return _apply_bare_pyfftw_plan(plan, values)
+        raise TypeError("ft must be a bare pyFFTW FFTW plan")
+
+    if isinstance(plan, _FFTWComplexPlan):
+        if not plan.scaled:
+            raise TypeError("ift must be a scaled pyFFTW FFTW plan")
+        return plan(values)
+    if isinstance(plan, ScaledFFTWPlan):
+        return plan(values)
+    if (
+        isinstance(plan, pyfftw.FFTW)
+        and plan.direction == "FFTW_BACKWARD"
+        and plan.normalise_idft
+    ):
+        # pyFFTW represents its normalized inverse as the same concrete plan
+        # class. Treat that common form as AbstractFFTs.plan_ifft.
+        return np.asarray(plan(values, normalise_idft=True))
+    raise TypeError("ift must be a scaled pyFFTW FFTW plan")
 
 
 class _FFTWComplexPlan:
     """Single-threaded column-major FFTW plan matching Julia ``plan_fft``."""
 
     def __init__(self, shape: tuple[int, ...], *, inverse: bool) -> None:
+        self.direction = "FFTW_BACKWARD" if inverse else "FFTW_FORWARD"
+        self.scaled = inverse
         self._input = pyfftw.empty_aligned(
             shape, dtype=np.complex128, order="F"
         )
@@ -373,7 +452,7 @@ class _FFTWComplexPlan:
             self._input,
             self._output,
             axes=tuple(range(len(shape))),
-            direction="FFTW_BACKWARD" if inverse else "FFTW_FORWARD",
+            direction=self.direction,
             flags=("FFTW_ESTIMATE",),
             threads=1,
             normalise_idft=True,
@@ -383,6 +462,32 @@ class _FFTWComplexPlan:
         self._input[...] = np.asarray(values, dtype=np.complex128)
         self._plan()
         return self._output.copy(order="F")
+
+
+class ScaledFFTWPlan:
+    """Python counterpart of an ``AbstractFFTs.ScaledPlan``.
+
+    Julia permits any bare complex FFTW plan, including a forward plan, to be
+    multiplied by a scalar and passed as ``gsIter``/``pdgsIter``'s scaled plan.
+    pyFFTW has no separate scaled-plan type, so this small explicit wrapper
+    preserves that successful plan family without accepting arbitrary
+    callables or operator protocols.
+    """
+
+    def __init__(self, plan: Any, scale: Any) -> None:
+        if not isinstance(plan, (pyfftw.FFTW, _FFTWComplexPlan)):
+            raise TypeError("ScaledFFTWPlan requires a pyFFTW FFTW plan")
+        if not np.isscalar(scale) or isinstance(scale, (str, bytes)):
+            raise TypeError("ScaledFFTWPlan scale must be numeric")
+        self.plan = plan
+        self.scale = scale
+
+    def __call__(self, values: Any) -> np.ndarray:
+        if isinstance(self.plan, pyfftw.FFTW):
+            transformed = _apply_bare_pyfftw_plan(self.plan, values)
+        else:
+            transformed = self.plan(values)
+        return np.asarray(transformed) * self.scale
 
 
 def _fftw_plan_pair(shape: tuple[int, ...]) -> tuple[_FFTWComplexPlan, _FFTWComplexPlan]:
@@ -396,13 +501,15 @@ def gsIter(
     guess: Any,
     u: Any,
     v: Any,
-    ft: Any = None,
-    ift: Any = None,
+    ft: Any,
+    ift: Any,
 ) -> np.ndarray:
     """Perform one Gerchberg--Saxton iteration on unshifted arrays.
 
-    ``ft`` and ``ift`` may be callable FFT plans.  Omitting them uses NumPy's
-    N-dimensional FFT and normalized inverse FFT, matching FFTW's defaults.
+    ``ft`` must be a bare pyFFTW plan and ``ift`` a scaled plan, matching
+    Julia's concrete ``cFFTWPlan``/``ScaledPlan`` dispatch. Transform
+    direction is deliberately unrestricted. Use :class:`ScaledFFTWPlan` for
+    scaled plan families that pyFFTW does not represent directly.
     """
 
     guess_array = _require_dense_ndarray(guess, "gsIter guess")
@@ -416,8 +523,10 @@ def gsIter(
         raise TypeError("u and v must have Julia Float64 element type")
     if guess_array.shape != u_array.shape or guess_array.shape != v_array.shape:
         raise ValueError("guess, u, and v must have the same shape")
-    transformed = _fft_with_plan(guess_array, ft, inverse=False)
-    update = _fft_with_plan(_phasor(transformed) * v_array, ift, inverse=True)
+    transformed = _fft_with_plan(guess_array, ft, scaled=False)
+    update = _fft_with_plan(
+        _phasor(transformed) * v_array, ift, scaled=True
+    )
     return np.asarray(u_array * _phasor(update), dtype=np.complex128)
 
 
@@ -425,9 +534,7 @@ def gs(
     U: LatticeField,
     V: LatticeField,
     nit: int,
-    phi0: LatticeField | None = None,
-    *,
-    rng: np.random.Generator | None = None,
+    phi0: Any = _OMITTED,
 ) -> LatticeField:
     """Run Gerchberg--Saxton and return a ``ComplexPhase`` field.
 
@@ -446,13 +553,13 @@ def gs(
     _validate_dual(u_field, v_field)
     if np.shape(u_field.data) != np.shape(v_field.data):
         raise ValueError("input and target must have the same shape")
-    if phi0 is None:
+    if phi0 is _OMITTED:
         if intensity_inputs:
             raise TypeError(
                 "the Julia Intensity gs overload forwards nothing to a "
                 "nonexistent four-argument Modulus method; supply phi0"
             )
-        random = rng.random(np.shape(u_field.data)) if rng is not None else np.random.random(np.shape(u_field.data))
+        random = np.random.random(np.shape(u_field.data))
         phi0 = _make_field(RealPhase, random, u_field.L, u_field.flambda)
     if not _is_phase(phi0):
         raise TypeError("phi0 must be a phase LatticeField")
@@ -467,6 +574,12 @@ def gs(
 
     u_data = np.asarray(u_field.data)
     v_data = np.asarray(v_field.data)
+    if _has_arbitrary_precision_modulus(
+        u_data
+    ) or _has_arbitrary_precision_modulus(v_data):
+        raise TypeError(
+            "Julia's gs path reaches unsupported phasor(Complex{BigFloat})"
+        )
     guess = np.fft.ifftshift(u_data * _phasor(_phase_array(phi0)))
     if iterations > 0:
         if u_data.dtype == np.dtype(np.float64) and v_data.dtype == np.dtype(
@@ -494,10 +607,9 @@ def gsLog(
     U: LatticeField,
     V: LatticeField,
     nit: int,
-    phi0: LatticeField | None = None,
+    phi0: Any = _OMITTED,
     *,
     every: int = 1,
-    rng: np.random.Generator | None = None,
 ) -> tuple[LatticeField, list[float]]:
     """Run GS and record the squared normalized modulus error.
 
@@ -517,13 +629,13 @@ def gsLog(
     _validate_dual(u_field, v_field)
     if np.shape(u_field.data) != np.shape(v_field.data):
         raise ValueError("input and target must have the same shape")
-    if phi0 is None:
+    if phi0 is _OMITTED:
         if intensity_inputs:
             raise TypeError(
                 "the Julia Intensity gsLog overload forwards nothing to a "
                 "nonexistent four-argument Modulus method; supply phi0"
             )
-        random = rng.random(np.shape(u_field.data)) if rng is not None else np.random.random(np.shape(u_field.data))
+        random = np.random.random(np.shape(u_field.data))
         phi0 = _make_field(RealPhase, random, u_field.L, u_field.flambda)
     if not _is_phase(phi0):
         raise TypeError("phi0 must be a phase LatticeField")
@@ -540,6 +652,13 @@ def gsLog(
     # those component-wise low-precision divisions and their logged error.
     u_data = np.asarray(u_field.data)
     v_data = np.asarray(v_field.data)
+    if _has_arbitrary_precision_modulus(
+        u_data
+    ) or _has_arbitrary_precision_modulus(v_data):
+        raise TypeError(
+            "Julia's gsLog path reaches unsupported "
+            "phasor(Complex{BigFloat})"
+        )
     rational_u = u_data.dtype.kind == "O" and all(
         isinstance(value, Fraction) for value in u_data.flat
     )
@@ -593,14 +712,18 @@ def gsLog(
 
 def _normalize_modulus(values: Any) -> np.ndarray:
     array = np.asarray(values)
-    magnitudes = np.abs(array)
+    magnitudes = _julia_abs(array)
     squared = _julia_array_array_operation(
         magnitudes, magnitudes, np.multiply
     )
     total = _julia_sum(squared)
-    norm = np.sqrt(float(total)) if isinstance(total, Fraction) else np.sqrt(total)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        return array / norm
+    if isinstance(total, Fraction):
+        norm = np.sqrt(float(total))
+    elif isinstance(total, (_MPFR, _MPQ, _MPZ)):
+        norm = _mpfr_sqrt(total)
+    else:
+        norm = np.sqrt(total)
+    return _julia_array_scalar_operation(array, norm, np.divide)
 
 
 def gsError(U: LatticeField, V: LatticeField, phase: LatticeField) -> float:
@@ -625,12 +748,16 @@ def _prepare_pdgs(
     real_moduli_required: bool,
     function_name: str,
 ) -> tuple[tuple[LatticeField, ...], tuple[LatticeField, ...], tuple[np.ndarray, ...], tuple[np.ndarray, ...]]:
-    images = tuple(imgs)
-    phases = tuple(div_phases)
+    if not isinstance(imgs, tuple) or not isinstance(div_phases, tuple):
+        raise TypeError("imgs and divPhases must be NTuples")
+    images = imgs
+    phases = div_phases
     if not images or len(images) != len(phases):
         raise ValueError("imgs and divPhases must be nonempty and have equal length")
     if not _tag_is(beam_guess, ComplexAmp):
         raise TypeError("beamGuess must be a ComplexAmp LatticeField")
+    if not _is_complex_numeric_data(beam_guess.data):
+        raise TypeError("beamGuess must have a concrete complex element type")
     image_tags = tuple(getattr(image, "field_type", None) for image in images)
     if all(tag is Modulus for tag in image_tags):
         modulus_images = images
@@ -669,8 +796,24 @@ def _prepare_pdgs(
         phis.append(np.fft.ifftshift(_phase_array(phase) * np.exp(2j * np.pi * dual_phase)))
         modulus_data = np.asarray(image.data)
         if real_moduli_required:
-            modulus_data = np.asarray(modulus_data, dtype=float)
+            # Julia spells this ``i.data * 1.0`` and subsequently asserts a
+            # tuple of ``Array{Float64}``.  That promotes Float16/Float32 and
+            # Rational inputs, but deliberately does not narrow BigFloat.
+            modulus_data = _julia_array_scalar_operation(
+                modulus_data, np.float64(1.0), np.multiply
+            )
         mods.append(np.fft.ifftshift(modulus_data))
+    if real_moduli_required:
+        if any(np.asarray(phi).dtype != np.dtype(np.complex128) for phi in phis):
+            raise TypeError(
+                f"{function_name} diversity work arrays must have Julia "
+                "ComplexF64 element type"
+            )
+        if any(np.asarray(modulus).dtype != np.dtype(np.float64) for modulus in mods):
+            raise TypeError(
+                f"{function_name} modulus work arrays must have Julia "
+                "Float64 element type"
+            )
     return modulus_images, phases, tuple(phis), tuple(mods)
 
 
@@ -678,8 +821,8 @@ def pdgsIter(
     guess: Any,
     phis: Sequence[Any],
     mods: Sequence[Any],
-    ft: Any = None,
-    ift: Any = None,
+    ft: Any,
+    ift: Any,
 ) -> np.ndarray:
     """Perform one phase-diversity GS iteration on unshifted arrays."""
 
@@ -700,8 +843,12 @@ def pdgsIter(
             raise TypeError("pdgsIter moduli must have Julia Float64 element type")
         if phi_array.shape != guess_array.shape or modulus_array.shape != guess_array.shape:
             raise ValueError("guess, phases, and moduli must have the same shape")
-        propagated = _fft_with_plan(guess_array * phi_array, ft, inverse=False)
-        update = _fft_with_plan(modulus_array * _phasor(propagated), ift, inverse=True)
+        propagated = _fft_with_plan(
+            guess_array * phi_array, ft, scaled=False
+        )
+        update = _fft_with_plan(
+            modulus_array * _phasor(propagated), ift, scaled=True
+        )
         updates.append(update * np.conjugate(phi_array))
     return np.asarray(_julia_add_sum(tuple(updates))) / len(phis)
 
@@ -715,7 +862,7 @@ def pdgs(
     """Estimate a complex beam from phase-diverse modulus/intensity images."""
 
     iterations = _iterations(nit)
-    _, _, phis, mods = _prepare_pdgs(
+    images, phases, phis, mods = _prepare_pdgs(
         imgs,
         divPhases,
         beamGuess,
@@ -729,7 +876,7 @@ def pdgs(
         raise TypeError(
             "positive-iteration pdgs has no matching ComplexF64 pdgsIter method"
         )
-    guess = np.fft.ifftshift(np.asarray(beamGuess.data, dtype=np.complex128))
+    guess = np.fft.ifftshift(np.asarray(beamGuess.data))
     ft, ift = _fftw_plan_pair(tuple(guess.shape))
     for _ in range(iterations):
         guess = pdgsIter(guess, phis, mods, ft, ift)
@@ -748,7 +895,7 @@ def pdgsLog(
 
     iterations = _iterations(nit)
     cadence = _int64_keyword(every, "every")
-    _, _, phis, mods = _prepare_pdgs(
+    images, phases, phis, mods = _prepare_pdgs(
         imgs,
         divPhases,
         beamGuess,
@@ -756,13 +903,7 @@ def pdgsLog(
         real_moduli_required=True,
         function_name="pdgsLog",
     )
-    if iterations > 0 and np.asarray(beamGuess.data).dtype != np.dtype(
-        np.complex128
-    ):
-        raise TypeError(
-            "positive-iteration pdgsLog cannot apply its ComplexF64 FFT plans"
-        )
-    guess = np.fft.ifftshift(np.asarray(beamGuess.data, dtype=np.complex128))
+    guess = np.fft.ifftshift(np.asarray(beamGuess.data))
     errors: list[float] = []
     ft, ift = _fftw_plan_pair(tuple(guess.shape))
     for iteration in range(iterations):
@@ -785,7 +926,7 @@ def pdgsError(
     divMods: Iterable[LatticeField],
     divPhases: Iterable[LatticeField],
     beamGuess: LatticeField,
-) -> float:
+) -> Any:
     """Return the average normalized squared L2 error over diversity images."""
 
     images, phases, _, _ = _prepare_pdgs(
@@ -797,18 +938,35 @@ def pdgsError(
         function_name="pdgsError",
     )
     errors = []
-    beam = np.asarray(beamGuess.data, dtype=np.complex128)
+    beam = np.asarray(beamGuess.data)
     for image, phase in zip(images, phases, strict=True):
         target = _normalize_modulus(image.data)
-        reconstruction = _normalize_modulus(_sft_array(beam * _phase_array(phase)))
+        # Multiplying the two fields in Julia routes through the partial
+        # ComplexAmplitude constructor, which converts its work array to
+        # ComplexF64 before FFTW sees it.
+        propagated = np.asarray(
+            _julia_array_array_operation(
+                beam, _phase_array(phase), np.multiply
+            ),
+            dtype=np.complex128,
+        )
+        reconstruction = _normalize_modulus(_sft_array(propagated))
+        difference = _julia_array_array_operation(
+            _julia_abs(target),
+            _julia_abs(reconstruction),
+            np.subtract,
+        )
         errors.append(
-            float(
-                _julia_sum(
-                    (np.abs(target) - np.abs(reconstruction)) ** 2
+            _julia_sum(
+                _julia_array_array_operation(
+                    difference, difference, np.multiply
                 )
             )
         )
-    return float(sum(errors) / len(errors))
+    total = _julia_add_sum(tuple(errors))
+    return _julia_array_scalar_operation(
+        total, len(errors), np.divide
+    ).reshape(())[()]
 
 
 def oneShot(img: LatticeField, alpha: float, beta: Sequence[float]) -> LatticeField:

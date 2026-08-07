@@ -7,14 +7,13 @@ name = "hoganlab-slmtools"
 version = "0.3.0"
 description = "Python port of SLMTools.jl"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{name = "SLMTools contributors"}]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
 ]
@@ -23,6 +22,7 @@ dependencies = [
   "numpy>=2.5.1",
   "Pillow>=12.3.0",
   "pyFFTW>=0.15.1",
+  "scipy>=1.18.0",
 ]
 
 [project.optional-dependencies]

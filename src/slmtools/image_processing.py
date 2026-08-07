@@ -17,9 +17,24 @@ from os import PathLike
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
+import gmpy2
 import numpy as np
 from PIL import Image
+from scipy import linalg as scipy_linalg
 
+from ._bigfloat import (
+    _MPC,
+    _MPFR,
+    _MPFRComplex,
+    _MPQ,
+    _MPZ,
+    _bigfloat_context,
+    _is_mpfr,
+    _is_mpc,
+    _mpfr_object_operation,
+    _to_mpfr,
+)
+from ._omission import _OMITTED
 from .bmp8 import save_gray8bmp
 from .dual_lattices import dualShiftLattice
 from .lattice_field import (
@@ -35,11 +50,16 @@ from .lattice_field import (
     _decimal_sincos,
     _julia_array_array_operation,
     _julia_array_scalar_operation,
+    _julia_collect_comprehension_results,
     _julia_literal_array,
+    _julia_typed_zero,
     _logical_axis_scalar_operation,
     _object_contains_decimal,
+    _object_contains_mpfr,
+    _object_numeric_element_key,
     _object_destination_element_type,
     _is_real_number,
+    _require_julia_numeric_array,
     _require_dense_ndarray,
     as_lattice,
 )
@@ -197,6 +217,34 @@ def getImagesAndFilenames(
     return images, filenames
 
 
+def _is_load_dir_lattice(value: Any) -> bool:
+    """Recognize Python spellings of Julia's two-dimensional ``L`` union."""
+
+    if value is None or _is_real_number(value):
+        return True
+    if not isinstance(value, tuple):
+        return False
+    if len(value) != 2:
+        return False
+    components = value
+    if all(
+        _is_real_number(component) for component in components
+    ):
+        return True
+    # Julia's Lattice{2} is a tuple of ranges. Python coordinate axes may be
+    # concrete one-dimensional sequences (including regular NumPy arrays and
+    # LatticeAxis instances), which ``as_lattice`` validates below.
+    for component in components:
+        if isinstance(component, (str, bytes)):
+            return False
+        try:
+            if np.asarray(component).ndim != 1:
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 def loadDir(
     directory: str,
     extension: str,
@@ -209,6 +257,24 @@ def loadDir(
     look: str = "after",
 ) -> tuple[list[LatticeField], list[Any]]:
     """Load same-sized images as lattice fields and parse their filenames."""
+
+    # Julia's typed keyword wrapper rejects these values before entering the
+    # function body (and therefore before touching the filesystem).  Keep the
+    # two intentional ``nothing`` cases, ``L`` and ``cue``, separate below.
+    if not isinstance(T, type):
+        raise TypeError("loadDir T must be a data type")
+    if not isinstance(outType, (type, np.dtype)):
+        raise TypeError("loadDir outType must be a data type")
+    if not _is_load_dir_lattice(L):
+        raise TypeError(
+            "loadDir L must be a two-dimensional lattice or real spacing"
+        )
+    if not _is_real_number(flambda):
+        raise TypeError("loadDir flambda must be real")
+    if cue is not None and not isinstance(cue, str):
+        raise TypeError("loadDir cue must be a string, character, or None")
+    if not isinstance(look, str):
+        raise TypeError("loadDir look must be a string or character")
 
     images, filenames = getImagesAndFilenames(directory, extension)
     if not images:
@@ -255,33 +321,138 @@ def loadDir(
     return fields, params
 
 
+def _julia_integer_literal(string: str) -> int:
+    """Parse Base-style decimal/binary/octal/hex integer spellings."""
+
+    stripped = string.strip()
+    unsigned = stripped[1:] if stripped[:1] in "+-" else stripped
+    base = 0 if unsigned.lower().startswith(("0x", "0o", "0b")) else 10
+    return int(stripped, base)
+
+
+def _julia_int64_literal(string: str) -> int:
+    """Parse the concrete platform ``Int`` used by the audited Julia build."""
+
+    value = _julia_integer_literal(string)
+    limits = np.iinfo(np.int64)
+    if value < limits.min or value > limits.max:
+        raise OverflowError(f"overflow parsing {string!r} as Julia Int64")
+    return value
+
+
+def _julia_rational_literal(string: str, *, bigint: bool) -> Any:
+    """Parse Base's integer-only ``Rational{T}`` string grammar."""
+
+    components = string.split("/", 1)
+    parser = _julia_integer_literal if bigint else _julia_int64_literal
+    try:
+        numerator = parser(components[0])
+        if len(components) == 1:
+            denominator = 1
+        else:
+            denominator_text = components[1]
+            if denominator_text.startswith("/"):
+                denominator_text = denominator_text[1:]
+            denominator = parser(denominator_text)
+    except ValueError as error:
+        raise ValueError(f"invalid Rational literal: {string!r}") from error
+
+    if bigint:
+        return gmpy2.mpq(numerator, denominator)
+    return Fraction(numerator, denominator)
+
+
+def _julia_bigfloat_complex_literal(string: str) -> gmpy2.mpc:
+    """Parse Julia complex spelling with each component parsed as BigFloat."""
+
+    def component(text: str) -> gmpy2.mpfr:
+        stripped = text.strip()
+        if any(character.isspace() for character in stripped):
+            raise ValueError(f"invalid BigFloat literal: {text!r}")
+        return gmpy2.mpfr(stripped)
+
+    compact = string.strip()
+    unit_length = (
+        2
+        if compact.endswith("im")
+        else (1 if compact.endswith(("i", "j")) else 0)
+    )
+    body = compact[:-unit_length] if unit_length else compact
+    separator = None
+    for index, character in enumerate(body[1:], start=1):
+        if character in "+-" and body[index - 1] not in "eE":
+            separator = index
+            break
+    if unit_length == 0:
+        if separator is not None:
+            raise ValueError("missing imaginary unit")
+        return gmpy2.mpc(component(body), gmpy2.mpfr(0))
+    if separator is None:
+        return gmpy2.mpc(gmpy2.mpfr(0), component(body))
+    imaginary = component(body[separator + 1 :])
+    if body[separator] == "-":
+        imaginary = -imaginary
+    return gmpy2.mpc(
+        component(body[:separator]),
+        imaginary,
+    )
+
+
+def _julia_hex_float_literal(string: str) -> float | None:
+    stripped = string.strip()
+    unsigned = stripped[1:] if stripped[:1] in "+-" else stripped
+    return float.fromhex(stripped) if unsigned.lower().startswith("0x") else None
+
+
 def parseStringToNum(string: str, *, outType: Any | None = None) -> Any:
     """Parse Julia's filename number syntax (comma denotes the decimal point)."""
 
+    clean = string.replace(",", ".")
+    if "_" in clean:
+        raise ValueError("Julia numeric parsing does not accept underscores")
     if outType is None:
         if "," in string:
-            return float(string.replace(",", "."))
-        return int(string)
-    clean = string.replace(",", ".")
+            hexadecimal = _julia_hex_float_literal(clean)
+            return float(clean) if hexadecimal is None else hexadecimal
+        return _julia_int64_literal(clean)
     if outType is Decimal:
         return Decimal(clean)
     if outType is Fraction:
-        if any(marker in clean for marker in (".", "e", "E")):
-            raise ValueError(f"invalid Rational literal: {string!r}")
-        return Fraction(clean.replace("//", "/"))
+        return _julia_rational_literal(clean, bigint=False)
+    if outType is gmpy2.mpz:
+        return gmpy2.mpz(clean)
+    if outType is gmpy2.mpq:
+        return _julia_rational_literal(clean, bigint=True)
+    if outType is gmpy2.mpfr:
+        with _bigfloat_context():
+            return gmpy2.mpfr(clean)
+    if outType is gmpy2.mpc:
+        with _bigfloat_context():
+            return _julia_bigfloat_complex_literal(clean)
     try:
         dtype = np.dtype(outType)
         converter = dtype.type
-    except TypeError:
-        converter = outType
-        dtype = None
-    if dtype is not None and dtype.kind == "b":
+    except TypeError as error:
+        raise TypeError("outType must support Julia numeric parsing") from error
+    if dtype.kind not in "buifc":
+        raise TypeError("outType must support Julia numeric parsing")
+    if dtype.kind == "b":
         bool_text = clean.strip()
         if bool_text == "true" or clean == "1":
             return converter(True)
         if bool_text == "false" or clean == "0":
             return converter(False)
         raise ValueError(f"invalid Bool literal: {string!r}")
+    if dtype.kind in "iu":
+        return converter(_julia_integer_literal(clean))
+    if dtype.kind == "f":
+        hexadecimal = _julia_hex_float_literal(clean)
+        return converter(clean if hexadecimal is None else hexadecimal)
+    if dtype.kind == "c":
+        hexadecimal = _julia_hex_float_literal(clean)
+        if hexadecimal is not None:
+            return converter(hexadecimal)
+        return converter(clean.replace(" ", "").replace("im", "j"))
     if outType is bool:
         bool_text = clean.strip()
         if bool_text == "true" or clean == "1":
@@ -294,20 +465,33 @@ def parseStringToNum(string: str, *, outType: Any | None = None) -> Any:
 
 def parseFileName(
     name: str,
-    cue: str | None = None,
-    look: str = "after",
+    cue: Any = _OMITTED,
+    look: Any = _OMITTED,
+    /,
     *,
     outType: Any | None = None,
 ) -> Any:
     """Extract a number from a filename using the original cue convention."""
 
-    if cue is None:
+    if not isinstance(name, str):
+        raise TypeError("parseFileName name must be a string")
+    if cue is _OMITTED:
+        if look is not _OMITTED:
+            raise TypeError(
+                "parseFileName's cue-less overload does not accept look"
+            )
         dot = name.find(".")
         if dot < 0:
             raise ValueError("filename has no extension separator")
         return parseStringToNum(name[:dot], outType=outType)
+    if not isinstance(cue, str):
+        raise TypeError("parseFileName cue must be a string or character")
+    if look is _OMITTED:
+        look = "after"
+    elif not isinstance(look, str):
+        raise TypeError("parseFileName look must be a string or character")
 
-    direction = str(look).lstrip(":")
+    direction = look.lstrip(":")
     if direction not in {"before", "b", "after", "a"}:
         raise ValueError("Unrecognized look value.")
     direction = "b" if direction in {"before", "b"} else "a"
@@ -335,6 +519,595 @@ def parseFileName(
     return parseStringToNum(number, outType=outType)
 
 
+def _is_complex_bigfloat_scalar(value: Any) -> bool:
+    return isinstance(value, _MPFRComplex) or _is_mpc(value)
+
+
+def _is_bigfloat_linear_scalar(value: Any) -> bool:
+    return (
+        isinstance(value, Decimal)
+        or _is_mpfr(value)
+        or isinstance(value, (_MPQ, _MPZ))
+        or (
+            type(value) is int
+            and not np.iinfo(np.int64).min <= value <= np.iinfo(np.int64).max
+        )
+        or (
+            isinstance(value, Fraction)
+            and (
+                not np.iinfo(np.int64).min
+                <= value.numerator
+                <= np.iinfo(np.int64).max
+                or not np.iinfo(np.int64).min
+                <= value.denominator
+                <= np.iinfo(np.int64).max
+            )
+        )
+        or _is_complex_bigfloat_scalar(value)
+    )
+
+
+def _as_mpfr_complex(value: Any) -> _MPFRComplex:
+    if isinstance(value, _MPFRComplex):
+        return _MPFRComplex(value.real, value.imag)
+    if _is_mpc(value):
+        return _MPFRComplex(value.real, value.imag)
+    if isinstance(value, (complex, np.complexfloating)):
+        scalar = complex(value)
+        return _MPFRComplex(scalar.real, scalar.imag)
+    return _MPFRComplex(value)
+
+
+def _mpfr_complex_abs2(value: _MPFRComplex) -> Any:
+    with _bigfloat_context():
+        return value.real * value.real + value.imag * value.imag
+
+
+def _mpfr_complex_is_finite(value: _MPFRComplex) -> bool:
+    return bool(
+        gmpy2.is_finite(value.real) and gmpy2.is_finite(value.imag)
+    )
+
+
+def _mpfr_complex_norm(values: Sequence[_MPFRComplex]) -> Any:
+    """Mirror Julia's finite generic two-norm for Complex{BigFloat}."""
+
+    maximum = max(abs(value) for value in values)
+    if maximum == 0 or gmpy2.is_infinite(maximum):
+        return maximum
+    with _bigfloat_context():
+        scale_check = len(values) * maximum * maximum
+        if gmpy2.is_finite(scale_check) and scale_check != 0:
+            total = _mpfr_complex_abs2(values[0])
+            for value in values[1:]:
+                total += _mpfr_complex_abs2(value)
+            return gmpy2.sqrt(total)
+
+        total = _mpfr_complex_abs2(values[0] / maximum)
+        for value in values[1:]:
+            total += _mpfr_complex_abs2(value / maximum)
+        return maximum * gmpy2.sqrt(total)
+
+
+def _mpfr_complex_dot(
+    left: Sequence[_MPFRComplex],
+    right: Sequence[_MPFRComplex],
+) -> _MPFRComplex:
+    total = _MPFRComplex(0)
+    for left_value, right_value in zip(left, right, strict=True):
+        total = total + left_value.conjugate() * right_value
+    return total
+
+
+def _mpfr_complex_reflector_values_inplace(
+    values: list[_MPFRComplex],
+) -> _MPFRComplex:
+    """Apply Julia's generic complex Householder storage convention."""
+
+    norm = _mpfr_complex_norm(values)
+    first = values[0]
+    if norm == 0:
+        return _MPFRComplex(0)
+    with _bigfloat_context():
+        signed_norm = gmpy2.copy_sign(norm, first.real)
+    nu = _MPFRComplex(signed_norm)
+    leading = first + nu
+    values[0] = -nu
+    for index in range(1, len(values)):
+        values[index] = values[index] / leading
+    return leading / nu
+
+
+def _mpfr_complex_reflector_inplace(
+    matrix: list[list[_MPFRComplex]],
+    column: int,
+    row: int,
+) -> _MPFRComplex:
+    values = [
+        matrix[index][column] for index in range(row, len(matrix))
+    ]
+    tau = _mpfr_complex_reflector_values_inplace(values)
+    for index, value in enumerate(values, start=row):
+        matrix[index][column] = value
+    return tau
+
+
+def _mpfr_complex_qr_solve(
+    matrix: list[list[_MPFRComplex]],
+    taus: Sequence[_MPFRComplex],
+    permutation: Sequence[int],
+    ys: list[_MPFRComplex],
+) -> tuple[_MPFRComplex, _MPFRComplex]:
+    """Solve with Julia-layout QR factors already rounded to their source type."""
+
+    rows = len(matrix)
+    zero = _MPFRComplex(0)
+    transformed = list(ys)
+    if rows < 2:
+        transformed.append(zero)
+    for column, tau in enumerate(taus):
+        projection = transformed[column] + _mpfr_complex_dot(
+            [
+                matrix[row][column]
+                for row in range(column + 1, rows)
+            ],
+            [
+                transformed[row]
+                for row in range(column + 1, rows)
+            ],
+        )
+        projection = tau.conjugate() * projection
+        transformed[column] = transformed[column] - projection
+        for row in range(column + 1, rows):
+            transformed[row] = (
+                transformed[row] - matrix[row][column] * projection
+            )
+
+    if rows == 1:
+        wide_row = [matrix[0][0], matrix[0][1]]
+        wide_tau = _mpfr_complex_reflector_values_inplace(wide_row)
+        transformed[0] = transformed[0] / wide_row[0]
+        transformed[1] = zero
+        projection = wide_tau * transformed[0]
+        transformed[0] = transformed[0] - projection
+        transformed[1] = (
+            transformed[1]
+            - wide_row[1].conjugate() * projection
+        )
+        solution = transformed
+    else:
+        if matrix[1][1] == zero:
+            raise np.linalg.LinAlgError(
+                "linearFit design matrix is singular at pivot 2"
+            )
+        second = transformed[1] / matrix[1][1]
+        first = (
+            transformed[0] - matrix[0][1] * second
+        ) / matrix[0][0]
+        solution = [first, second]
+
+    inverse = [0, 0]
+    for index, original in enumerate(permutation):
+        inverse[original] = index
+    return solution[inverse[0]], solution[inverse[1]]
+
+
+def _mpfr_complex_linear_fit(
+    xs: list[_MPFRComplex],
+    ys: list[_MPFRComplex],
+    *,
+    complex_domain: bool = True,
+) -> tuple[_MPFRComplex, _MPFRComplex]:
+    """Two-column Julia QR/LU solve for Complex{BigFloat} regression."""
+
+    rows = len(xs)
+    zero = _MPFRComplex(0)
+    one = _MPFRComplex(1)
+    if rows == 0:
+        return zero, zero
+
+    if rows == 2:
+        # Julia recognizes this special upper-triangular design before LU.
+        if xs[1] == zero:
+            if xs[0] == zero:
+                raise np.linalg.LinAlgError(
+                    "linearFit design matrix is singular at pivot 1"
+                )
+            second = ys[1]
+            if complex_domain and second.imag == 0:
+                second = _MPFRComplex(second.real, gmpy2.mpfr("-0"))
+            first = (ys[0] - second) / xs[0]
+            return first, second
+
+        # Julia checks a non-triangular matrix before generic LU. Preserve the
+        # successful upper-triangular Inf/NaN path above, but reject non-finite
+        # designs that actually enter LU.
+        if not all(_mpfr_complex_is_finite(value) for value in xs):
+            raise ValueError(
+                "linearFit design matrix contains Infs or NaNs"
+            )
+
+        matrix = [[xs[0], one], [xs[1], one]]
+        rhs = list(ys)
+        if abs(matrix[1][0]) > abs(matrix[0][0]):
+            matrix[0], matrix[1] = matrix[1], matrix[0]
+            rhs[0], rhs[1] = rhs[1], rhs[0]
+        if matrix[0][0] == zero:
+            raise np.linalg.LinAlgError(
+                "linearFit design matrix is singular at pivot 1"
+            )
+        lower = matrix[1][0] * (one / matrix[0][0])
+        matrix[1][0] = lower
+        matrix[1][1] = matrix[1][1] - lower * matrix[0][1]
+        if matrix[1][1] == zero:
+            raise np.linalg.LinAlgError(
+                "linearFit design matrix is singular at pivot 2"
+            )
+        if lower == zero:
+            # UnitLowerTriangular dynamically follows its structurally-upper
+            # solve when this multiplier is exactly zero. This avoids
+            # evaluating ``0 * Inf`` into the second component. For complex
+            # arithmetic the same path still turns a non-finite leading RHS
+            # into NaN+NaN*im and gives the finite component a negative-zero
+            # imaginary part.
+            if complex_domain and not _mpfr_complex_is_finite(rhs[0]):
+                second = rhs[1] / matrix[1][1]
+                if second.imag == 0:
+                    second = _MPFRComplex(
+                        second.real,
+                        gmpy2.mpfr("-0"),
+                    )
+                return (
+                    _MPFRComplex(
+                        gmpy2.mpfr("nan"),
+                        -gmpy2.mpfr("nan"),
+                    ),
+                    second,
+                )
+        else:
+            rhs[1] = rhs[1] - lower * rhs[0]
+        second = rhs[1] / matrix[1][1]
+        first = (rhs[0] - matrix[0][1] * second) / matrix[0][0]
+        return first, second
+
+    matrix = [[value, one] for value in xs]
+    permutation = [0, 1]
+    taus: list[_MPFRComplex] = []
+    for column in range(min(rows, 2)):
+        norms = [
+            _mpfr_complex_norm(
+                [
+                    matrix[row][candidate]
+                    for row in range(column, rows)
+                ]
+            )
+            for candidate in range(column, 2)
+        ]
+        pivot = (
+            column + 1
+            if len(norms) == 2 and norms[1] > norms[0]
+            else column
+        )
+        if pivot != column:
+            permutation[pivot], permutation[column] = (
+                permutation[column],
+                permutation[pivot],
+            )
+            for row in range(rows):
+                matrix[row][pivot], matrix[row][column] = (
+                    matrix[row][column],
+                    matrix[row][pivot],
+                )
+
+        tau = _mpfr_complex_reflector_inplace(
+            matrix, column, column
+        )
+        taus.append(tau)
+        for target_column in range(column + 1, 2):
+            projection = matrix[column][target_column] + _mpfr_complex_dot(
+                [
+                    matrix[row][column]
+                    for row in range(column + 1, rows)
+                ],
+                [
+                    matrix[row][target_column]
+                    for row in range(column + 1, rows)
+                ],
+            )
+            projection = tau.conjugate() * projection
+            matrix[column][target_column] = (
+                matrix[column][target_column] - projection
+            )
+            for row in range(column + 1, rows):
+                matrix[row][target_column] = (
+                    matrix[row][target_column]
+                    - projection * matrix[row][column]
+                )
+
+    return _mpfr_complex_qr_solve(matrix, taus, permutation, ys)
+
+
+def _machine_factor_then_mpfr_linear_fit(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    *,
+    complex_result: bool,
+) -> tuple[Any, Any]:
+    """Factor a machine design before promoting its factors to BigFloat.
+
+    Julia chooses the QR/LU factorization from the left-hand matrix before a
+    higher-precision right-hand side determines the factorization solve type.
+    Thus a ComplexF64 matrix with a BigFloat right-hand side first rounds
+    LAPACK's factors in ComplexF64, then converts those stored factors to
+    Complex{BigFloat}. Refactoring the original matrix in MPFR changes the
+    result.
+    """
+
+    if xs.dtype.kind == "O":
+        machine_xs = xs.astype(np.float64)
+    else:
+        machine_xs = xs
+    design = np.column_stack((machine_xs, np.ones(len(machine_xs))))
+    rhs = [_as_mpfr_complex(value) for value in ys]
+    rows = len(machine_xs)
+    zero = _MPFRComplex(0)
+    if rows == 0:
+        result = (zero, zero)
+    elif rows == 2:
+        # The matrix polyalgorithm recognizes this upper-triangular shape
+        # before factorization and promotes its entries only for the solve.
+        if design[1, 0] == 0:
+            result = _mpfr_complex_linear_fit(
+                [_as_mpfr_complex(value) for value in design[:, 0]],
+                rhs,
+                complex_domain=complex_result,
+            )
+        else:
+            if not np.all(np.isfinite(design)):
+                raise ValueError(
+                    "linearFit design matrix contains Infs or NaNs"
+                )
+            getrf = scipy_linalg.get_lapack_funcs("getrf", (design,))
+            factors, pivots, info = getrf(
+                np.array(design, copy=True),
+                overwrite_a=True,
+            )
+            if info < 0:
+                raise ValueError(
+                    f"LAPACK getrf received an invalid argument {-info}"
+                )
+            if info > 0:
+                raise np.linalg.LinAlgError(
+                    f"linearFit design matrix is singular at pivot {info}"
+                )
+            matrix = [
+                [_as_mpfr_complex(value) for value in row]
+                for row in factors
+            ]
+            transformed = list(rhs)
+            for row, pivot in enumerate(pivots):
+                if row != pivot:
+                    transformed[row], transformed[pivot] = (
+                        transformed[pivot],
+                        transformed[row],
+                    )
+            if matrix[0][0] == zero or matrix[1][1] == zero:
+                raise np.linalg.LinAlgError(
+                    "linearFit design matrix is singular"
+                )
+            transformed[1] = (
+                transformed[1] - matrix[1][0] * transformed[0]
+            )
+            intercept = transformed[1] / matrix[1][1]
+            slope = (
+                transformed[0] - matrix[0][1] * intercept
+            ) / matrix[0][0]
+            result = (slope, intercept)
+    else:
+        raw_factors, _r, permutation = scipy_linalg.qr(
+            design,
+            mode="raw",
+            pivoting=True,
+            check_finite=False,
+        )
+        factors, taus = raw_factors
+        matrix = [
+            [_as_mpfr_complex(value) for value in row]
+            for row in factors
+        ]
+        result = _mpfr_complex_qr_solve(
+            matrix,
+            [_as_mpfr_complex(value) for value in taus],
+            [int(value) for value in permutation],
+            rhs,
+        )
+
+    if complex_result:
+        return result
+    return result[0].real, result[1].real
+
+
+def _machine_nonfinite_qr_factors(
+    design: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, list[int]]:
+    """Build Julia-compatible raw pivoted-QR storage for non-finite inputs."""
+
+    rows = len(design)
+    if np.all(np.isfinite(design)):
+        raw_factors, _r, permutation = scipy_linalg.qr(
+            design,
+            mode="raw",
+            pivoting=True,
+            check_finite=False,
+        )
+        factors, taus = raw_factors
+        return factors, taus, [int(value) for value in permutation]
+
+    # The only non-finite design column is the user-supplied x vector; the
+    # intercept column is Float64 one. LAPACK keeps that column order.
+    factors = np.array(design, copy=True)
+    taus = np.empty(min(rows, 2), dtype=design.dtype)
+    permutation = [0, 1]
+    if rows == 1:
+        taus[0] = 0
+        return factors, taus, permutation
+
+    complex_dtype = design.dtype.kind == "c"
+    x_column = design[:, 0]
+    if np.any(np.isnan(x_column.real)) or (
+        complex_dtype and np.any(np.isnan(x_column.imag))
+    ):
+        nan = (
+            complex(float("nan"), float("nan"))
+            if complex_dtype
+            else float("nan")
+        )
+        factors[:, :] = nan
+        taus[:] = nan
+        return factors, taus, permutation
+
+    # Julia's LAPACK reflector for an infinite norm stores a signed infinite
+    # diagonal and zero tail. Applying its NaN tau then affects only the
+    # leading row; BLAS skips the exact-zero reflector components.
+    signed_norm = np.copysign(float("inf"), float(x_column[0].real))
+    factors[0, 0] = (
+        complex(-signed_norm, 0.0)
+        if complex_dtype
+        else -signed_norm
+    )
+    factors[1:, 0] = 0
+    factors[0, 1] = (
+        complex(float("nan"), float("nan"))
+        if complex_dtype
+        else float("nan")
+    )
+    taus[0] = (
+        complex(float("nan"), 0.0)
+        if complex_dtype
+        else float("nan")
+    )
+
+    raw_second, _r = scipy_linalg.qr(
+        factors[1:, 1:2],
+        mode="raw",
+        pivoting=False,
+        check_finite=False,
+    )
+    second_factors, second_tau = raw_second
+    factors[1:, 1] = second_factors[:, 0]
+    taus[1] = second_tau[0]
+    return factors, taus, permutation
+
+
+def _machine_nonfinite_qr_solve(
+    factors: np.ndarray,
+    taus: np.ndarray,
+    permutation: Sequence[int],
+    ys: np.ndarray,
+) -> tuple[Any, Any]:
+    """Apply Julia's two-column QRPivoted ldiv operation order."""
+
+    rows = len(factors)
+    result_dtype = np.result_type(factors.dtype, ys.dtype)
+    transformed = np.zeros(max(rows, 2), dtype=result_dtype)
+    transformed[:rows] = ys
+
+    with np.errstate(
+        over="ignore",
+        under="ignore",
+        invalid="ignore",
+        divide="ignore",
+    ):
+        for column, tau in enumerate(taus):
+            if tau == 0:
+                continue
+            projection = transformed[column]
+            for row in range(column + 1, rows):
+                projection = (
+                    projection
+                    + np.conjugate(factors[row, column])
+                    * transformed[row]
+                )
+            projection = np.conjugate(tau) * projection
+            transformed[column] = transformed[column] - projection
+            for row in range(column + 1, rows):
+                reflector = factors[row, column]
+                if reflector != 0:
+                    transformed[row] = (
+                        transformed[row] - reflector * projection
+                    )
+
+        if rows == 1:
+            wide = np.asarray(
+                [factors[0, 0], factors[0, 1]],
+                dtype=factors.dtype,
+            )
+            norm = scipy_linalg.norm(wide, check_finite=False)
+            signed_norm = np.copysign(
+                norm,
+                float(wide[0].real),
+            )
+            nu = np.asarray(
+                complex(signed_norm, 0.0)
+                if factors.dtype.kind == "c"
+                else signed_norm,
+                dtype=factors.dtype,
+            )[()]
+            leading = wide[0] + nu
+            wide[0] = -nu
+            wide[1] = wide[1] / leading
+            wide_tau = leading / nu
+
+            transformed[0] = transformed[0] / wide[0]
+            transformed[1] = 0
+            projection = wide_tau * transformed[0]
+            transformed[0] = transformed[0] - projection
+            transformed[1] = (
+                transformed[1] - np.conjugate(wide[1]) * projection
+            )
+            solution = transformed[:2]
+        else:
+            if factors[1, 1] == 0:
+                nan = (
+                    complex(float("nan"), float("nan"))
+                    if result_dtype.kind == "c"
+                    else float("nan")
+                )
+                solution = np.asarray([nan, nan], dtype=result_dtype)
+            else:
+                second = transformed[1] / factors[1, 1]
+                first = (
+                    transformed[0] - factors[0, 1] * second
+                ) / factors[0, 0]
+                solution = np.asarray([first, second], dtype=result_dtype)
+
+    inverse = [0, 0]
+    for index, original in enumerate(permutation):
+        inverse[original] = index
+    ordered = [solution[inverse[0]], solution[inverse[1]]]
+    if result_dtype.kind == "c":
+        for index, value in enumerate(ordered):
+            if value.imag == 0:
+                ordered[index] = np.asarray(
+                    complex(float(value.real), 0.0),
+                    dtype=result_dtype,
+                )[()]
+    return ordered[0], ordered[1]
+
+
+def _machine_nonfinite_linear_fit(
+    design: np.ndarray,
+    ys: np.ndarray,
+) -> tuple[Any, Any]:
+    factors, taus, permutation = _machine_nonfinite_qr_factors(design)
+    return _machine_nonfinite_qr_solve(
+        factors,
+        taus,
+        permutation,
+        ys,
+    )
+
+
 def linearFit(xs: Sequence[Any], ys: Sequence[Any]) -> tuple[Any, Any]:
     """Return ``(slope, intercept)`` from an ordinary least-squares line fit."""
 
@@ -352,7 +1125,15 @@ def linearFit(xs: Sequence[Any], ys: Sequence[Any]) -> tuple[Any, Any]:
                     f"linearFit {name} empty list has no concrete numeric "
                     "element type"
                 )
-            result = _julia_literal_array(value)
+            if any(_is_bigfloat_linear_scalar(item) for item in value):
+                # NumPy has no native BigFloat or Complex{BigFloat} dtype.
+                # Preserve the concrete object vector until Julia-compatible
+                # promotion below.
+                result = np.empty(len(value), dtype=object)
+                for index, item in enumerate(value):
+                    result[index] = item
+            else:
+                result = _julia_literal_array(value)
         elif isinstance(value, np.ndarray):
             result = _require_dense_ndarray(value, f"linearFit {name}")
             # A deliberately object-typed ndarray of ordinary machine
@@ -361,13 +1142,14 @@ def linearFit(xs: Sequence[Any], ys: Sequence[Any]) -> tuple[Any, Any]:
             # storage remains necessary for the concrete numeric domains
             # NumPy lacks: Rational and BigFloat are represented by Fraction
             # and Decimal, respectively.
-            if result.dtype.kind == "O" and not any(
-                isinstance(item, (Fraction, Decimal))
+            if result.dtype.kind == "O" and not all(
+                isinstance(item, (Number, Decimal, np.number, _MPQ, _MPZ))
+                or isinstance(item, _MPFRComplex)
                 for item in result.flat
             ):
                 raise TypeError(
                     f"linearFit {name} object arrays must represent a "
-                    "Fraction or Decimal numeric vector"
+                    "Julia numeric vector"
                 )
         else:
             raise TypeError(f"linearFit {name} must be a vector")
@@ -375,7 +1157,11 @@ def linearFit(xs: Sequence[Any], ys: Sequence[Any]) -> tuple[Any, Any]:
             raise TypeError("linearFit expects two one-dimensional vectors")
         if result.dtype.kind not in "buifc":
             if result.dtype.kind != "O" or not all(
-                isinstance(item, (Number, Decimal, np.number))
+                isinstance(
+                    item,
+                    (Number, Decimal, np.number, _MPQ, _MPZ),
+                )
+                or isinstance(item, _MPFRComplex)
                 for item in result.flat
             ):
                 raise TypeError("linearFit vectors must contain numbers")
@@ -386,8 +1172,95 @@ def linearFit(xs: Sequence[Any], ys: Sequence[Any]) -> tuple[Any, Any]:
     if len(x) != len(y):
         raise ValueError("linearFit coordinate vectors must have equal length")
 
+    # Julia also permits vectors whose declared element type is an abstract
+    # numeric supertype such as Real or Number. Generic QR promotes their
+    # runtime scalar values as it works. NumPy object arrays carry no such
+    # declaration, so normalize their numeric values through Julia literal
+    # promotion before selecting the equivalent concrete solver.
+    if x.dtype.kind == "O" and _object_numeric_element_key(x) is None:
+        x = _julia_literal_array(list(x))
+    if y.dtype.kind == "O" and _object_numeric_element_key(y) is None:
+        y = _julia_literal_array(list(y))
+
     if x.dtype.kind == "O" or y.dtype.kind == "O":
         values = (*x.flat, *y.flat)
+        x_has_bigfloat = any(
+            _is_bigfloat_linear_scalar(value) for value in x.flat
+        )
+        y_has_bigfloat = any(
+            _is_bigfloat_linear_scalar(value) for value in y.flat
+        )
+        has_decimal = any(isinstance(value, Decimal) for value in values)
+        has_mpfr = any(_is_mpfr(value) for value in values)
+        has_big_exact = any(
+            isinstance(value, (_MPQ, _MPZ))
+            or (
+                type(value) is int
+                and not np.iinfo(np.int64).min
+                <= value
+                <= np.iinfo(np.int64).max
+            )
+            or (
+                isinstance(value, Fraction)
+                and (
+                    not np.iinfo(np.int64).min
+                    <= value.numerator
+                    <= np.iinfo(np.int64).max
+                    or not np.iinfo(np.int64).min
+                    <= value.denominator
+                    <= np.iinfo(np.int64).max
+                )
+            )
+            for value in values
+        )
+        has_mpfr_complex = any(
+            _is_complex_bigfloat_scalar(value) for value in values
+        )
+        has_machine_complex = any(
+            isinstance(value, (complex, np.complexfloating))
+            for value in values
+        )
+        if y_has_bigfloat and not x_has_bigfloat:
+            with _bigfloat_context():
+                return _machine_factor_then_mpfr_linear_fit(
+                    x,
+                    y,
+                    complex_result=(
+                        x.dtype.kind == "c"
+                        or any(
+                            _is_complex_bigfloat_scalar(value)
+                            or isinstance(
+                                value, (complex, np.complexfloating)
+                            )
+                            for value in y.flat
+                        )
+                    ),
+                )
+
+        if has_mpfr_complex or (
+            (has_decimal or has_mpfr or has_big_exact)
+            and has_machine_complex
+        ):
+            xc = [_as_mpfr_complex(value) for value in x]
+            yc = [_as_mpfr_complex(value) for value in y]
+            with _bigfloat_context():
+                return _mpfr_complex_linear_fit(xc, yc)
+
+        if has_mpfr or has_big_exact:
+            # The real BigFloat and Complex{BigFloat} generic solvers have
+            # identical operation order when every imaginary component is
+            # zero. Reusing that MPFR implementation preserves Julia's exact
+            # 256-bit result while returning the real scalar element type.
+            xc = [_as_mpfr_complex(value) for value in x]
+            yc = [_as_mpfr_complex(value) for value in y]
+            with _bigfloat_context():
+                slope, intercept = _mpfr_complex_linear_fit(
+                    xc,
+                    yc,
+                    complex_domain=False,
+                )
+            return slope.real, intercept.real
+
         if any(isinstance(value, Decimal) for value in values):
             # Julia promotes a BigFloat operand, the Float64 ones column, and
             # the right-hand side to BigFloat before solving. Decimal is the
@@ -410,21 +1283,91 @@ def linearFit(xs: Sequence[Any], ys: Sequence[Any]) -> tuple[Any, Any]:
             yd = [as_decimal(value) for value in y]
             return _decimal_linear_fit(xd, yd)
 
-        if all(isinstance(value, (Fraction, int, np.integer)) for value in values):
-            # ``hcat(xs, ones(...))`` promotes Julia Rational input to
-            # Float64 because the intercept column is Float64.
+        # ``hcat(xs, ones(...))`` promotes a Rational design column to
+        # Float64. Backslash then promotes a Rational right-hand side to the
+        # real or complex machine element type of that design independently.
+        # Treat the vectors separately so Rational/ComplexF64 mixes do not
+        # leave an object array for LAPACK.
+        if all(
+            isinstance(value, (Fraction, int, np.integer))
+            for value in x.flat
+        ):
             x = x.astype(np.float64)
+        if all(
+            isinstance(value, (Fraction, int, np.integer))
+            for value in y.flat
+        ):
             y = y.astype(np.float64)
 
     design = np.column_stack((x, np.ones(len(x))))
     # Julia's `A \ b` chooses LU when the two-column design is square. In
     # particular, two identical x coordinates raise SingularException rather
-    # than returning the minimum-norm solution produced by `lstsq`. Rectangular
-    # designs use pivoted QR and retain their minimum-norm behavior.
+    # than returning a minimum-norm solution. Rectangular StridedMatrix
+    # designs go through LAPACK's pivoted-QR least-squares driver (gelsy).
+    # NumPy's SVD-based lstsq uses a different rank threshold and collapses
+    # Julia's large, finite result for nearly dependent designs.
     if design.shape[0] == design.shape[1]:
-        slope, intercept = np.linalg.solve(design, y)
+        if design[1, 0] == 0:
+            if design[0, 0] == 0:
+                raise np.linalg.LinAlgError(
+                    "linearFit design matrix is singular at pivot 1"
+                )
+            slope, intercept = scipy_linalg.solve_triangular(
+                design,
+                y,
+                lower=False,
+                check_finite=False,
+            )
+            return slope, intercept
+        if not np.all(np.isfinite(design)):
+            raise ValueError(
+                "linearFit design matrix contains Infs or NaNs"
+            )
+        getrf = scipy_linalg.get_lapack_funcs("getrf", (design,))
+        factors, pivots, info = getrf(
+            np.array(design, copy=True),
+            overwrite_a=True,
+        )
+        if info < 0:
+            raise ValueError(
+                f"LAPACK getrf received an invalid argument {-info}"
+            )
+        if info > 0:
+            raise np.linalg.LinAlgError(
+                f"linearFit design matrix is singular at pivot {info}"
+            )
+        getrs = scipy_linalg.get_lapack_funcs("getrs", (factors, y))
+        solution, info = getrs(
+            factors,
+            pivots,
+            np.array(y, copy=True),
+            trans=0,
+            overwrite_b=True,
+        )
+        if info != 0:
+            raise ValueError(
+                f"LAPACK getrs received an invalid argument {-info}"
+            )
+        slope, intercept = solution
     else:
-        slope, intercept = np.linalg.lstsq(design, y, rcond=None)[0]
+        if not np.all(np.isfinite(design)) or not np.all(np.isfinite(y)):
+            return _machine_nonfinite_linear_fit(design, y)
+        # QRPivoted's Julia ldiv path estimates rank with
+        # ``min(m, n) * eps(real(T))``. LAPACK's bare gelsy default is only
+        # ``eps`` and retains a spurious second direction at the boundary.
+        rank_cutoff = (
+            min(design.shape)
+            * np.finfo(np.asarray(design.real).dtype).eps
+        )
+        slope, intercept = scipy_linalg.lstsq(
+            design,
+            y,
+            cond=rank_cutoff,
+            lapack_driver="gelsy",
+            # Julia passes non-finite entries through to LAPACK, where they
+            # propagate into the result rather than being pre-rejected.
+            check_finite=False,
+        )[0]
     return slope, intercept
 
 
@@ -619,8 +1562,6 @@ def _decimal_linear_fit(
         if rows != 2:
             nan = Decimal("NaN")
             return nan, nan
-        if not all(value.is_finite() for value in xs):
-            raise ValueError("linearFit design matrix contains Infs or NaNs")
 
         # This is Julia 1.11's two-by-two generic row-pivoted LU operation
         # order, evaluated with Decimal's IEEE non-finite propagation enabled.
@@ -638,6 +1579,10 @@ def _decimal_linear_fit(
                 second = ys[1]
                 first = (ys[0] - second) / xs[0]
                 return first, second
+            if not all(value.is_finite() for value in xs):
+                raise ValueError(
+                    "linearFit design matrix contains Infs or NaNs"
+                )
 
             matrix = [
                 [xs[0], Decimal(1)],
@@ -918,6 +1863,16 @@ def _decimal_atan2(y: Any, x: Any) -> Decimal:
     return Decimal(0)
 
 
+def _splat_roi_index(roi: Any) -> Any:
+    """Translate Julia's ``field[roi...]`` selector convention."""
+
+    if isinstance(roi, list):
+        return tuple(roi)
+    if isinstance(roi, np.ndarray) and roi.ndim == 1:
+        return tuple(roi.tolist())
+    return roi
+
+
 def getOrientation(
     linImgs: Sequence[LatticeField],
     idxs: Sequence[Any],
@@ -939,13 +1894,29 @@ def getOrientation(
         for image in images
     ):
         raise TypeError("linImgs must contain two-dimensional Intensity fields")
-    if images and any(
-        np.asarray(image.data).dtype != np.asarray(images[0].data).dtype
-        for image in images[1:]
-    ):
-        raise TypeError("linImgs must have one concrete element type")
+    for image in images:
+        _require_julia_numeric_array(image.data, "getOrientation image")
+    if images:
+        def element_key(image: LatticeField) -> Any:
+            dtype = np.asarray(image.data).dtype
+            if dtype.kind != "O":
+                return dtype
+            key = _object_numeric_element_key(image.data)
+            if key is not None:
+                return key
+            logical = image._logical_object_type
+            if logical in (Decimal, _MPFR):
+                return _MPFR
+            if logical in (_MPFRComplex, _MPC):
+                return _MPC
+            return logical
+
+        first_key = element_key(images[0])
+        if any(element_key(image) != first_key for image in images[1:]):
+            raise TypeError("linImgs must have one concrete element type")
     if roi is not None:
-        images = [image[roi] for image in images]
+        roi_index = _splat_roi_index(roi)
+        images = [image[roi_index] for image in images]
     center_rows = [np.asarray(centroid(image, threshold)) for image in images]
     if not center_rows:
         # Preserve vcat's empty-input failure instead of fabricating a shape.
@@ -968,7 +1939,22 @@ def getOrientation(
     if isinstance(xs, Decimal) or isinstance(ys, Decimal):
         theta = _decimal_atan2(ys, xs)
         return np.asarray([xi, yi], dtype=object), theta
-    theta = np.angle(xs + 1j * ys)
+    if (
+        _is_mpfr(xs)
+        or _is_mpfr(ys)
+        or _is_complex_bigfloat_scalar(xs)
+        or _is_complex_bigfloat_scalar(ys)
+    ):
+        with _bigfloat_context():
+            direction = (
+                _as_mpfr_complex(xs)
+                + _MPFRComplex(0, 1) * _as_mpfr_complex(ys)
+            )
+            theta = gmpy2.atan2(direction.imag, direction.real)
+        return np.asarray([xi, yi], dtype=object), theta
+    # Construct the complex value directly so a QR-produced ``-0.0`` slope
+    # keeps its sign, as it does in Julia's ``xs + im * ys`` expression.
+    theta = np.angle(complex(xs, ys))
     return np.asarray([xi, yi]), float(theta)
 
 
@@ -976,6 +1962,8 @@ def _julia_zero_for_field_data(data: Any) -> Any:
     """Return ``zero(T)`` for the concrete element type represented by *data*."""
 
     array = np.asarray(data)
+    if array.dtype.kind == "O" and array.size:
+        return _julia_typed_zero(array.ravel(order="F")[0])
     object_type = _object_destination_element_type(array)
     if object_type is Fraction:
         return Fraction(0)
@@ -991,6 +1979,10 @@ def _julia_sincos(theta: Any) -> tuple[Any, Any]:
 
     if isinstance(theta, Decimal):
         return _decimal_sincos(theta)
+    if isinstance(theta, (_MPFR, _MPQ, _MPZ)):
+        with _bigfloat_context():
+            sine, cosine = gmpy2.sin_cos(_to_mpfr(theta))
+            return _MPFR(sine), _MPFR(cosine)
     if isinstance(theta, (Fraction, int, np.integer, bool, np.bool_)):
         # Julia promotes Integer/Rational trigonometry to Float64. NumPy
         # instead selects Float16 for Int8, Float32 for Int16/Int32, and
@@ -1009,7 +2001,7 @@ def dualate(
     roi: Any | None = None,
     interpolation: Callable[..., Any] = cubic_spline_interpolation,
     naturalize: bool = False,
-    bc: Any | None = None,
+    bc: Any = _OMITTED,
 ) -> LatticeField | list[LatticeField]:
     """Offset, rotate, and interpolate a field onto ``dualShiftLattice(L)``."""
 
@@ -1037,6 +2029,7 @@ def dualate(
         ]
     if not isinstance(f, LatticeField):
         raise TypeError("dualate requires a lattice field")
+    _require_julia_numeric_array(f.data, "dualate field")
     if isinstance(center, tuple) or not isinstance(center, (list, np.ndarray)):
         raise TypeError("center must be a Julia-style real Vector")
     center_array = np.asarray(center)
@@ -1052,9 +2045,11 @@ def dualate(
         raise ValueError("Incompatible lengths for center and f.L.")
     if len(f.L) != 2:
         raise ValueError("dualate is defined for two-dimensional fields")
-    field = f if roi is None else f[roi]
+    field = f if roi is None else f[_splat_roi_index(roi)]
     boundary = (
-        _julia_zero_for_field_data(field.data) if bc is None else bc
+        _julia_zero_for_field_data(field.data)
+        if bc is _OMITTED
+        else bc
     )
     shifted_axes = []
     for axis in range(2):
@@ -1079,7 +2074,11 @@ def dualate(
             [[cosine, -sine], [sine, cosine]]
         )
     dual_origin = np.asarray([dual_lattice[0][0], dual_lattice[1][0]])
-    if _object_contains_decimal(rotation) or _object_contains_decimal(dual_origin):
+    if _object_contains_mpfr(rotation) or _object_contains_mpfr(dual_origin):
+        origin = _julia_array_array_operation(
+            rotation, dual_origin, np.matmul
+        )
+    elif _object_contains_decimal(rotation) or _object_contains_decimal(dual_origin):
         origin = _as_decimal_array(rotation) @ _as_decimal_array(dual_origin)
     else:
         origin = rotation @ dual_origin
@@ -1089,6 +2088,14 @@ def dualate(
     dy = _julia_array_scalar_operation(
         rotation[:, 1], _step(dual_lattice[1]), np.multiply
     )
+    # Julia evaluates this untyped keyword in a Boolean context here, before
+    # constructing or evaluating the interpolation comprehension.  Reject
+    # Python's truthy values (including ``None`` and integers) at the same
+    # point so factory side effects remain observable but no scalar
+    # interpolation call occurs.
+    if not isinstance(naturalize, (bool, np.bool_)):
+        raise TypeError("dualate naturalize must be boolean")
+    naturalize = bool(naturalize)
     ii, jj = np.meshgrid(
         np.arange(len(dual_lattice[0])),
         np.arange(len(dual_lattice[1])),
@@ -1102,47 +2109,42 @@ def dualate(
     y_from_j = _julia_array_scalar_operation(jj, dy[1], np.multiply)
     ycoords = _julia_array_array_operation(y_from_i, y_from_j, np.add)
     ycoords = _julia_array_scalar_operation(ycoords, origin[1], np.add)
-    vectorized = False
+    # Julia evaluates the interpolation object once per CartesianIndex. Its
+    # first array dimension advances fastest, so reproduce that observable
+    # call order rather than speculatively invoking custom callables with
+    # whole coordinate arrays.
+    indices = (
+        tuple(reversed(index))
+        for index in np.ndindex(tuple(reversed(xcoords.shape)))
+    )
     try:
-        candidate = np.asarray(interp(xcoords, ycoords))
-        if candidate.shape == xcoords.shape:
-            data = candidate
-            vectorized = True
-    except (TypeError, ValueError):
-        pass
-    if not vectorized:
-        # A user-supplied Julia-style scalar interpolator need not be
-        # vectorized.  Preserve that extension point without penalizing the
-        # NumPy default. A scalar or otherwise wrong-shaped result from an
-        # array call is not sufficient evidence of vectorization: Julia calls
-        # the interpolator independently at every Cartesian index.
-        indices = iter(np.ndindex(xcoords.shape))
-        try:
-            first_index = next(indices)
-        except StopIteration:
-            data = np.empty(
-                xcoords.shape,
-                dtype=np.result_type(field.data.dtype, boundary),
+        first_index = next(indices)
+    except StopIteration:
+        data = np.empty(
+            xcoords.shape,
+            dtype=np.result_type(field.data.dtype, boundary),
+        )
+    else:
+        evaluated = [
+            (
+                first_index,
+                interp(xcoords[first_index], ycoords[first_index]),
             )
-        else:
-            evaluated = [
+        ]
+        for index in indices:
+            evaluated.append(
                 (
-                    first_index,
-                    interp(xcoords[first_index], ycoords[first_index]),
+                    index,
+                    interp(xcoords[index], ycoords[index]),
                 )
-            ]
-            for index in indices:
-                evaluated.append(
-                    (index, interp(xcoords[index], ycoords[index]))
-                )
-            promoted = _julia_literal_array(
-                [value for _index, value in evaluated]
             )
-            data = np.empty(xcoords.shape, dtype=promoted.dtype)
-            for (index, _value), converted in zip(
-                evaluated, promoted, strict=True
-            ):
-                data[index] = converted
+        values = [value for _index, value in evaluated]
+        promoted = _julia_collect_comprehension_results(values)
+        data = np.empty(xcoords.shape, dtype=promoted.dtype)
+        for (index, _value), converted in zip(
+            evaluated, promoted, strict=True
+        ):
+            data[index] = converted
 
     if naturalize:
         return LatticeField(data, natlat(data.shape), 1.0, field_type=field.field_type)
@@ -1169,7 +2171,10 @@ def _phase_image(value: Any) -> np.ndarray:
     if _is_field(value):
         tag = _field_tag_name(value)
         if tag in {"RealPhase", "UPhase", "UnwrappedPhase"}:
-            return np.mod(np.asarray(value.data), 1)
+            data = np.asarray(value.data)
+            if data.dtype.kind == "O" and _object_contains_decimal(data):
+                return _mpfr_object_operation(np.remainder, data, 1)
+            return _julia_array_scalar_operation(data, 1, np.remainder)
         if tag not in {"ComplexPhase", "S1Phase"}:
             raise TypeError("savePhase is implemented only for phase lattice fields")
         data = np.asarray(value.data)
@@ -1203,7 +2208,7 @@ def saveBeam(
     name: str,
     data: Iterable[str] = ("beamCsv", "angleCsv", "anglePng", "negativeAnglePng"),
     *,
-    dir: str | PathLike[str] | None = None,
+    dir: Any = _OMITTED,
 ) -> None:
     """Expose the unusable upstream beam-saving entry point.
 

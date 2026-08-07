@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 from pyfftw.interfaces import numpy_fft as _fftw_fft
 
+from ._bigfloat import _MPFRComplex, _MPQ, _MPZ, _is_bigfloat_input, _is_mpc
 from .lattice_field import (
     ComplexAmplitude,
     DomainError,
@@ -18,7 +19,9 @@ from .lattice_field import (
     _axis,
     _isapprox_array,
     _julia_array_scalar_operation,
+    _julia_literal_array,
     _logical_axis_scalar_operation,
+    _with_axis_length_kind,
     as_lattice,
 )
 from .lattice_utils import _step, latticeDisplacement, toDim
@@ -35,6 +38,8 @@ _UNSET = _DefaultFlambda()
 def dualLattice(lattice: Any, flambda: Number = 1) -> Lattice:
     """Return the unshifted all-nonnegative DFT frequency lattice."""
 
+    if not isinstance(flambda, (Number, np.bool_)):
+        raise TypeError("flambda must be a Julia Number")
     axes = as_lattice(lattice)
     output = []
     for axis in axes:
@@ -53,9 +58,12 @@ def dualLattice(lattice: Any, flambda: Number = 1) -> Lattice:
             scaled = _logical_axis_scalar_operation(
                 indices, flambda, np.multiply
             )
+            result = _logical_axis_scalar_operation(
+                scaled, denominator, np.divide
+            )
             output.append(
-                _logical_axis_scalar_operation(
-                    scaled, denominator, np.divide
+                _with_axis_length_kind(
+                    result, getattr(axis, "_length_kind", "int64")
                 )
             )
     return tuple(output)
@@ -64,6 +72,8 @@ def dualLattice(lattice: Any, flambda: Number = 1) -> Lattice:
 def dualShiftLattice(lattice: Any, flambda: Number = 1) -> Lattice:
     """Return the centered/fftshifted dual lattice."""
 
+    if not isinstance(flambda, (Number, np.bool_)):
+        raise TypeError("flambda must be a Julia Number")
     axes = as_lattice(lattice)
     output = []
     for axis in axes:
@@ -80,9 +90,12 @@ def dualShiftLattice(lattice: Any, flambda: Number = 1) -> Lattice:
             scaled = _logical_axis_scalar_operation(
                 frequencies, flambda, np.multiply
             )
+            result = _logical_axis_scalar_operation(
+                scaled, denominator, np.divide
+            )
             output.append(
-                _logical_axis_scalar_operation(
-                    scaled, denominator, np.divide
+                _with_axis_length_kind(
+                    result, getattr(axis, "_length_kind", "int64")
                 )
             )
     return tuple(output)
@@ -126,6 +139,23 @@ def dualPhase(
     """Return the real phase ramp caused by displacement of a lattice origin."""
 
     axes = as_lattice(lattice)
+    if any(
+        np.asarray(axis).dtype.kind == "O"
+        and any(
+            isinstance(value, _MPZ)
+            or (
+                type(value) is int
+                and not np.iinfo(np.int64).min
+                <= value
+                <= np.iinfo(np.int64).max
+            )
+            for value in np.asarray(axis).flat
+        )
+        for axis in axes
+    ):
+        raise TypeError(
+            "Julia dualPhase fails for BigInt lattice ranges in range construction"
+        )
     if len(axes) == 0:
         # Julia reaches the ambiguous zero-argument broadcasted `+()` in this
         # case.  Do not invent a scalar zero-dimensional phase field.
@@ -180,14 +210,54 @@ def _isft_array(value: Any) -> np.ndarray:
 
 
 def _fft_input(value: Any) -> np.ndarray:
-    """Apply FFTW's working Rational-to-Float64 input conversion."""
+    """Validate Julia FFTW domains and convert Rational input to Float64."""
 
-    array = np.asarray(value)
-    if array.dtype.kind == "O" and all(
-        isinstance(item, Fraction) for item in array.flat
+    array = (
+        _julia_literal_array(value)
+        if isinstance(value, list)
+        else np.asarray(value)
+    )
+    if array.dtype.kind == "O":
+        items = tuple(array.flat)
+        if items and all(isinstance(item, Fraction) for item in items):
+            int64 = np.iinfo(np.int64)
+            if not all(
+                int64.min <= item.numerator <= int64.max
+                and 1 <= item.denominator <= int64.max
+                for item in items
+            ):
+                raise TypeError("type BigFloat not supported")
+            return np.asarray(array, dtype=np.float64)
+        if any(
+            _is_bigfloat_input(item)
+            or _is_mpc(item)
+            or isinstance(item, _MPFRComplex)
+            or isinstance(item, (_MPQ, _MPZ))
+            or (
+                type(item) is int
+                and not np.iinfo(np.int64).min
+                <= item
+                <= np.iinfo(np.int64).max
+            )
+            for item in items
+        ):
+            raise TypeError("type BigFloat not supported")
+        # NumPy/pyFFTW would coerce arbitrary object arrays to complex128.
+        # Julia's FFTW dispatch instead rejects arrays without a concrete
+        # supported numeric element type.
+        raise TypeError("object-array element type not supported by FFTW")
+
+    if array.dtype.kind in "bui":
+        return array
+    if array.dtype in (
+        np.dtype(np.float16),
+        np.dtype(np.float32),
+        np.dtype(np.float64),
+        np.dtype(np.complex64),
+        np.dtype(np.complex128),
     ):
-        return np.asarray(array, dtype=np.float64)
-    return array
+        return array
+    raise TypeError(f"type {array.dtype.name} not supported by FFTW")
 
 
 def sft(value: Any) -> Any:
@@ -201,6 +271,8 @@ def sft(value: Any) -> Any:
             dualShiftLattice(value.L, value.flambda),
             value.flambda,
         )
+    if isinstance(value, tuple):
+        raise TypeError("sft requires an array or range, not a tuple")
     return _sft_array(value)
 
 
@@ -215,6 +287,8 @@ def isft(value: Any) -> Any:
             dualShiftLattice(value.L, value.flambda),
             value.flambda,
         )
+    if isinstance(value, tuple):
+        raise TypeError("isft requires an array or range, not a tuple")
     return _isft_array(value)
 
 

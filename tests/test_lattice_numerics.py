@@ -51,13 +51,12 @@ from slmtools.templates import lfBlur, lfCap, lfGaussian, lfParabola, lfRing
 
 
 class ResamplingTests(unittest.TestCase):
-    def test_julia_affine_downsample_example(self):
+    def test_julia_affine_downsample_wrapper_preserves_source_failure(self):
         array = np.arange(1, 17).reshape((4, 4), order="F")
-        np.testing.assert_allclose(
-            downsample(array, 2),
-            np.array([[3.5, 11.5], [5.5, 13.5]]),
-            atol=1e-12,
-        )
+        with self.assertRaisesRegex(
+            NotImplementedError, "does not produce defined values"
+        ):
+            downsample(array, 2)
 
     def test_downsample_and_upsample_lattice_geometry(self):
         lattice = (range(1, 13), range(1, 13))
@@ -73,7 +72,10 @@ class ResamplingTests(unittest.TestCase):
         source = (range(1, 5),)
         target = (np.arange(1.0, 4.01, 0.5),)
         signal = np.array([2.0, 4.0, 6.0, 8.0])
-        np.testing.assert_allclose(upsample(signal, source, target), 2 * target[0])
+        with self.assertRaisesRegex(
+            NotImplementedError, "does not produce defined values"
+        ):
+            upsample(signal, source, target)
 
         spline = cubic_spline_interpolation(
             source, signal, extrapolation_bc=-9.0
@@ -94,6 +96,96 @@ class ResamplingTests(unittest.TestCase):
         )
         with self.assertRaises(IndexError):
             _ = throwing[0.0]
+
+    def test_resampling_preserves_successful_indexing_families(self):
+        source = (range(1, 5),)
+        signal = np.array([2.0, 4.0, 6.0, 8.0])
+        integer_target = (range(2, 4),)
+
+        np.testing.assert_allclose(
+            downsample(signal, source, integer_target), [4.0, 6.0]
+        )
+        np.testing.assert_allclose(
+            upsample(signal, source, integer_target), [4.0, 6.0]
+        )
+
+        field = LF[Generic](signal, source, 2.5)
+        selected = upsample(field, integer_target)
+        np.testing.assert_allclose(selected.data.copy(), [4.0, 6.0])
+        self.assertEqual(selected.flambda, 2.5)
+        np.testing.assert_array_equal(selected.L[0], [2, 3])
+
+        unsigned_target = (
+            LatticeAxis.from_start_step(
+                np.uint64(1), np.uint64(1), np.int64(3)
+            ),
+        )
+        np.testing.assert_allclose(
+            upsample(signal, source, unsigned_target), [2.0, 4.0, 6.0]
+        )
+
+        invalid_unsigned = (
+            LatticeAxis(
+                np.arange(1, 4, dtype=np.uint64),
+                step_hint=np.uint64(1),
+                _range_kind="unit",
+            ),
+        )
+        with self.assertRaisesRegex(
+            NotImplementedError, "does not produce defined values"
+        ):
+            upsample(signal, source, invalid_unsigned)
+
+    def test_resampling_custom_indexing_and_empty_targets_remain_valid(self):
+        source = (range(1, 5),)
+        signal = np.array([2.0, 4.0, 6.0, 8.0])
+        float_target = (
+            LatticeAxis.from_start_step(
+                np.float64(1.0), np.float64(0.5), np.int64(7)
+            ),
+        )
+        captured: dict[str, object] = {}
+
+        class ConstantIndexable:
+            def __getitem__(self, target):
+                return np.full(tuple(map(len, target)), 3.25)
+
+        def custom_factory(ranges, values, *, extrapolation_bc=0):
+            captured["ranges"] = ranges
+            captured["values"] = values
+            captured["boundary"] = extrapolation_bc
+            return ConstantIndexable()
+
+        result = upsample(
+            signal,
+            source,
+            float_target,
+            interpolation=custom_factory,
+            bc=-7.0,
+        )
+        np.testing.assert_array_equal(result, np.full(7, 3.25))
+        self.assertEqual(captured["boundary"], -7.0)
+
+        def callable_only_factory(_ranges, _values, *, extrapolation_bc=0):
+            del extrapolation_bc
+            return lambda *_coordinates: np.zeros(7)
+
+        with self.assertRaises(TypeError):
+            upsample(
+                signal,
+                source,
+                float_target,
+                interpolation=callable_only_factory,
+            )
+
+        empty_target = (
+            LatticeAxis.from_start_step(
+                np.float64(0.5), np.float64(0.5), np.int64(0)
+            ),
+        )
+        empty = upsample(signal, source, empty_target)
+        self.assertEqual(empty.shape, (0,))
+        self.assertEqual(empty.dtype, signal.dtype)
 
     def test_natural_cubic_reproduces_knots_and_is_tensor_product(self):
         x = np.arange(5.0)
@@ -974,6 +1066,49 @@ class DualAndTransformTests(unittest.TestCase):
             ldot(np.asarray([], dtype=np.int64), ())
         with self.assertRaises(TypeError):
             ldot((), ())
+
+    def test_todim_preserves_one_dimensional_range_identity_and_ldot_metadata(self):
+        float16_axis = LatticeAxis.from_start_step(
+            np.float16(0.1), np.float16(0.2), 4
+        )
+        self.assertIs(toDim(float16_axis, 1, 1), float16_axis)
+
+        float16_dot = ldot((np.float16(2),), (float16_axis,))
+        self.assertIsInstance(float16_dot, LatticeAxis)
+        np.testing.assert_array_equal(
+            float16_dot.view(np.uint16),
+            np.asarray([12902, 14541, 15360, 15770], dtype=np.uint16),
+        )
+        self.assertEqual(float16_dot._logical_ref, 0.2)
+        self.assertEqual(float16_dot._logical_step, 0.4)
+        self.assertEqual(float16_dot._logical_offset, 0)
+        self.assertEqual(float16_dot._range_kind, "srl")
+
+        big_start = 10**30
+        big_step = 3 * 10**29
+        big_axis = LatticeAxis(
+            np.asarray(
+                [big_start + index * big_step for index in range(4)],
+                dtype=object,
+            ),
+            step_hint=big_step,
+            _logical_ref=big_start,
+            _logical_step=big_step,
+            _logical_offset=0,
+            _range_kind="ordinal",
+        )
+        self.assertIs(toDim(big_axis, 1, 1), big_axis)
+        self.assertEqual(big_axis._logical_ref, big_start)
+        self.assertEqual(big_axis._logical_step, big_step)
+
+        big_dot = ldot((2,), (big_axis,))
+        self.assertIsInstance(big_dot, LatticeAxis)
+        self.assertEqual(big_dot.dtype, np.dtype(object))
+        self.assertEqual(big_dot._step_hint, 2 * big_step)
+        self.assertEqual(
+            big_dot.tolist(),
+            [2 * (big_start + index * big_step) for index in range(4)],
+        )
 
     def test_nyquist_widens_narrow_integer_steps_before_multiplication(self):
         cases = (

@@ -29,7 +29,7 @@ from decimal import (
     localcontext,
 )
 from fractions import Fraction
-from numbers import Complex, Integral, Real
+from numbers import Complex, Integral, Number, Real
 from typing import Any, Iterator, TypeAlias
 import weakref
 
@@ -38,12 +38,16 @@ import numpy as np
 
 from ._bigfloat import (
     _MPFR,
+    _MPC,
     _MPFRComplex as _DecimalComplex,
+    _MPQ,
+    _MPZ,
     _bigfloat_context,
     _is_bigfloat_input,
     _is_mpfr,
     _mpfr_object_operation,
     _mpfr_pi,
+    _mpfr_rtol,
     _mpfr_sincos,
     _mpfr_sqrt,
     _to_mpfr,
@@ -229,8 +233,23 @@ def _require_dense_ndarray(value: Any, name: str) -> np.ndarray:
     )
 
 
-class FieldVal:
-    """Base class for semantic field-value tags."""
+class _AbstractFieldTagMeta(type):
+    """Keep only Julia's built-in abstract field tags non-instantiable."""
+
+    def __call__(cls, *args: Any, **kwargs: Any) -> Any:
+        if cls in globals().get("_JULIA_ABSTRACT_FIELD_TAGS", ()):
+            raise TypeError(
+                f"{cls.__name__} is an abstract field tag and cannot be "
+                "instantiated"
+            )
+        # Declaring a Python subclass is the counterpart of declaring a
+        # concrete Julia ``struct <: FieldVal``.  Do not inherit the built-in
+        # tags' abstract-instantiation guard into that user-defined class.
+        return super().__call__(*args, **kwargs)
+
+
+class FieldVal(metaclass=_AbstractFieldTagMeta):
+    """Base class for Julia-compatible abstract field-value tags."""
 
 
 class Generic(FieldVal):
@@ -277,6 +296,21 @@ class ComplexAmplitude(Amplitude):
 
 
 ComplexAmp = ComplexAmplitude
+
+
+_JULIA_ABSTRACT_FIELD_TAGS = frozenset(
+    (
+        FieldVal,
+        Generic,
+        Phase,
+        RealPhase,
+        ComplexPhase,
+        Intensity,
+        Amplitude,
+        Modulus,
+        ComplexAmplitude,
+    )
+)
 
 
 def _julia_float_rat(value: Any, dtype: np.dtype[Any]) -> tuple[int, int]:
@@ -991,14 +1025,20 @@ class LatticeAxis(np.ndarray):
         _logical_step: Any | None = None,
         _logical_offset: int | None = None,
         _range_kind: str | None = None,
+        _length_kind: str | None = None,
     ) -> "LatticeAxis":
+        inherited_length_kind = getattr(values, "_length_kind", None)
         array = np.asarray(values)
         if array.ndim != 1:
             raise DimensionMismatch("A lattice axis must be one-dimensional.")
         result = np.array(array, copy=True).view(cls)
         step_is_logical = step_hint is not None
         if step_hint is None and len(result) >= 2:
-            step_hint = result[1] - result[0]
+            step_hint = (
+                np.bool_(True)
+                if result.dtype == np.dtype(np.bool_)
+                else result[1] - result[0]
+            )
         result._step_hint = step_hint
         result._step_hint_is_logical = step_is_logical
         if _logical_ref is not None and _logical_step is not None:
@@ -1038,6 +1078,36 @@ class LatticeAxis(np.ndarray):
             result._logical_step = None
             result._logical_offset = None
             result._range_kind = None
+        if _length_kind is None:
+            _length_kind = inherited_length_kind
+        if _length_kind is None:
+            if result.dtype == np.dtype(np.uint64):
+                _length_kind = "uint64"
+            elif result.dtype.kind == "O" and result.size:
+                int64 = np.iinfo(np.int64)
+                items = tuple(result.flat)
+                if all(
+                    isinstance(item, _MPZ)
+                    or (
+                        type(item) is int
+                        and not int64.min <= item <= int64.max
+                    )
+                    for item in items
+                ) or all(
+                    isinstance(item, _MPQ)
+                    or (
+                        isinstance(item, Fraction)
+                        and (
+                            not int64.min <= item.numerator <= int64.max
+                            or not 1 <= item.denominator <= int64.max
+                        )
+                    )
+                    for item in items
+                ):
+                    _length_kind = "bigint"
+            if _length_kind is None:
+                _length_kind = "int64"
+        result._length_kind = _length_kind
         result.setflags(write=False)
         return result
 
@@ -1125,6 +1195,11 @@ class LatticeAxis(np.ndarray):
                 _logical_step=step_value,
                 _logical_offset=0,
                 _range_kind=range_kind,
+                _length_kind=(
+                    "uint64"
+                    if length_dtype == np.dtype(np.uint64)
+                    else "int64"
+                ),
             )
         dtype = _julia_promote_numeric_dtypes(start_dtype, step_dtype)
         if dtype not in (
@@ -1167,6 +1242,11 @@ class LatticeAxis(np.ndarray):
             _logical_step=logical_step,
             _logical_offset=offset,
             _range_kind=range_kind,
+            _length_kind=(
+                "uint64"
+                if length_dtype == np.dtype(np.uint64)
+                else "int64"
+            ),
         )
 
     def __array_finalize__(self, obj: Any) -> None:
@@ -1176,6 +1256,7 @@ class LatticeAxis(np.ndarray):
         self._logical_step = getattr(obj, "_logical_step", None)
         self._logical_offset = getattr(obj, "_logical_offset", None)
         self._range_kind = getattr(obj, "_range_kind", None)
+        self._length_kind = getattr(obj, "_length_kind", None)
         # ``np.array(axis, copy=True, subok=True)`` bypasses both
         # ``__array_function__`` and ``copy``.  NumPy must keep that fresh
         # destination writable while filling it, so it cannot remain an
@@ -1193,6 +1274,7 @@ class LatticeAxis(np.ndarray):
             self._logical_step = None
             self._logical_offset = None
             self._range_kind = None
+            self._length_kind = None
         # Views inherit the read-only flag from their base.  Fresh ufunc output
         # must remain writable while NumPy fills it; canonicalization through
         # ``_axis`` makes public lattice axes read-only again.
@@ -1212,6 +1294,7 @@ class LatticeAxis(np.ndarray):
             _logical_step=self._logical_step,
             _logical_offset=self._logical_offset,
             _range_kind=self._range_kind,
+            _length_kind=self._length_kind,
         )
 
     def __copy__(self) -> np.ndarray:
@@ -1472,6 +1555,7 @@ class LatticeAxis(np.ndarray):
                     _logical_step=new_step,
                     _logical_offset=output_offset,
                     _range_kind=output_kind,
+                    _length_kind=self._length_kind,
                 )
             hint = self._step_hint
             result._step_hint = None if hint is None else hint * stride
@@ -1514,6 +1598,88 @@ def _is_real_number(value: Any) -> bool:
     )
 
 
+def _is_julia_number(value: Any) -> bool:
+    """Recognize scalar values that can represent a Julia ``Number``."""
+
+    return isinstance(value, (Number, _DecimalComplex))
+
+
+def _logical_object_numeric_key(value: Any) -> type[Any] | None:
+    """Classify one object scalar by its concrete Julia numeric type."""
+
+    if isinstance(value, (Decimal, _MPFR)):
+        return _MPFR
+    if isinstance(value, (_MPC, _DecimalComplex)):
+        return _MPC
+    if isinstance(value, _MPQ):
+        return _MPQ
+    if isinstance(value, _MPZ):
+        return _MPZ
+    if isinstance(value, Fraction):
+        limits = np.iinfo(np.int64)
+        return (
+            Fraction
+            if limits.min <= value.numerator <= limits.max
+            and 1 <= value.denominator <= limits.max
+            else _MPQ
+        )
+    if type(value) is int and not _is_julia_platform_int(value):
+        return _MPZ
+    # Ordinary machine numbers stored behind dtype=object correspond to
+    # ``Array{Any}``, not a concrete ``Array{T<:Number}``.
+    return None
+
+
+def _object_numeric_element_key(value: Any) -> type[Any] | None:
+    """Return the one concrete exact numeric type represented by an array."""
+
+    array = np.asarray(value)
+    if array.dtype.kind != "O" or array.size == 0:
+        return None
+    keys = {_logical_object_numeric_key(item) for item in array.flat}
+    if None in keys or len(keys) != 1:
+        return None
+    return next(iter(keys))
+
+
+def _logical_object_type_matches(
+    value: Any, expected: type[Any]
+) -> bool:
+    """Check a boxed value against a concrete or abstract Julia type."""
+
+    if expected is Number:
+        return _is_julia_number(value)
+    if expected is Real:
+        return _is_real_number(value)
+    if expected is Complex:
+        return isinstance(
+            value,
+            (_MPC, _DecimalComplex, complex, np.complexfloating),
+        )
+    if expected is object:
+        return True
+    return type(value) is expected
+
+
+def _require_julia_numeric_array(value: Any, name: str) -> np.ndarray:
+    """Enforce a public Julia ``AbstractArray{T} where T<:Number`` gate.
+
+    Machine numeric dtypes carry their element type directly.  Object arrays
+    are the port's storage for Rational/BigFloat-like values, so a nonempty
+    homogeneous numeric object array remains valid.  An empty object array has
+    no retained numeric element type and corresponds to ``Array{Any}``.
+    """
+
+    array = np.asarray(value)
+    if array.dtype.kind in "buifc":
+        return array
+    if array.dtype.kind == "O" and array.size and all(
+        _is_julia_number(item) for item in array.flat
+    ):
+        return array
+    raise TypeError(f"{name} requires an array with Julia numeric element type")
+
+
 def _axis(
     values: Any,
     step_hint: Any | None = None,
@@ -1522,6 +1688,7 @@ def _axis(
     _logical_step: Any | None = None,
     _logical_offset: int | None = None,
     _range_kind: str | None = None,
+    _length_kind: str | None = None,
 ) -> LatticeAxis:
     if isinstance(values, LatticeAxis):
         if (
@@ -1531,6 +1698,7 @@ def _axis(
             and _logical_step is None
             and _logical_offset is None
             and _range_kind is None
+            and _length_kind is None
         ):
             return values
         return LatticeAxis(
@@ -1540,6 +1708,7 @@ def _axis(
             _logical_step=_logical_step,
             _logical_offset=_logical_offset,
             _range_kind=_range_kind,
+            _length_kind=_length_kind,
         )
     if isinstance(values, range):
         axis = LatticeAxis.from_start_step(
@@ -1559,6 +1728,7 @@ def _axis(
             _logical_step=axis._logical_step,
             _logical_offset=axis._logical_offset,
             _range_kind="unit",
+            _length_kind=axis._length_kind,
         )
     return LatticeAxis(
         values,
@@ -1567,6 +1737,24 @@ def _axis(
         _logical_step=_logical_step,
         _logical_offset=_logical_offset,
         _range_kind=_range_kind,
+        _length_kind=_length_kind,
+    )
+
+
+def _with_axis_length_kind(axis: Any, length_kind: str) -> LatticeAxis:
+    """Copy one logical range while retaining Julia's ``length`` type."""
+
+    canonical = _axis(axis)
+    if getattr(canonical, "_length_kind", "int64") == length_kind:
+        return canonical
+    return LatticeAxis(
+        np.asarray(canonical),
+        step_hint=canonical._step_hint,
+        _logical_ref=canonical._logical_ref,
+        _logical_step=canonical._logical_step,
+        _logical_offset=canonical._logical_offset,
+        _range_kind=canonical._range_kind,
+        _length_kind=length_kind,
     )
 
 
@@ -1640,9 +1828,9 @@ def _validate_regular_axis(axis: LatticeAxis) -> None:
                     regular = all(
                         actual == expected for actual, expected in pairs
                     )
-            elif values.dtype.kind in "buif":
+            elif values.dtype.kind in "buifc":
                 expected = np.asarray(expected_values, dtype=values.dtype)
-                if values.dtype.kind == "f":
+                if values.dtype.kind in "fc":
                     epsilon = np.finfo(values.dtype).eps
                     scale = max(
                         1.0,
@@ -1653,21 +1841,32 @@ def _validate_regular_axis(axis: LatticeAxis) -> None:
                         if np.any(np.isfinite(expected))
                         else 1.0,
                     )
-                    matching_nonfinite = (
-                        (np.isnan(values) & np.isnan(expected))
-                        | (np.isposinf(values) & np.isposinf(expected))
-                        | (np.isneginf(values) & np.isneginf(expected))
-                    )
-                    with np.errstate(invalid="ignore", over="ignore"):
-                        matching_finite = (
-                            np.isfinite(values)
-                            & np.isfinite(expected)
-                            & (
-                                np.abs(values - expected)
-                                <= 8 * epsilon * scale
-                            )
+                    if values.dtype.kind == "c":
+                        regular = np.allclose(
+                            values,
+                            expected,
+                            rtol=8 * epsilon,
+                            atol=8 * epsilon * scale,
+                            equal_nan=True,
                         )
-                    regular = np.all(matching_nonfinite | matching_finite)
+                    else:
+                        matching_nonfinite = (
+                            (np.isnan(values) & np.isnan(expected))
+                            | (np.isposinf(values) & np.isposinf(expected))
+                            | (np.isneginf(values) & np.isneginf(expected))
+                        )
+                        with np.errstate(invalid="ignore", over="ignore"):
+                            matching_finite = (
+                                np.isfinite(values)
+                                & np.isfinite(expected)
+                                & (
+                                    np.abs(values - expected)
+                                    <= 8 * epsilon * scale
+                                )
+                            )
+                        regular = np.all(
+                            matching_nonfinite | matching_finite
+                        )
                 else:
                     regular = np.array_equal(values, expected)
             else:
@@ -1681,18 +1880,34 @@ def _validate_regular_axis(axis: LatticeAxis) -> None:
         return
     if values.dtype.kind == "O":
         coordinates = values.tolist()
-        if not all(_is_real_number(value) for value in coordinates):
-            raise TypeError("Lattice axes must contain real numeric coordinates.")
-        differences = [
-            right - left
-            for left, right in zip(coordinates[:-1], coordinates[1:], strict=True)
-        ]
+        if not all(_is_julia_number(value) for value in coordinates):
+            raise TypeError("Lattice axes must contain numeric coordinates.")
+        if _object_contains_mpfr(values):
+            with _bigfloat_context():
+                differences = [
+                    right - left
+                    for left, right in zip(
+                        coordinates[:-1], coordinates[1:], strict=True
+                    )
+                ]
+        else:
+            differences = [
+                right - left
+                for left, right in zip(
+                    coordinates[:-1], coordinates[1:], strict=True
+                )
+            ]
         candidate = differences[0]
         if not all(difference == candidate for difference in differences):
             raise ValueError("Lattice axes must be regularly spaced.")
         return
     if values.dtype.kind not in "buifc":
         raise TypeError("Lattice axes must contain numeric coordinates.")
+    if values.dtype == np.dtype(np.bool_):
+        differences = np.diff(values.astype(np.int8))
+        if not np.all(differences == 1):
+            raise ValueError("Lattice axes must be regularly spaced.")
+        return
     differences = np.diff(values)
     candidate = differences[0]
     real_dtype = values.real.dtype
@@ -1736,18 +1951,40 @@ def _julia_scalar_dtype(value: Any) -> np.dtype[Any]:
     if type(value) is int:
         limits = np.iinfo(np.int64)
         if not limits.min <= value <= limits.max:
-            raise OverflowError("Python integer does not fit Julia Int64.")
+            return np.dtype(object)
         return np.dtype(np.int64)
     if type(value) is float:
         return np.dtype(np.float64)
     if type(value) is complex:
         return np.dtype(np.complex128)
-    if isinstance(value, (Fraction, Decimal)):
+    if isinstance(
+        value,
+        (Fraction, Decimal, _MPFR, _MPC, _MPQ, _MPZ, _DecimalComplex),
+    ):
         return np.dtype(object)
     array = np.asarray(value)
     if array.ndim != 0 or array.dtype.kind not in "buifc":
         raise TypeError("Scalar arithmetic requires a numeric scalar.")
     return array.dtype
+
+
+def _julia_asarray(value: Any) -> np.ndarray:
+    """Preserve exact scalar identity that NumPy otherwise narrows.
+
+    In particular, ``np.asarray(gmpy2.mpz(1))`` becomes an ``int64`` scalar.
+    That erases Julia's distinction between ``BigInt`` and ``Int64`` before
+    promotion. Arrays already carry their declared element type, so only
+    scalar adapters need explicit object storage here.
+    """
+
+    if isinstance(
+        value,
+        (Fraction, Decimal, _MPFR, _MPC, _MPQ, _MPZ, _DecimalComplex),
+    ) or (type(value) is int and not _is_julia_platform_int(value)):
+        scalar = np.empty((), dtype=object)
+        scalar[()] = value
+        return scalar
+    return np.asarray(value)
 
 
 def _julia_promote_numeric_dtypes(
@@ -1822,14 +2059,82 @@ def _julia_literal_array(value: Any) -> np.ndarray:
         return source
 
     items = tuple(source.flat)
-    if any(isinstance(item, Decimal) for item in items):
+    if not all(_is_julia_number(item) for item in items):
+        if all(isinstance(item, str) for item in items):
+            return np.asarray(value)
+        if all(isinstance(item, bytes) for item in items):
+            return np.asarray(value)
+        output = np.empty(source.shape, dtype=object)
+        for index in np.ndindex(source.shape):
+            output[index] = source[index]
+        return output
+    has_mpfr_complex = any(
+        isinstance(item, (_MPC, _DecimalComplex)) for item in items
+    )
+    has_machine_complex = any(
+        isinstance(item, (complex, np.complexfloating)) for item in items
+    )
+    has_mpfr = any(isinstance(item, _MPFR) for item in items)
+    has_mpq = any(isinstance(item, _MPQ) for item in items)
+    has_decimal = any(isinstance(item, Decimal) for item in items)
+    has_fraction = any(isinstance(item, Fraction) for item in items)
+    has_mpz = any(isinstance(item, _MPZ) for item in items) or any(
+        type(item) is int and not _is_julia_platform_int(item)
+        for item in items
+    )
+    if has_mpfr_complex or (
+        has_machine_complex
+        and (has_mpfr or has_mpq or has_mpz or has_decimal)
+    ):
+        output = np.empty(source.shape, dtype=object)
+        with _bigfloat_context():
+            for index in np.ndindex(source.shape):
+                item = source[index]
+                if isinstance(item, _MPC):
+                    output[index] = _MPC(
+                        _to_mpfr(item.real), _to_mpfr(item.imag)
+                    )
+                elif isinstance(item, _DecimalComplex):
+                    output[index] = _MPC(item.real, item.imag)
+                elif isinstance(item, (complex, np.complexfloating)):
+                    output[index] = _MPC(
+                        _to_mpfr(item.real), _to_mpfr(item.imag)
+                    )
+                else:
+                    output[index] = _MPC(_to_mpfr(item), _to_mpfr(0))
+        return output
+    if has_mpfr or (has_decimal and (has_mpq or has_mpz)) or (
+        (has_mpq or has_mpz)
+        and any(isinstance(item, (float, np.floating)) for item in items)
+    ):
+        output = np.empty(source.shape, dtype=object)
+        with _bigfloat_context():
+            for index in np.ndindex(source.shape):
+                output[index] = _to_mpfr(source[index])
+        return output
+    if has_mpq or (has_mpz and has_fraction):
+        output = np.empty(source.shape, dtype=object)
+        for index in np.ndindex(source.shape):
+            item = source[index]
+            if isinstance(item, _MPQ):
+                output[index] = item
+            elif isinstance(item, Fraction):
+                output[index] = _MPQ(item.numerator, item.denominator)
+            else:
+                output[index] = _MPQ(item)
+        return output
+    if has_mpz:
+        output = np.empty(source.shape, dtype=object)
+        for index in np.ndindex(source.shape):
+            output[index] = _MPZ(source[index])
+        return output
+    if has_decimal:
         if any(isinstance(item, (complex, np.complexfloating)) for item in items):
             raise TypeError(
                 "Complex{BigFloat}-like literal arrays are not supported."
             )
         return _as_decimal_array(source)
 
-    has_fraction = any(isinstance(item, Fraction) for item in items)
     machine_dtypes: list[np.dtype[Any]] = []
     for item in items:
         if isinstance(item, Fraction):
@@ -1862,10 +2167,134 @@ def _julia_literal_array(value: Any) -> np.ndarray:
     return np.asarray(converted, dtype=promoted)
 
 
+def _julia_field_literal_array(value: list[Any], lattice: Any) -> np.ndarray:
+    """Resolve matrix literals versus composite scalar vector elements."""
+
+    target_shape = tuple(len(axis) for axis in as_lattice(lattice))
+    expanded = np.asarray(value, dtype=object)
+    if expanded.shape == target_shape:
+        return _julia_literal_array(value)
+    if len(target_shape) == 1 and len(value) == target_shape[0]:
+        output = np.empty(len(value), dtype=object)
+        for index, item in enumerate(value):
+            output[index] = item
+        return output
+    return _julia_literal_array(value)
+
+
+def _julia_collect_results(values: Any) -> np.ndarray:
+    """Collect comprehension results without expanding composite scalars.
+
+    Julia stores a tuple, vector, array, or ``nothing`` returned by a callback
+    as one array element.  NumPy instead interprets homogeneous Python
+    sequences as an additional dimension, so explicitly box those values.
+    Numeric scalar results retain Julia literal-promotion behavior.
+    """
+
+    items = tuple(values)
+    must_box = any(
+        item is None or isinstance(item, (list, tuple, np.ndarray))
+        for item in items
+    )
+    if not must_box:
+        try:
+            return _julia_literal_array(items)
+        except (TypeError, ValueError):
+            # Arbitrary callable results form a Julia comprehension with a
+            # widened element type; they are not constrained to Number.
+            must_box = True
+    if must_box:
+        output = np.empty(len(items), dtype=object)
+        for index, item in enumerate(items):
+            output[index] = item
+        return output
+    raise AssertionError("unreachable comprehension collector state")
+
+
+def _julia_collect_comprehension_results(values: Any) -> np.ndarray:
+    """Collect callback results using Julia comprehension type joining.
+
+    Unlike an array literal, a comprehension does not call ``promote`` on
+    heterogeneous runtime result types.  It widens its element type instead,
+    preserving values such as ``Int64(1)`` and ``Float64(2.5)`` side by side.
+    Homogeneous numeric results still materialize with their concrete dtype.
+    """
+
+    items = tuple(values)
+    if not items:
+        return np.empty(0, dtype=object)
+    if any(
+        item is None or isinstance(item, (list, tuple, np.ndarray))
+        for item in items
+    ):
+        output = np.empty(len(items), dtype=object)
+        for index, item in enumerate(items):
+            output[index] = item
+        return output
+    def result_type_key(item: Any) -> Any:
+        if type(item) is bool or isinstance(item, np.bool_):
+            return np.dtype(np.bool_)
+        if type(item) is int:
+            return (
+                np.dtype(np.int64)
+                if _is_julia_platform_int(item)
+                else _MPZ
+            )
+        if type(item) is float:
+            return np.dtype(np.float64)
+        if type(item) is complex:
+            return np.dtype(np.complex128)
+        if isinstance(item, np.generic):
+            return item.dtype
+        return type(item)
+
+    if len({result_type_key(item) for item in items}) != 1:
+        output = np.empty(len(items), dtype=object)
+        for index, item in enumerate(items):
+            output[index] = item
+        return output
+    try:
+        return _julia_literal_array(items)
+    except (TypeError, ValueError):
+        output = np.empty(len(items), dtype=object)
+        for index, item in enumerate(items):
+            output[index] = item
+        return output
+
+
+def _julia_fill(value: Any, shape: tuple[int, ...]) -> np.ndarray:
+    """Create Julia ``fill(value, shape)`` storage without broadcasting it.
+
+    A Julia vector, tuple, or other object is a scalar cell value here.  NumPy
+    normally broadcasts list/tuple/array inputs across the destination, so
+    object-like and non-scalar inputs must be assigned cell by cell.  Mutable
+    values intentionally retain Julia ``fill`` aliasing semantics.
+    """
+
+    if type(value) is int and not _is_julia_platform_int(value):
+        value = _MPZ(value)
+    scalar = np.asarray(value)
+    object_scalar = isinstance(
+        value,
+        (Fraction, Decimal, _MPFR, _MPC, _MPQ, _MPZ, _DecimalComplex),
+    ) or (type(value) is int and not _is_julia_platform_int(value))
+    if (
+        isinstance(value, np.ndarray)
+        or scalar.ndim != 0
+        or scalar.dtype.kind == "O"
+        or object_scalar
+    ):
+        output = np.empty(shape, dtype=object)
+        for index in np.ndindex(shape):
+            output[index] = value
+        return output
+    return np.full(shape, value, dtype=scalar.dtype)
+
+
 def _julia_sum_widened(value: Any) -> np.ndarray:
     """Apply Base.add_sum's scalar accumulator widening."""
 
-    array = np.asarray(value)
+    array = _julia_asarray(value)
     if array.dtype.kind == "b":
         return array.astype(np.int64)
     if array.dtype.kind == "i" and array.dtype.itemsize < 8:
@@ -1873,6 +2302,29 @@ def _julia_sum_widened(value: Any) -> np.ndarray:
     if array.dtype.kind == "u" and array.dtype.itemsize < 8:
         return array.astype(np.uint64)
     return array
+
+
+def _julia_typed_zero(value: Any) -> Any:
+    """Construct ``zero(typeof(value))`` in the represented numeric context."""
+
+    if isinstance(value, _MPFR):
+        return _to_mpfr(0)
+    if isinstance(value, _MPC):
+        with _bigfloat_context():
+            return _MPC(_to_mpfr(0), _to_mpfr(0))
+    if isinstance(value, _DecimalComplex):
+        return _DecimalComplex(0, 0)
+    if isinstance(value, Decimal):
+        return Decimal(0)
+    if isinstance(value, Fraction):
+        return Fraction(0, 1)
+    if isinstance(value, _MPQ):
+        return _MPQ(0)
+    if isinstance(value, _MPZ) or (
+        type(value) is int and not _is_julia_platform_int(value)
+    ):
+        return _MPZ(0)
+    return type(value)(0)
 
 
 def _julia_float_vector_reduce(
@@ -1913,14 +2365,8 @@ def _julia_sum_zero(array: np.ndarray) -> Any:
         return _julia_sum_widened(zero).reshape(())[()]
     if array.size:
         sample = array.ravel(order="F")[0]
-        if isinstance(sample, _DecimalComplex):
-            return _DecimalComplex(Decimal(0), Decimal(0))
-        if isinstance(sample, Decimal):
-            return Decimal(0)
-        if isinstance(sample, Fraction):
-            return Fraction(0, 1)
         try:
-            return type(sample)(0)
+            return _julia_typed_zero(sample)
         except (TypeError, ValueError):
             pass
     # Python object arrays do not retain their concrete Julia element type
@@ -1933,7 +2379,7 @@ def _julia_accumulate_value(left: Any, right: Any) -> Any:
     """Apply Julia's checked/nontrapping ``add_sum`` scalar operation."""
 
     result = _julia_array_array_operation(
-        np.asarray(left), np.asarray(right), np.add
+        left, right, np.add
     )
     return (
         result.reshape(())[()]
@@ -1979,6 +2425,9 @@ def _julia_abs(values: Any) -> np.ndarray:
     """Elementwise ``abs`` using Julia's complex ``hypot`` kernels."""
 
     array = np.asarray(values)
+    if array.dtype.kind == "O" and _object_contains_mpfr(array):
+        with _bigfloat_context():
+            return np.asarray(np.abs(array), dtype=object)
     if array.dtype.kind != "c":
         return np.asarray(np.abs(array))
     component_dtype = array.real.dtype
@@ -2299,7 +2748,7 @@ def _julia_sum_sequence(
             top_level=False,
         )
         combined = _julia_array_array_operation(
-            np.asarray(left), np.asarray(right), np.add
+            left, right, np.add
         )
         return (
             combined.reshape(())[()]
@@ -2696,8 +3145,18 @@ def _julia_array_scalar_operation(
 ) -> np.ndarray:
     """Apply an array/scalar operation with Julia rather than NumPy promotion."""
 
-    values = np.asarray(array)
-    scalar_array = np.asarray(scalar)
+    values = _julia_asarray(array)
+    scalar_array = _julia_asarray(scalar)
+    if _object_contains_gmp(values) or _object_contains_gmp(scalar_array):
+        converted_values = values.astype(object, copy=False)
+        converted_scalar = scalar_array.reshape(())[()]
+        if reflected:
+            return _mpfr_object_operation(
+                operation, converted_scalar, converted_values
+            )
+        return _mpfr_object_operation(
+            operation, converted_values, converted_scalar
+        )
     if (
         values.dtype.kind == "O"
         and values.size > 0
@@ -2818,12 +3277,35 @@ def _logical_axis_scalar_operation(
     logical_step = getattr(canonical, "_logical_step", None)
     offset = getattr(canonical, "_logical_offset", None)
     range_kind = getattr(canonical, "_range_kind", None)
-    scalar_array = np.asarray(scalar)
+    length_kind = getattr(canonical, "_length_kind", "int64")
+    scalar_array = _julia_asarray(scalar)
+    exact_range_scalar = isinstance(
+        scalar,
+        (Decimal, _MPFR, _MPQ, _MPZ),
+    ) or (
+        type(scalar) is int and not _is_julia_platform_int(scalar)
+    ) or (
+        isinstance(scalar, Fraction)
+        and (
+            not _is_julia_platform_int(scalar.numerator)
+            or not _is_julia_platform_int(scalar.denominator)
+        )
+    )
+    if (
+        operation is np.multiply
+        and range_kind == "tp"
+        and exact_range_scalar
+    ):
+        raise TypeError(
+            "Julia 1.11 cannot multiply this Float64 StepRangeLen by an "
+            "arbitrary-precision scalar"
+        )
     if (
         reference is None
         or logical_step is None
         or offset is None
         or range_kind is None
+        or canonical.dtype.kind == "O"
         or scalar_array.ndim != 0
         or scalar_array.dtype.kind not in "buif"
         or operation not in (np.add, np.subtract, np.multiply, np.divide)
@@ -2835,18 +3317,38 @@ def _logical_axis_scalar_operation(
         if old_step is None:
             new_step = None
         elif operation in (np.add, np.subtract):
-            new_step = -old_step if reflected and operation is np.subtract else old_step
+            # A range translation leaves the numerical step unchanged, but
+            # Julia still promotes its *type* with the translation scalar.
+            # This is observable for BigInt ranges shifted by BigFloat.
+            promoted_step = _julia_array_array_operation(
+                _julia_asarray(old_step),
+                _julia_asarray(_julia_typed_zero(scalar)),
+                np.add,
+            ).reshape(())[()]
+            new_step = (
+                _julia_array_scalar_operation(
+                    _julia_asarray(promoted_step),
+                    np.int64(-1),
+                    np.multiply,
+                ).reshape(())[()]
+                if reflected and operation is np.subtract
+                else promoted_step
+            )
         elif operation is np.multiply:
             new_step = _julia_array_scalar_operation(
-                np.asarray(old_step), scalar, np.multiply
+                _julia_asarray(old_step), scalar, np.multiply
             ).reshape(())[()]
         elif reflected:
             new_step = None
         else:
             new_step = _julia_array_scalar_operation(
-                np.asarray(old_step), scalar, np.divide
+                _julia_asarray(old_step), scalar, np.divide
             ).reshape(())[()]
-        return _axis(values, step_hint=new_step)
+        return _axis(
+            values,
+            step_hint=new_step,
+            _length_kind=length_kind,
+        )
 
     scalar_dtype = _julia_scalar_dtype(scalar)
     result_dtype = _julia_promote_numeric_dtypes(
@@ -2861,7 +3363,7 @@ def _logical_axis_scalar_operation(
         values = _julia_array_scalar_operation(
             np.asarray(canonical), scalar, operation, reflected=True
         )
-        return _axis(values)
+        return _axis(values, _length_kind=length_kind)
 
     if range_kind in ("ordinal", "unit"):
         is_integer_scalar = scalar_array.dtype.kind in "bui"
@@ -2917,8 +3419,17 @@ def _logical_axis_scalar_operation(
                     _logical_step=generated._logical_step,
                     _logical_offset=generated._logical_offset,
                     _range_kind="unit",
+                    _length_kind=length_kind,
                 )
-            return generated
+            return LatticeAxis(
+                np.asarray(generated),
+                step_hint=generated._step_hint,
+                _logical_ref=generated._logical_ref,
+                _logical_step=generated._logical_step,
+                _logical_offset=generated._logical_offset,
+                _range_kind=generated._range_kind,
+                _length_kind=length_kind,
+            )
         elif (
             operation in (np.add, np.subtract)
             and range_kind == "unit"
@@ -3027,8 +3538,17 @@ def _logical_axis_scalar_operation(
                     _logical_step=generated._logical_step,
                     _logical_offset=generated._logical_offset,
                     _range_kind="srl",
+                    _length_kind=length_kind,
                 )
-            return generated
+            return LatticeAxis(
+                np.asarray(generated),
+                step_hint=generated._step_hint,
+                _logical_ref=generated._logical_ref,
+                _logical_step=generated._logical_step,
+                _logical_offset=generated._logical_offset,
+                _range_kind=generated._range_kind,
+                _length_kind=length_kind,
+            )
     elif range_kind == "tp":
         assert isinstance(reference, _TwicePrecision)
         assert isinstance(logical_step, _TwicePrecision)
@@ -3137,6 +3657,7 @@ def _logical_axis_scalar_operation(
         _logical_step=new_step,
         _logical_offset=int(offset),
         _range_kind=new_kind,
+        _length_kind=length_kind,
     )
 
 
@@ -3157,6 +3678,29 @@ def _object_contains_decimal(value: Any) -> bool:
 def _object_contains_decimal_complex(value: Any) -> bool:
     array = np.asarray(value, dtype=object)
     return any(isinstance(item, _DecimalComplex) for item in array.flat)
+
+
+def _object_contains_mpfr(value: Any) -> bool:
+    """Whether an object container participates in Julia BigFloat arithmetic."""
+
+    array = np.asarray(value, dtype=object)
+    return any(
+        isinstance(item, (_MPFR, _MPC, _DecimalComplex))
+        for item in array.flat
+    )
+
+
+def _object_contains_gmp(value: Any) -> bool:
+    """Whether object arithmetic must run in Julia's 256-bit MPFR context."""
+
+    array = np.asarray(value)
+    if array.dtype.kind != "O":
+        return False
+    return any(
+        isinstance(item, (_MPFR, _MPC, _MPQ, _MPZ, _DecimalComplex))
+        or (type(item) is int and not _is_julia_platform_int(item))
+        for item in array.flat
+    )
 
 
 _INT64_MIN = int(np.iinfo(np.int64).min)
@@ -3315,8 +3859,16 @@ def _julia_array_array_operation(
     while Julia performs wrapping UInt64 arithmetic.
     """
 
-    first = np.asarray(left)
-    second = np.asarray(right)
+    first = _julia_asarray(left)
+    second = _julia_asarray(right)
+    if _object_contains_gmp(first) or _object_contains_gmp(second):
+        if operation is np.matmul:
+            return _mpfr_object_operation(operation, first, second)
+        first, second = np.broadcast_arrays(
+            first.astype(object, copy=False),
+            second.astype(object, copy=False),
+        )
+        return _mpfr_object_operation(operation, first, second)
     if _object_contains_decimal_complex(first) or _object_contains_decimal_complex(
         second
     ):
@@ -3414,7 +3966,19 @@ def _exact_real_to_machine_float(value: Any, dtype: Any) -> Any:
     if destination.kind != "f":
         raise TypeError("destination must be a machine floating dtype")
 
-    if isinstance(value, Decimal):
+    if isinstance(value, _MPFR):
+        if gmpy2.is_nan(value):
+            return np.asarray(math.nan, dtype=destination)[()]
+        if gmpy2.is_infinite(value):
+            infinity = -math.inf if value < 0 else math.inf
+            return np.asarray(infinity, dtype=destination)[()]
+        numerator, denominator = value.as_integer_ratio()
+        exact = Fraction(int(numerator), int(denominator))
+    elif isinstance(value, _MPQ):
+        exact = Fraction(int(value.numerator), int(value.denominator))
+    elif isinstance(value, _MPZ):
+        exact = Fraction(int(value), 1)
+    elif isinstance(value, Decimal):
         if value.is_nan():
             return np.asarray(math.nan, dtype=destination)[()]
         if value.is_infinite():
@@ -3495,7 +4059,15 @@ def _object_destination_element_type(array: np.ndarray | None) -> type[Any] | No
     if len(types) != 1:
         return None
     element_type = next(iter(types))
-    if element_type in (Fraction, Decimal, _DecimalComplex):
+    if element_type in (
+        Fraction,
+        Decimal,
+        _MPFR,
+        _MPC,
+        _MPQ,
+        _MPZ,
+        _DecimalComplex,
+    ):
         return element_type
     return None
 
@@ -3535,6 +4107,8 @@ def _julia_assignment_values(array: Any, dtype: Any) -> np.ndarray:
 
         def numeric_parts(value: Any) -> tuple[Any, Any]:
             if isinstance(value, _DecimalComplex):
+                return value.real, value.imag
+            if isinstance(value, _MPC):
                 return value.real, value.imag
             if isinstance(value, Decimal):
                 return value, Decimal(0)
@@ -3589,6 +4163,40 @@ def _julia_assignment_values(array: Any, dtype: Any) -> np.ndarray:
                 converted_object[index] = result
                 continue
 
+            if concrete_object_type is _MPQ:
+                if imaginary_value != 0:
+                    raise ValueError(
+                        "Inexact assignment to Rational{BigInt}: complex "
+                        "values have nonzero imaginary parts."
+                    )
+                try:
+                    if isinstance(real_value, Fraction):
+                        converted_object[index] = _MPQ(
+                            real_value.numerator, real_value.denominator
+                        )
+                    else:
+                        converted_object[index] = _MPQ(real_value)
+                except (ArithmeticError, TypeError, ValueError, OverflowError) as error:
+                    raise ValueError(
+                        "Inexact assignment to Rational{BigInt}."
+                    ) from error
+                continue
+
+            if concrete_object_type is _MPZ:
+                if imaginary_value != 0:
+                    raise ValueError(
+                        "Inexact assignment to BigInt: complex values have "
+                        "nonzero imaginary parts."
+                    )
+                try:
+                    converted_integer = _MPZ(real_value)
+                    if converted_integer != real_value:
+                        raise ValueError
+                    converted_object[index] = converted_integer
+                except (ArithmeticError, TypeError, ValueError, OverflowError) as error:
+                    raise ValueError("Inexact assignment to BigInt.") from error
+                continue
+
             if concrete_object_type is Decimal:
                 if imaginary_value != 0:
                     raise ValueError(
@@ -3600,6 +4208,31 @@ def _julia_assignment_values(array: Any, dtype: Any) -> np.ndarray:
                 except (ArithmeticError, TypeError, ValueError, OverflowError) as error:
                     raise ValueError(
                         "Inexact assignment to BigFloat-like storage."
+                    ) from error
+                continue
+
+            if concrete_object_type is _MPFR:
+                if imaginary_value != 0:
+                    raise ValueError(
+                        "Inexact assignment to BigFloat: complex values have "
+                        "nonzero imaginary parts."
+                    )
+                try:
+                    with _bigfloat_context():
+                        converted_object[index] = _to_mpfr(real_value)
+                except (ArithmeticError, TypeError, ValueError, OverflowError) as error:
+                    raise ValueError("Inexact assignment to BigFloat.") from error
+                continue
+
+            if concrete_object_type is _MPC:
+                try:
+                    with _bigfloat_context():
+                        converted_object[index] = _MPC(
+                            _to_mpfr(real_value), _to_mpfr(imaginary_value)
+                        )
+                except (ArithmeticError, TypeError, ValueError, OverflowError) as error:
+                    raise ValueError(
+                        "Inexact assignment to Complex{BigFloat}."
                     ) from error
                 continue
 
@@ -3765,6 +4398,9 @@ def _julia_assignment_values(array: Any, dtype: Any) -> np.ndarray:
 def _julia_rtol(*arrays: Any) -> Any:
     tolerances: list[Any] = []
     for item in arrays:
+        if _object_contains_mpfr(item):
+            tolerances.append(_mpfr_rtol())
+            continue
         if _object_contains_decimal(item):
             tolerances.append(_decimal_rtol())
             continue
@@ -3784,6 +4420,8 @@ def _isapprox_array(left: Any, right: Any) -> bool:
     b = np.asarray(right)
     if a.shape != b.shape:
         return False
+    if a is b or np.array_equal(a, b):
+        return True
     if a.dtype.kind == "O" or b.dtype.kind == "O":
         tolerance = _julia_rtol(a, b)
         if isinstance(tolerance, Decimal):
@@ -3840,11 +4478,25 @@ def _isapprox_array(left: Any, right: Any) -> bool:
         difference_values = _julia_array_array_operation(
             a, b, np.subtract
         )
-        difference = float(np.linalg.norm(difference_values))
+        norm_values = difference_values
+        if norm_values.dtype.kind in "fc" and norm_values.dtype.itemsize < 8:
+            norm_values = norm_values.astype(
+                np.complex128 if norm_values.dtype.kind == "c" else np.float64
+            )
+        difference = float(np.linalg.norm(norm_values))
         if np.isfinite(difference):
             if tolerance == 0:
                 return difference <= 0
-            scale = max(float(np.linalg.norm(a)), float(np.linalg.norm(b)))
+            norm_a = a
+            norm_b = b
+            if a.dtype.kind in "fc" and a.dtype.itemsize < 8:
+                widened = np.complex128 if a.dtype.kind == "c" else np.float64
+                norm_a = a.astype(widened)
+                norm_b = b.astype(widened)
+            scale = max(
+                float(np.linalg.norm(norm_a)),
+                float(np.linalg.norm(norm_b)),
+            )
             return difference <= tolerance * scale
         return all(
             _isapprox_scalar(x, y, rtol=tolerance)
@@ -3948,12 +4600,46 @@ class _FullTypedConstructor:
     def __init__(self, tag: type[FieldVal], dtype: Any, ndim: Any):
         if not _is_field_tag(tag):
             raise TypeError("The first LatticeField parameter must be a FieldVal tag.")
-        try:
-            self.dtype = np.dtype(dtype)
-        except TypeError as error:
-            raise TypeError("The second LatticeField parameter must be a dtype.") from error
-        if not isinstance(ndim, (int, np.integer)):
-            raise TypeError("The third LatticeField parameter must be an integer.")
+        if dtype is None:
+            # ``nothing`` may appear syntactically as Julia's unconstrained T
+            # parameter, but no ``AbstractArray{nothing}`` can satisfy the
+            # full constructor. NumPy instead treats ``dtype=None`` as
+            # Float64, which would invent a successful typed constructor.
+            raise TypeError("The second LatticeField parameter must be a dtype.")
+        exact_object_types = (
+            Fraction,
+            Decimal,
+            _MPFR,
+            _MPC,
+            _MPQ,
+            _MPZ,
+            _DecimalComplex,
+        )
+        python_machine_types = (bool, int, float, complex)
+        arbitrary_python_type = (
+            isinstance(dtype, type)
+            and dtype not in python_machine_types
+            and not issubclass(dtype, np.generic)
+            and dtype is not object
+        )
+        self.logical_object_type = (
+            dtype
+            if dtype in exact_object_types or arbitrary_python_type
+            else None
+        )
+        if self.logical_object_type is not None:
+            self.dtype = np.dtype(object)
+        else:
+            try:
+                self.dtype = np.dtype(dtype)
+            except TypeError as error:
+                raise TypeError(
+                    "The second LatticeField parameter must be a dtype."
+                ) from error
+        if not _is_julia_platform_int(ndim):
+            raise TypeError(
+                "The third LatticeField parameter must be a Julia platform Int."
+            )
         self.ndim = int(ndim)
         if self.ndim < 0:
             raise ValueError("LatticeField dimensionality must be nonnegative.")
@@ -3965,16 +4651,37 @@ class _FullTypedConstructor:
         lattice: Any,
         flambda: Real = 1.0,
     ) -> "LatticeField":
-        array = (
-            data
-            if isinstance(data, _CheckedFieldArray)
-            else np.asarray(data)
-        )
+        if isinstance(data, _CheckedFieldArray):
+            array = data
+        elif isinstance(data, list):
+            array = _julia_field_literal_array(data, lattice)
+        elif isinstance(data, np.ndarray):
+            array = data
+        else:
+            raise TypeError(
+                "Full typed LatticeField data must be an array or list literal."
+            )
+        if self.logical_object_type is not None and array.ndim == self.ndim:
+            boxed = np.empty(array.shape, dtype=object)
+            for index in np.ndindex(array.shape):
+                value = array[index]
+                boxed[index] = value.item() if isinstance(value, np.generic) else value
+            array = boxed
         if array.dtype != self.dtype or array.ndim != self.ndim:
             raise TypeError(
                 "Full typed LatticeField constructor requires data with exact "
                 f"dtype {self.dtype} and ndim {self.ndim}; got {array.dtype} "
                 f"and ndim {array.ndim}."
+            )
+        if self.logical_object_type is not None and any(
+            not _logical_object_type_matches(
+                value, self.logical_object_type
+            )
+            for value in array.flat
+        ):
+            raise TypeError(
+                "Full typed LatticeField constructor requires exact object "
+                f"elements of type {self.logical_object_type.__name__}."
             )
         return LatticeField._from_full(
             array,
@@ -3982,6 +4689,7 @@ class _FullTypedConstructor:
             flambda,
             self.tag,
             expected_dtype=self.dtype,
+            expected_object_type=self.logical_object_type,
         )
 
 
@@ -5322,6 +6030,7 @@ class LatticeField:
         "L",
         "flambda",
         "field_type",
+        "_logical_object_type",
         "_frozen",
     )
 
@@ -5333,6 +6042,7 @@ class LatticeField:
             "L",
             "flambda",
             "field_type",
+            "_logical_object_type",
         }:
             if (
                 name == "data"
@@ -5360,11 +6070,16 @@ class LatticeField:
             raise TypeError("field_type must be a FieldVal subclass.")
         if not _is_real_number(flambda):
             raise TypeError("flambda must be real.")
-        array = (
-            data
-            if isinstance(data, _CheckedFieldArray)
-            else np.asarray(data)
-        )
+        if isinstance(data, _CheckedFieldArray):
+            array = data
+        elif isinstance(data, list):
+            array = _julia_field_literal_array(data, lattice)
+        elif isinstance(data, np.ndarray):
+            array = data
+        else:
+            raise TypeError(
+                "LatticeField data must be an array or list literal."
+            )
         axes = as_lattice(lattice)
         if field_type is Intensity:
             # Deliberately allocate, matching Julia's broadcast constructor.
@@ -5383,7 +6098,7 @@ class LatticeField:
                     if isinstance(value, Decimal) and value.is_nan():
                         continue
                     if value < 0:
-                        array[index] = type(value)(0)
+                        array[index] = _julia_typed_zero(value)
             else:
                 array = np.where(array < 0, np.zeros((), dtype=array.dtype), array)
         elif field_type is ComplexAmplitude:
@@ -5401,6 +6116,7 @@ class LatticeField:
         field_type: type[FieldVal],
         *,
         expected_dtype: np.dtype[Any] | None = None,
+        expected_object_type: type[Any] | None = None,
     ) -> "LatticeField":
         if not _is_real_number(flambda):
             raise TypeError("flambda must be real.")
@@ -5414,8 +6130,22 @@ class LatticeField:
                 "Operation changed the element dtype; Julia's typed constructor "
                 f"requires {np.dtype(expected_dtype)}, got {array.dtype}."
             )
+        if expected_object_type is not None and any(
+            not _logical_object_type_matches(value, expected_object_type)
+            for value in array.flat
+        ):
+            raise TypeError(
+                "Operation changed the logical object element type; Julia's "
+                f"typed constructor requires {expected_object_type.__name__}."
+            )
         result = cls.__new__(cls)
-        result._initialize(array, as_lattice(lattice), flambda, field_type)
+        result._initialize(
+            array,
+            as_lattice(lattice),
+            flambda,
+            field_type,
+            logical_object_type=expected_object_type,
+        )
         return result
 
     def _initialize(
@@ -5424,9 +6154,23 @@ class LatticeField:
         lattice: Lattice,
         flambda: Real,
         field_type: type[FieldVal],
+        *,
+        logical_object_type: type[Any] | None = None,
     ) -> None:
         object.__setattr__(self, "_frozen", False)
-        if data.ndim != len(lattice) or data.shape != tuple(map(len, lattice)):
+        # Julia's inner constructor compares ``size(data) !== length.(L)``.
+        # The identity comparison makes otherwise matching BigInt, UInt64,
+        # Int128, and Rational{BigInt} endpoint ranges fail because their
+        # ``length`` result is not the platform ``Int64`` used by ``size``.
+        nonplatform_length = any(
+            getattr(axis, "_length_kind", "int64") != "int64"
+            for axis in lattice
+        )
+        if (
+            nonplatform_length
+            or data.ndim != len(lattice)
+            or data.shape != tuple(map(len, lattice))
+        ):
             raise DimensionMismatch("Field data size does not match lattice size.")
         if isinstance(data, _CheckedFieldArray):
             # Julia's field constructor stores an existing Array by
@@ -5442,11 +6186,20 @@ class LatticeField:
             # defensive copy.
             storage = np.asarray(data)
             state = _FieldStorageState(storage)
+        if (
+            logical_object_type is None
+            and storage.dtype.kind == "O"
+            and storage.size
+        ):
+            element_types = {type(value) for value in storage.flat}
+            if len(element_types) == 1:
+                logical_object_type = element_types.pop()
         object.__setattr__(self, "_data", storage)
         object.__setattr__(self, "_storage_state", state)
         self.L = lattice
         self.flambda = flambda
         self.field_type = field_type
+        object.__setattr__(self, "_logical_object_type", logical_object_type)
         object.__setattr__(self, "_frozen", True)
 
     @property
@@ -5605,6 +6358,7 @@ class LatticeField:
             self.flambda,
             self.field_type,
             expected_dtype=self.data.dtype,
+            expected_object_type=self._logical_object_type,
         )
 
     def __setitem__(self, key: Any, value: Any) -> None:
@@ -5677,6 +6431,7 @@ class LatticeField:
             self.flambda,
             self.field_type,
             expected_dtype=self.data.dtype,
+            expected_object_type=self._logical_object_type,
         )
 
     @staticmethod
@@ -5695,7 +6450,14 @@ class LatticeField:
         if not self._is_scalar(other):
             return NotImplemented
         scalar_dtype = _julia_scalar_dtype(other)
-        if scalar_dtype.kind == "c" and self.data.dtype.kind != "c":
+        logical_complex = (
+            self.data.dtype.kind == "c"
+            or self._logical_object_type in (_MPC, _DecimalComplex)
+        )
+        scalar_complex = scalar_dtype.kind == "c" or isinstance(
+            other, (_MPC, _DecimalComplex)
+        )
+        if scalar_complex and not logical_complex:
             return NotImplemented
         result = _julia_array_scalar_operation(
             self.data, other, operation, reflected=reflected
@@ -5710,11 +6472,13 @@ class LatticeField:
         if self.field_type not in (Intensity, ComplexAmplitude):
             raise TypeError("Behavior undefined for this combination of inputs.")
         values = np.asarray(self.data)
-        positive = (
-            values.astype(np.int64)
-            if values.dtype == np.dtype(np.bool_)
-            else +values
-        )
+        if values.dtype == np.dtype(np.bool_):
+            positive = values.astype(np.int64)
+        elif self.field_type is Intensity and _object_contains_mpfr(values):
+            with _bigfloat_context():
+                positive = np.asarray(np.positive(values), dtype=object)
+        else:
+            positive = +values
         return LatticeField[self.field_type](positive, self.L, self.flambda)
 
     def __mul__(self, other: Any) -> Any:
@@ -5767,6 +6531,29 @@ class LatticeField:
             # ``sqrt(::Integer)`` is Float64 throughout Julia Base. NumPy
             # instead selects Float16/Float32 for narrow integer arrays.
             rooted = np.sqrt(values.astype(np.float64))
+        elif values.dtype.kind == "O" and (
+            _object_contains_mpfr(values)
+            or all(
+                isinstance(value, (_MPQ, _MPZ))
+                or (
+                    type(value) is int
+                    and not _is_julia_platform_int(value)
+                )
+                for value in values.flat
+            )
+        ):
+            rooted = np.empty(values.shape, dtype=object)
+            with _bigfloat_context():
+                for index in np.ndindex(values.shape):
+                    item = values[index]
+                    if isinstance(item, _MPC):
+                        rooted[index] = gmpy2.sqrt(item)
+                    elif isinstance(item, _DecimalComplex):
+                        rooted[index] = gmpy2.sqrt(
+                            _MPC(item.real, item.imag)
+                        )
+                    else:
+                        rooted[index] = gmpy2.sqrt(_to_mpfr(item))
         else:
             rooted = np.sqrt(values)
         return LatticeField[Modulus](rooted, self.L, self.flambda)
@@ -5784,13 +6571,26 @@ class LatticeField:
                     conjugated[index] = _fraction_int64_negate(values[index])
             else:
                 with np.errstate(over="ignore", invalid="ignore"):
-                    conjugated = -values
+                    if _object_contains_mpfr(values):
+                        with _bigfloat_context():
+                            conjugated = np.asarray(
+                                np.negative(values), dtype=object
+                            )
+                    else:
+                        conjugated = -values
             return LatticeField[RealPhase](
                 conjugated, self.L, self.flambda
             )
         if self.field_type is ComplexPhase:
+            if _object_contains_mpfr(self.data):
+                with _bigfloat_context():
+                    conjugated = np.asarray(
+                        np.conjugate(self.data), dtype=object
+                    )
+            else:
+                conjugated = np.conjugate(self.data)
             return LatticeField[ComplexPhase](
-                np.conjugate(self.data), self.L, self.flambda
+                conjugated, self.L, self.flambda
             )
         raise TypeError("Conjugation is only defined for phase fields.")
 
@@ -5838,9 +6638,17 @@ LF = LatticeField
 
 
 def _multiply_fields(left: LatticeField, right: LatticeField) -> LatticeField:
-    elq(left, right)
     ls = left.field_type
     rs = right.field_type
+    supported = (
+        (issubclass(ls, Amplitude) and rs in (ComplexPhase, RealPhase))
+        or (ls in (ComplexPhase, RealPhase) and issubclass(rs, Amplitude))
+        or (ls is ComplexPhase and rs in (ComplexPhase, RealPhase))
+        or (ls is RealPhase and rs is ComplexPhase)
+    )
+    if not supported:
+        raise TypeError("Behavior undefined for this combination of inputs.")
+    elq(left, right)
     if issubclass(ls, Amplitude) and rs is ComplexPhase:
         return LatticeField[ComplexAmplitude](
             _julia_array_array_operation(
@@ -6081,19 +6889,23 @@ def _real_phase_phasors(data: Any) -> np.ndarray:
         # samples promotes those samples to Float64 before ``exp``.
         values = np.asarray(values, dtype=np.float64)
     elif values.dtype.kind == "O" and all(
-        isinstance(value, Decimal) for value in values.flat
+        isinstance(value, (Decimal, _MPFR, _MPQ, _MPZ))
+        or (type(value) is int and not _is_julia_platform_int(value))
+        for value in values.flat
     ):
         output = np.empty(values.shape, dtype=object)
         # Julia's ``2pi`` token is Float64. Multiplication promotes that exact
         # binary64 value to BigFloat before applying the high-precision exp.
-        factor = Decimal.from_float(float(2 * np.pi))
-        for index in np.ndindex(values.shape):
-            if not values[index].is_finite():
-                nan = Decimal("NaN")
-                output[index] = _DecimalComplex(nan, nan)
-            else:
-                sine, cosine = _decimal_sincos(factor * values[index])
-                output[index] = _DecimalComplex(cosine, sine)
+        with _bigfloat_context():
+            factor = _to_mpfr(float(2 * np.pi))
+            for index in np.ndindex(values.shape):
+                phase = _to_mpfr(values[index])
+                if not gmpy2.is_finite(phase):
+                    nan = _MPFR("nan")
+                    output[index] = _DecimalComplex(nan, nan)
+                else:
+                    sine, cosine = gmpy2.sin_cos(factor * phase)
+                    output[index] = _DecimalComplex(cosine, sine)
         return output
     # ``2pi * im`` is ComplexF64 in Julia and therefore widens every machine
     # real/complex phase array before exponentiation.
@@ -6275,21 +7087,40 @@ def normalizeLF(field: LatticeField) -> LatticeField:
         else:
             result = _julia_abs(quotient)
     elif issubclass(field.field_type, Amplitude):
-        magnitude = _julia_abs(values)
-        squared = _julia_array_array_operation(
-            magnitude, magnitude, np.multiply
-        )
-        squared_sum = _julia_sum(squared)
-        if isinstance(squared_sum, Decimal):
+        if _object_contains_mpfr(values):
+            with _bigfloat_context():
+                magnitude = _julia_abs(values)
+                squared = _julia_array_array_operation(
+                    magnitude, magnitude, np.multiply
+                )
+                squared_sum = _julia_sum(squared)
+                norm = _mpfr_sqrt(squared_sum)
+                result = _julia_array_scalar_operation(
+                    values, norm, np.divide
+                )
+        else:
+            magnitude = _julia_abs(values)
+            squared = _julia_array_array_operation(
+                magnitude, magnitude, np.multiply
+            )
+            squared_sum = _julia_sum(squared)
+        if _object_contains_mpfr(values):
+            pass
+        elif isinstance(squared_sum, Decimal):
             with localcontext() as context:
                 context.traps[DivisionByZero] = False
                 context.traps[InvalidOperation] = False
                 context.traps[DecimalOverflow] = False
                 norm = squared_sum.sqrt()
+            result = _julia_array_scalar_operation(
+                values, norm, np.divide
+            )
         else:
             with np.errstate(divide="ignore", invalid="ignore"):
                 norm = np.sqrt(squared_sum)
-        result = _julia_array_scalar_operation(values, norm, np.divide)
+            result = _julia_array_scalar_operation(
+                values, norm, np.divide
+            )
     else:
         raise TypeError(
             "normalizeLF is only defined for intensity/amplitude fields."
@@ -6300,6 +7131,7 @@ def normalizeLF(field: LatticeField) -> LatticeField:
         field.flambda,
         field.field_type,
         expected_dtype=field.data.dtype,
+        expected_object_type=field._logical_object_type,
     )
 
 
@@ -6313,9 +7145,17 @@ def phasor(value: Any) -> Any:
             raise TypeError(
                 "phasor(ComplexAmplitude) requires ComplexF64 field data."
             )
+        # ``field.data`` is a checked facade whose Boolean indexing follows
+        # Julia's indexing contract.  NumPy's mask assignment expects its own
+        # row-major rules, so operate on one authoritative plain-array copy.
+        data = value.data.copy()
         vectorized = np.ones(value.shape, dtype=np.complex128)
-        nonzero = value.data != 0
-        vectorized[nonzero] = value.data[nonzero] / np.abs(value.data[nonzero])
+        np.divide(
+            data,
+            np.abs(data),
+            out=vectorized,
+            where=data != 0,
+        )
         return LatticeField[ComplexPhase](vectorized, value.L, value.flambda)
     if type(value) is complex:
         scalar = value

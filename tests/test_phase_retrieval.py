@@ -6,9 +6,14 @@ from fractions import Fraction
 import unittest
 
 import numpy as np
+import pyfftw
 
 import slmtools as slm
-from slmtools.ift import _literal_square
+from slmtools.ift import (
+    ScaledFFTWPlan,
+    _fftw_plan_pair,
+    _literal_square,
+)
 from slmtools.lattice_field import _julia_add_sum
 
 
@@ -27,8 +32,13 @@ class GerchbergSaxtonTests(unittest.TestCase):
         )
 
     def test_gs_iter_defines_zero_phasor_as_one(self) -> None:
+        ft, ift = _fftw_plan_pair((4,))
         update = slm.gsIter(
-            np.zeros(4, dtype=np.complex128), np.ones(4), np.ones(4)
+            np.zeros(4, dtype=np.complex128),
+            np.ones(4),
+            np.ones(4),
+            ft,
+            ift,
         )
         np.testing.assert_array_equal(update, np.ones(4, dtype=np.complex128))
         self.assertEqual(update.dtype, np.complex128)
@@ -38,27 +48,158 @@ class GerchbergSaxtonTests(unittest.TestCase):
         real = np.ones(4, dtype=np.float64)
         phases = (np.ones(4, dtype=np.complex128),)
         moduli = (real.copy(),)
-        self.assertEqual(slm.gsIter(guess, real, real).dtype, np.complex128)
+        ft, ift = _fftw_plan_pair(guess.shape)
         self.assertEqual(
-            slm.pdgsIter(guess, phases, moduli).dtype, np.complex128
+            slm.gsIter(guess, real, real, ft, ift).dtype, np.complex128
+        )
+        self.assertEqual(
+            slm.pdgsIter(guess, phases, moduli, ft, ift).dtype,
+            np.complex128,
+        )
+        forward_input = pyfftw.empty_aligned(4, dtype=np.complex128)
+        forward_output = pyfftw.empty_aligned(4, dtype=np.complex128)
+        inverse_input = pyfftw.empty_aligned(4, dtype=np.complex128)
+        inverse_output = pyfftw.empty_aligned(4, dtype=np.complex128)
+        public_ft = pyfftw.FFTW(
+            forward_input,
+            forward_output,
+            direction="FFTW_FORWARD",
+            flags=("FFTW_ESTIMATE",),
+        )
+        public_ift = pyfftw.FFTW(
+            inverse_input,
+            inverse_output,
+            direction="FFTW_BACKWARD",
+            flags=("FFTW_ESTIMATE",),
+            normalise_idft=True,
+        )
+        self.assertEqual(
+            slm.gsIter(
+                guess, real, real, public_ft, public_ift
+            ).dtype,
+            np.complex128,
+        )
+        self.assertEqual(
+            slm.gsIter(
+                guess, real, real, public_ift, public_ift
+            ).dtype,
+            np.complex128,
+        )
+        scaled_forward = ScaledFFTWPlan(public_ft, 2.0)
+        self.assertEqual(
+            slm.gsIter(
+                guess, real, real, public_ft, scaled_forward
+            ).dtype,
+            np.complex128,
         )
 
         with self.assertRaisesRegex(TypeError, "ComplexF64"):
-            slm.gsIter(guess.astype(np.complex64), real, real)
+            slm.gsIter(guess.astype(np.complex64), real, real, ft, ift)
         with self.assertRaisesRegex(TypeError, "Float64"):
-            slm.gsIter(guess, real.astype(np.float32), real)
+            slm.gsIter(guess, real.astype(np.float32), real, ft, ift)
         with self.assertRaisesRegex(TypeError, "dense NumPy"):
-            slm.gsIter(guess.tolist(), real, real)
+            slm.gsIter(guess.tolist(), real, real, ft, ift)
         with self.assertRaisesRegex(TypeError, "ComplexF64"):
-            slm.pdgsIter(guess, (phases[0].astype(np.complex64),), moduli)
+            slm.pdgsIter(
+                guess,
+                (phases[0].astype(np.complex64),),
+                moduli,
+                ft,
+                ift,
+            )
         with self.assertRaisesRegex(TypeError, "Float64"):
-            slm.pdgsIter(guess, phases, (real.astype(np.float32),))
+            slm.pdgsIter(
+                guess,
+                phases,
+                (real.astype(np.float32),),
+                ft,
+                ift,
+            )
+
+        with self.assertRaisesRegex(TypeError, "required positional"):
+            slm.gsIter(guess, real, real)
+        with self.assertRaisesRegex(TypeError, "required positional"):
+            slm.pdgsIter(guess, phases, moduli)
+        with self.assertRaisesRegex(TypeError, "pyFFTW"):
+            slm.gsIter(guess, real, real, np.fft.fftn, np.fft.ifftn)
+        with self.assertRaisesRegex(TypeError, "bare"):
+            slm.gsIter(guess, real, real, ift, ft)
+        with self.assertRaisesRegex(TypeError, "scaled"):
+            slm.gsIter(guess, real, real, public_ft, public_ft)
+
+    def test_raw_iteration_helpers_accept_julia_plan_type_families(self) -> None:
+        guess = np.arange(1, 5, dtype=np.complex128)
+        real = np.ones(4, dtype=np.float64)
+        forward_input = pyfftw.empty_aligned(4, dtype=np.complex128)
+        forward_output = pyfftw.empty_aligned(4, dtype=np.complex128)
+        backward_input = pyfftw.empty_aligned(4, dtype=np.complex128)
+        backward_output = pyfftw.empty_aligned(4, dtype=np.complex128)
+        forward = pyfftw.FFTW(
+            forward_input,
+            forward_output,
+            direction="FFTW_FORWARD",
+            flags=("FFTW_ESTIMATE",),
+        )
+        backward = pyfftw.FFTW(
+            backward_input,
+            backward_output,
+            direction="FFTW_BACKWARD",
+            flags=("FFTW_ESTIMATE",),
+            normalise_idft=True,
+        )
+
+        bare_backward = slm.gsIter(
+            guess, real, real, backward, backward
+        )
+        scaled_forward = slm.gsIter(
+            guess,
+            real,
+            real,
+            forward,
+            ScaledFFTWPlan(forward, 2.0),
+        )
+        expected_gs = np.asarray([-1, 1, 1, 1], dtype=np.complex128)
+        np.testing.assert_allclose(bare_backward, expected_gs, atol=1e-15)
+        np.testing.assert_allclose(scaled_forward, expected_gs, atol=1e-15)
+
+        phases = (np.ones(4, dtype=np.complex128),)
+        moduli = (real,)
+        pd_bare_backward = slm.pdgsIter(
+            guess, phases, moduli, backward, backward
+        )
+        pd_scaled_forward = slm.pdgsIter(
+            guess,
+            phases,
+            moduli,
+            forward,
+            ScaledFFTWPlan(forward, 2.0),
+        )
+        np.testing.assert_allclose(
+            pd_bare_backward,
+            [
+                -0.35355339059327373,
+                0.8535533905932737,
+                0.35355339059327373,
+                0.14644660940672627,
+            ],
+            atol=1e-15,
+        )
+        np.testing.assert_allclose(
+            pd_scaled_forward,
+            [
+                -2.82842712474619,
+                6.82842712474619,
+                2.82842712474619,
+                1.1715728752538102,
+            ],
+            atol=1e-14,
+        )
 
     def test_intensity_gs_retains_upstream_default_phase_failure(self) -> None:
         source = slm.square(self.source)
         target = slm.square(self.target)
         with self.assertRaisesRegex(TypeError, "nonexistent four-argument"):
-            slm.gs(source, target, 3, rng=np.random.default_rng(1234))
+            slm.gs(source, target, 3)
         with self.assertRaisesRegex(TypeError, "nonexistent four-argument"):
             slm.gsLog(source, target, 0)
 
@@ -67,6 +208,23 @@ class GerchbergSaxtonTests(unittest.TestCase):
         self.assertEqual(result.flambda, source.flambda)
         self.assertTrue(all(np.array_equal(a, b) for a, b in zip(result.L, source.L)))
         np.testing.assert_allclose(np.abs(result.data), 1.0, atol=2e-16)
+
+        with self.assertRaisesRegex(TypeError, "unexpected keyword"):
+            slm.gs(
+                source,
+                target,
+                0,
+                self.zero_phase,
+                rng=np.random.default_rng(1234),
+            )
+        with self.assertRaisesRegex(TypeError, "unexpected keyword"):
+            slm.gsLog(
+                source,
+                target,
+                0,
+                self.zero_phase,
+                rng=np.random.default_rng(1234),
+            )
 
     def test_integer_intensity_sqrt_widens_to_julia_float64_work(self) -> None:
         lattice = slm.natlat((4,))
@@ -501,7 +659,7 @@ class PhaseDiversityTests(unittest.TestCase):
             atol=2e-15,
         )
 
-    def test_complex64_pdgs_beam_fails_only_when_julia_enters_loop(self) -> None:
+    def test_complex64_pdgs_dispatch_matches_the_two_julia_loops(self) -> None:
         lattice = slm.natlat((4,))
         dual = slm.dualShiftLattice(lattice)
         image = slm.LF[slm.Modulus](np.ones(4), lattice)
@@ -513,8 +671,9 @@ class PhaseDiversityTests(unittest.TestCase):
         self.assertEqual(empty.dtype, np.dtype(np.complex128))
         with self.assertRaisesRegex(TypeError, "ComplexF64"):
             slm.pdgs((image,), (phase,), 1, beam)
-        with self.assertRaisesRegex(TypeError, "ComplexF64"):
-            slm.pdgsLog((image,), (phase,), 1, beam)
+        logged, errors = slm.pdgsLog((image,), (phase,), 1, beam)
+        self.assertEqual(logged.dtype, np.dtype(np.complex128))
+        self.assertEqual(len(errors), 1)
 
     def test_pdgs_log_nonpositive_every_matches_julia_modulo_timing(self) -> None:
         lattice = slm.natlat((5,))
