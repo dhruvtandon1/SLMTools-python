@@ -5,12 +5,17 @@ from __future__ import annotations
 from decimal import Decimal, localcontext
 from fractions import Fraction
 import unittest
+from unittest.mock import patch
 import warnings
 
 import numpy as np
 
 import slmtools as slm
-from slmtools.ot import _sinkhorn_gibbs
+from slmtools.ot import (
+    _ot_natural_lattices,
+    _separable_dense_ot_map_2d,
+    _sinkhorn_gibbs,
+)
 
 
 class CostMapAndIntegrationTests(unittest.TestCase):
@@ -296,6 +301,58 @@ class CostMapAndIntegrationTests(unittest.TestCase):
         singleton_cost = slm.getCostMatrix((slm.LatticeAxis([0.0], step_hint=1.0),))
         self.assertEqual(singleton_cost.shape, (1, 1))
         self.assertTrue(np.isnan(singleton_cost[0, 0]))
+
+    def test_separable_dense_map_matches_materialized_dense_plan(self) -> None:
+        size = 12
+        rng = np.random.default_rng(42)
+        source = rng.random((size, size))
+        source[0, 0] = 0
+        source /= np.sum(source)
+        target = np.zeros((size, size))
+        target[3:9, 4:10] = rng.random((6, 6))
+        target /= np.sum(target)
+        natural_source, natural_target = _ot_natural_lattices(
+            source.shape, target.shape
+        )
+        plan = _sinkhorn_gibbs(
+            source.ravel(order="F"),
+            target.ravel(order="F"),
+            slm.getCostMatrix(natural_source, natural_target),
+            0.02,
+            maxiter=1000,
+        )
+        expected = slm.mapify(plan, natural_source, natural_target)
+        actual, converged = _separable_dense_ot_map_2d(
+            source,
+            target,
+            natural_source,
+            natural_target,
+            natural_target,
+            0.02,
+            maxiter=1000,
+        )
+        self.assertTrue(converged)
+        np.testing.assert_allclose(actual, expected, rtol=2e-14, atol=1e-15)
+        np.testing.assert_array_equal(actual[0, 0], np.zeros(2))
+
+    def test_large_float64_ot_uses_implicit_dense_kernel(self) -> None:
+        size = 64
+        lattice = (np.arange(size, dtype=np.float64),) * 2
+        source = slm.LF[slm.Intensity](
+            np.ones((size, size), dtype=np.float64), lattice
+        )
+        target_data = np.ones((size, size), dtype=np.float64)
+        target_data[size // 3 : size // 2, size // 2 : 2 * size // 3] = 2
+        target = slm.LF[slm.Intensity](target_data, lattice)
+        with patch(
+            "slmtools.ot.getCostMatrix",
+            side_effect=AssertionError("dense matrix was materialized"),
+        ):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                phase = slm.otPhase(source, target, 0.1, maxiter=20)
+        self.assertEqual(phase.shape, (size, size))
+        self.assertTrue(np.all(np.isfinite(phase.data)))
 
     def test_bigfloat_degenerate_normalization_and_singleton_cost_propagate(
         self,

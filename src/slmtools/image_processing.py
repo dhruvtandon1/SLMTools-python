@@ -1312,6 +1312,26 @@ def linearFit(xs: Sequence[Any], ys: Sequence[Any]) -> tuple[Any, Any]:
                 raise np.linalg.LinAlgError(
                     "linearFit design matrix is singular at pivot 1"
                 )
+            if (
+                design.dtype.kind == "c"
+                and not np.isfinite(design[0, 0])
+            ):
+                # Accelerate's complex ``trtrs`` maps a finite numerator
+                # divided by ``Inf + 0im`` to ``NaN + NaN*im``. Julia's
+                # structurally upper-triangular solve performs the scalar
+                # division instead, producing a complex zero. Keep this
+                # narrow non-finite branch outside LAPACK so the result does
+                # not depend on the SciPy/BLAS backend.
+                result_dtype = np.result_type(design.dtype, y.dtype)
+                intercept = np.asarray(y[1], dtype=result_dtype)[()]
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    slope = np.asarray(
+                        (y[0] - intercept) / design[0, 0],
+                        dtype=result_dtype,
+                    )[()]
+                if slope.real == 0 and slope.imag == 0:
+                    slope = np.asarray(0j, dtype=result_dtype)[()]
+                return slope, intercept
             slope, intercept = scipy_linalg.solve_triangular(
                 design,
                 y,
@@ -1359,7 +1379,7 @@ def linearFit(xs: Sequence[Any], ys: Sequence[Any]) -> tuple[Any, Any]:
             min(design.shape)
             * np.finfo(np.asarray(design.real).dtype).eps
         )
-        slope, intercept = scipy_linalg.lstsq(
+        solution, _residuals, rank, _singular_values = scipy_linalg.lstsq(
             design,
             y,
             cond=rank_cutoff,
@@ -1367,7 +1387,65 @@ def linearFit(xs: Sequence[Any], ys: Sequence[Any]) -> tuple[Any, Any]:
             # Julia passes non-finite entries through to LAPACK, where they
             # propagate into the result rather than being pre-rejected.
             check_finite=False,
-        )[0]
+        )
+        # Accelerate's ``gelsy`` retains a second direction for one 3x2
+        # Float64 system that the Julia 1.11.6 OpenBLAS reference classifies
+        # as rank one. Use a scalar Householder step to measure the residual
+        # second direction without another LAPACK-dependent rank decision.
+        # The sqrt(m) factor is the usual normwise conversion of a component
+        # roundoff bound; the adjacent four-epsilon rank-two case remains
+        # outside it.
+        if (
+            rank == 2
+            and design.shape == (3, 2)
+            and design.dtype == np.dtype(np.float64)
+        ):
+            coordinates = design[:, 0]
+            column_norm = np.sqrt(
+                coordinates[0] * coordinates[0]
+                + coordinates[1] * coordinates[1]
+                + coordinates[2] * coordinates[2]
+            )
+            beta = -np.copysign(column_norm, coordinates[0])
+            tau = (beta - coordinates[0]) / beta
+            tail = coordinates[1:] / (coordinates[0] - beta)
+            projection = tau * (1.0 + tail[0] + tail[1])
+            second_diagonal = np.hypot(
+                1.0 - tail[0] * projection,
+                1.0 - tail[1] * projection,
+            )
+            roundoff_limit = (
+                rank_cutoff
+                * np.sqrt(design.shape[0])
+                * abs(beta)
+            )
+            if second_diagonal <= roundoff_limit:
+                # Solve the resulting rank-one model A = x*[1, c]
+                # directly. This is the same minimum-norm problem as gelsy's
+                # rank-one branch, without sending the boundary case back to
+                # a backend-specific rank estimator.
+                gram = (
+                    coordinates[0] * coordinates[0]
+                    + coordinates[1] * coordinates[1]
+                    + coordinates[2] * coordinates[2]
+                )
+                column_ratio = (
+                    coordinates[0]
+                    + coordinates[1]
+                    + coordinates[2]
+                ) / gram
+                projected_rhs = (
+                    coordinates[0] * y[0]
+                    + coordinates[1] * y[1]
+                    + coordinates[2] * y[2]
+                ) / gram
+                scale = projected_rhs / (
+                    1.0 + column_ratio * column_ratio
+                )
+                solution = np.asarray(
+                    [scale, scale * column_ratio]
+                )
+        slope, intercept = solution
     return slope, intercept
 
 
@@ -2109,42 +2187,46 @@ def dualate(
     y_from_j = _julia_array_scalar_operation(jj, dy[1], np.multiply)
     ycoords = _julia_array_array_operation(y_from_i, y_from_j, np.add)
     ycoords = _julia_array_scalar_operation(ycoords, origin[1], np.add)
-    # Julia evaluates the interpolation object once per CartesianIndex. Its
-    # first array dimension advances fastest, so reproduce that observable
-    # call order rather than speculatively invoking custom callables with
-    # whole coordinate arrays.
-    indices = (
-        tuple(reversed(index))
-        for index in np.ndindex(tuple(reversed(xcoords.shape)))
-    )
-    try:
-        first_index = next(indices)
-    except StopIteration:
-        data = np.empty(
-            xcoords.shape,
-            dtype=np.result_type(field.data.dtype, boundary),
+    # The built-in natural spline has an optimized paired-coordinate path.
+    # Keep the scalar CartesianIndex loop for custom factories: their call
+    # order, side effects, heterogeneous values, and failure point are part of
+    # the compatibility contract.
+    data = NotImplemented
+    if interpolation is cubic_spline_interpolation:
+        data = interp._evaluate_paired_2d((xcoords, ycoords))
+    if data is NotImplemented:
+        indices = (
+            tuple(reversed(index))
+            for index in np.ndindex(tuple(reversed(xcoords.shape)))
         )
-    else:
-        evaluated = [
-            (
-                first_index,
-                interp(xcoords[first_index], ycoords[first_index]),
+        try:
+            first_index = next(indices)
+        except StopIteration:
+            data = np.empty(
+                xcoords.shape,
+                dtype=np.result_type(field.data.dtype, boundary),
             )
-        ]
-        for index in indices:
-            evaluated.append(
+        else:
+            evaluated = [
                 (
-                    index,
-                    interp(xcoords[index], ycoords[index]),
+                    first_index,
+                    interp(xcoords[first_index], ycoords[first_index]),
                 )
-            )
-        values = [value for _index, value in evaluated]
-        promoted = _julia_collect_comprehension_results(values)
-        data = np.empty(xcoords.shape, dtype=promoted.dtype)
-        for (index, _value), converted in zip(
-            evaluated, promoted, strict=True
-        ):
-            data[index] = converted
+            ]
+            for index in indices:
+                evaluated.append(
+                    (
+                        index,
+                        interp(xcoords[index], ycoords[index]),
+                    )
+                )
+            values = [value for _index, value in evaluated]
+            promoted = _julia_collect_comprehension_results(values)
+            data = np.empty(xcoords.shape, dtype=promoted.dtype)
+            for (index, _value), converted in zip(
+                evaluated, promoted, strict=True
+            ):
+                data[index] = converted
 
     if naturalize:
         return LatticeField(data, natlat(data.shape), 1.0, field_type=field.field_type)

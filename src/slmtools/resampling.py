@@ -1971,6 +1971,162 @@ class _CubicSpline:
         self.spline_boundary = spline_boundary
         self.spline_oncell = spline_oncell
 
+    def _evaluate_paired_2d(
+        self,
+        coordinates: tuple[Any, Any],
+        *,
+        chunk_size: int = 131_072,
+    ) -> np.ndarray | Any:
+        """Evaluate matching 2-D coordinate arrays without a tensor grid.
+
+        ``dualate`` asks for one spline value at each pair of coordinates.  Its
+        compatibility fallback calls ``__call__`` once per point, which is
+        important for user-provided interpolation factories but needlessly
+        rebuilds both natural-spline systems for the built-in interpolator.
+
+        Natural tensor-product splines are separable and linear.  Precomputing
+        the x, y, and mixed second derivatives therefore gives the same cubic
+        polynomial at every paired point while keeping both the source-grid
+        preparation and target evaluation vectorized.  Unsupported numeric or
+        boundary cases return ``NotImplemented`` so callers can retain the
+        fully general scalar behavior.
+        """
+
+        if (
+            self.values.ndim != 2
+            or self.spline_boundary != "natural"
+            or self.spline_oncell
+            or self.values.dtype.kind not in "fc"
+            or self.values.dtype == np.dtype(np.float16)
+        ):
+            return NotImplemented
+
+        x_coordinate = np.asarray(coordinates[0])
+        y_coordinate = np.asarray(coordinates[1])
+        if (
+            x_coordinate.shape != y_coordinate.shape
+            or x_coordinate.dtype.kind != "f"
+            or y_coordinate.dtype.kind != "f"
+        ):
+            return NotImplemented
+
+        fill_array = np.asarray(self.extrapolation_bc)
+        if fill_array.ndim != 0 or fill_array.dtype.kind not in "buifc":
+            return NotImplemented
+
+        # Julia's first array dimension advances fastest.  Flattening and
+        # reshaping in Fortran order keeps paired masks and values in that
+        # order, including the empty-grid case.
+        x_flat = x_coordinate.ravel(order="F")
+        y_flat = y_coordinate.ravel(order="F")
+        (
+            sources,
+            mapped,
+            _extrapolation_targets,
+            outside_masks,
+            linear_axes,
+            fill_value,
+        ) = _map_targets(
+            self.ranges,
+            (x_flat, y_flat),
+            self.extrapolation_bc,
+        )
+        if any(lower or upper for lower, upper in linear_axes):
+            return NotImplemented
+        if any(
+            np.asarray(item).dtype == np.dtype(np.float16)
+            for item in (*sources, *mapped)
+        ):
+            return NotImplemented
+
+        x_mapped, y_mapped = mapped
+        x_dtype = _interpolation_output_dtype(self.values, x_mapped)
+        y_dtype = _interpolation_output_dtype(
+            np.empty((), dtype=x_dtype), y_mapped
+        )
+        if x_dtype != y_dtype or y_dtype.kind not in "fc":
+            return NotImplemented
+
+        values = self.values.astype(y_dtype, copy=False)
+        x_source = np.asarray(sources[0])
+        y_source = np.asarray(sources[1])
+        x_spacing = np.diff(x_source)
+        y_spacing = np.diff(y_source)
+        if np.any(x_spacing <= 0) or np.any(y_spacing <= 0):
+            raise ValueError("Interpolation lattice axes must have positive steps.")
+
+        def second_derivative(array: np.ndarray, axis: int) -> np.ndarray:
+            moved = np.moveaxis(array, axis, 0)
+            spacing = x_spacing if axis == 0 else y_spacing
+            second = _cubic_second_derivatives(
+                moved.reshape(moved.shape[0], -1), spacing, "natural"
+            )
+            return np.moveaxis(second.reshape(moved.shape), 0, axis)
+
+        second_x = second_derivative(values, 0)
+        second_y = second_derivative(values, 1)
+        second_xy = second_derivative(second_x, 1)
+
+        def weights(
+            source: np.ndarray, target: np.ndarray
+        ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+            interval = np.searchsorted(source, target, side="right") - 1
+            interval = np.clip(interval, 0, len(source) - 2)
+            lower = source[interval]
+            upper = source[interval + 1]
+            width = upper - lower
+            a = (upper - target) / width
+            b = (target - lower) / width
+            second_a = (a**3 - a) * width**2 / 6
+            second_b = (b**3 - b) * width**2 / 6
+            return interval, a, b, second_a, second_b
+
+        output = np.empty(x_flat.size, dtype=y_dtype)
+        for start in range(0, x_flat.size, chunk_size):
+            stop = min(start + chunk_size, x_flat.size)
+            ix, ax, bx, cx, dx = weights(x_source, x_mapped[start:stop])
+            iy, ay, by, cy, dy = weights(y_source, y_mapped[start:stop])
+            ix1 = ix + 1
+            iy1 = iy + 1
+
+            value_y0 = (
+                ax * values[ix, iy]
+                + bx * values[ix1, iy]
+                + cx * second_x[ix, iy]
+                + dx * second_x[ix1, iy]
+            )
+            value_y1 = (
+                ax * values[ix, iy1]
+                + bx * values[ix1, iy1]
+                + cx * second_x[ix, iy1]
+                + dx * second_x[ix1, iy1]
+            )
+            second_y0 = (
+                ax * second_y[ix, iy]
+                + bx * second_y[ix1, iy]
+                + cx * second_xy[ix, iy]
+                + dx * second_xy[ix1, iy]
+            )
+            second_y1 = (
+                ax * second_y[ix, iy1]
+                + bx * second_y[ix1, iy1]
+                + cx * second_xy[ix, iy1]
+                + dx * second_xy[ix1, iy1]
+            )
+            output[start:stop] = (
+                ay * value_y0
+                + by * value_y1
+                + cy * second_y0
+                + dy * second_y1
+            )
+
+        output_dtype = _julia_numeric_dtype(output, fill_value)
+        output = output.astype(output_dtype, copy=False)
+        outside = outside_masks[0] | outside_masks[1]
+        if np.any(outside):
+            output[outside] = fill_value
+        return output.reshape(x_coordinate.shape, order="F")
+
     def _evaluate_grid(self, coordinates: tuple[Any, ...]) -> np.ndarray:
         (
             sources,

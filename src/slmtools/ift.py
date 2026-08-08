@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Sequence
 from decimal import Decimal
 from fractions import Fraction
+import os
 from typing import Any
 
 import numpy as np
@@ -307,6 +308,7 @@ def _sft_array(values: Any) -> np.ndarray:
         _fftw_fft.fftn(
             np.fft.ifftshift(values),
             planner_effort="FFTW_ESTIMATE",
+            threads=_fftw_thread_count(),
         )
     )
 
@@ -316,6 +318,7 @@ def _isft_array(values: Any) -> np.ndarray:
         _fftw_fft.ifftn(
             np.fft.ifftshift(values),
             planner_effort="FFTW_ESTIMATE",
+            threads=_fftw_thread_count(),
         )
     )
 
@@ -436,8 +439,26 @@ def _fft_with_plan(
     raise TypeError("ift must be a scaled pyFFTW FFTW plan")
 
 
+def _fftw_thread_count() -> int:
+    """Return the requested FFTW worker count, defaulting to Julia parity."""
+
+    value = os.environ.get("SLMTOOLS_FFT_THREADS", "1")
+    try:
+        threads = int(value)
+    except ValueError as error:
+        raise ValueError("SLMTOOLS_FFT_THREADS must be a positive integer") from error
+    if threads < 1:
+        raise ValueError("SLMTOOLS_FFT_THREADS must be a positive integer")
+    return threads
+
+
 class _FFTWComplexPlan:
-    """Single-threaded column-major FFTW plan matching Julia ``plan_fft``."""
+    """Column-major FFTW plan with an opt-in worker-count override.
+
+    One thread remains the library default for strict Julia-port parity.
+    Notebook applications can set ``SLMTOOLS_FFT_THREADS`` before constructing
+    a solver to use the threaded FFTW backend shipped by pyFFTW.
+    """
 
     def __init__(self, shape: tuple[int, ...], *, inverse: bool) -> None:
         self.direction = "FFTW_BACKWARD" if inverse else "FFTW_FORWARD"
@@ -454,7 +475,7 @@ class _FFTWComplexPlan:
             axes=tuple(range(len(shape))),
             direction=self.direction,
             flags=("FFTW_ESTIMATE",),
-            threads=1,
+            threads=_fftw_thread_count(),
             normalise_idft=True,
         )
 

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from fractions import Fraction
+import os
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pyfftw
@@ -12,7 +14,10 @@ import slmtools as slm
 from slmtools.ift import (
     ScaledFFTWPlan,
     _fftw_plan_pair,
+    _fftw_thread_count,
+    _isft_array,
     _literal_square,
+    _sft_array,
 )
 from slmtools.lattice_field import _julia_add_sum
 
@@ -30,6 +35,30 @@ class GerchbergSaxtonTests(unittest.TestCase):
         self.target = slm.LF[slm.Modulus](
             target_data, slm.dualShiftLattice(self.lattice)
         )
+
+    def test_fft_worker_count_is_opt_in_and_validated(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(_fftw_thread_count(), 1)
+        with patch.dict(os.environ, {"SLMTOOLS_FFT_THREADS": "4"}):
+            self.assertEqual(_fftw_thread_count(), 4)
+        for invalid in ("0", "-1", "four"):
+            with self.subTest(invalid=invalid), patch.dict(
+                os.environ, {"SLMTOOLS_FFT_THREADS": invalid}
+            ):
+                with self.assertRaisesRegex(ValueError, "positive integer"):
+                    _fftw_thread_count()
+
+    def test_shifted_fft_helpers_forward_the_requested_worker_count(self) -> None:
+        values = np.ones((2, 2), dtype=np.complex128)
+        with (
+            patch.dict(os.environ, {"SLMTOOLS_FFT_THREADS": "3"}),
+            patch("slmtools.ift._fftw_fft.fftn", return_value=values) as forward,
+            patch("slmtools.ift._fftw_fft.ifftn", return_value=values) as inverse,
+        ):
+            _sft_array(values)
+            _isft_array(values)
+        self.assertEqual(forward.call_args.kwargs["threads"], 3)
+        self.assertEqual(inverse.call_args.kwargs["threads"], 3)
 
     def test_gs_iter_defines_zero_phasor_as_one(self) -> None:
         ft, ift = _fftw_plan_pair((4,))

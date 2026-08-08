@@ -358,6 +358,53 @@ def _cost_matrix_terms(
 
     source_components = _point_components(source)
     target_components = _point_components(target)
+    if (
+        target_scale is None
+        and source_components
+        and all(
+            component.dtype == np.dtype(np.float64)
+            for component in (*source_components, *target_components)
+        )
+    ):
+        # The natural lattices used by ``otPhase`` are homogeneous Float64.
+        # Build their dense cost in bounded row blocks rather than retaining
+        # one full difference and one full squared-distance matrix per axis.
+        # The subtract, multiply, and axis-add order is unchanged, so this is
+        # also bitwise-equivalent to the generic path for finite inputs.
+        rows = source_components[0].size
+        columns = target_components[0].size
+        matrix = np.empty((rows, columns), dtype=np.float64)
+        if rows == 0 or columns == 0:
+            return matrix
+        target_block_bytes = 32 * 1024 * 1024
+        block_rows = max(
+            1,
+            min(rows, target_block_bytes // (columns * matrix.itemsize)),
+        )
+        scratch = np.empty(
+            (min(block_rows, rows), columns), dtype=np.float64
+        )
+        for start in range(0, rows, block_rows):
+            stop = min(start + block_rows, rows)
+            output_block = matrix[start:stop]
+            for dimension, (source_component, target_component) in enumerate(
+                zip(source_components, target_components, strict=True)
+            ):
+                work = (
+                    output_block
+                    if dimension == 0
+                    else scratch[: stop - start]
+                )
+                np.subtract(
+                    source_component[start:stop, None],
+                    target_component[None, :],
+                    out=work,
+                )
+                np.multiply(work, work, out=work)
+                if dimension:
+                    np.add(output_block, work, out=output_block)
+        return matrix
+
     terms: list[np.ndarray] = []
     for source_component, target_component in zip(
         source_components, target_components, strict=True
@@ -446,6 +493,22 @@ def _normalize_cost(
     return divide()
 
 
+def _normalize_default_float_cost(
+    matrix: np.ndarray,
+    normalization: Callable[[np.ndarray], Any],
+) -> np.ndarray | None:
+    """Normalize a private Float64 cost buffer without another dense copy."""
+
+    if matrix.dtype != np.dtype(np.float64) or not (
+        normalization is np.max or normalization is np.amax
+    ):
+        return None
+    divisor = normalization(matrix)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        np.divide(matrix, divisor, out=matrix)
+    return matrix
+
+
 def getCostMatrix(
     Lmu: Sequence[Any],
     Lv: Any = _OMITTED,
@@ -463,6 +526,9 @@ def getCostMatrix(
     if len(source) != len(target):
         raise ValueError("source and target lattices must have the same dimensionality")
     matrix = _cost_matrix_terms(source, target)
+    normalized = _normalize_default_float_cost(matrix, normalization)
+    if normalized is not None:
+        return normalized
     with np.errstate(divide="ignore", invalid="ignore"):
         return _normalize_cost(matrix, normalization)
 
@@ -500,6 +566,9 @@ def pdCostMatrix(
         delta_array, flambda, np.multiply
     ).reshape(())[()]
     matrix = _cost_matrix_terms(root, target, target_scale=delta)
+    normalized = _normalize_default_float_cost(matrix, normalization)
+    if normalized is not None:
+        return normalized
     with np.errstate(divide="ignore", invalid="ignore"):
         return _normalize_cost(matrix, normalization)
 
@@ -1358,8 +1427,14 @@ def _sinkhorn_gibbs(
     source = np.asarray(source_input, dtype=float)
     target = np.asarray(target_input, dtype=float)
     C = np.asarray(cost_input, dtype=float)
+    kernel = np.empty_like(C)
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-        kernel = np.exp(-C / float(epsilon))
+        # Preserve the original ufunc order while avoiding two dense
+        # temporaries for ``-C / epsilon``.  At a 96 by 96 transport grid each
+        # dense matrix is about 648 MiB.
+        np.negative(C, out=kernel)
+        np.divide(kernel, float(epsilon), out=kernel)
+        np.exp(kernel, out=kernel)
     u = np.ones(source.shape, dtype=float)
     v = np.ones(target.shape, dtype=float)
     Kv = kernel @ v  # OptimalTransport.jl's init_step!
@@ -1408,7 +1483,13 @@ def _sinkhorn_gibbs(
             RuntimeWarning,
             stacklevel=2,
         )
-    return kernel * u[:, None] * v[None, :]
+    # The Gibbs kernel is private and dead after the solve, so turn it into
+    # the plan in place.  This keeps the same pair of multiply roundings as
+    # ``kernel * u[:, None] * v[None, :]`` without allocating two more full
+    # transport matrices.
+    np.multiply(kernel, u[:, None], out=kernel)
+    np.multiply(kernel, v[None, :], out=kernel)
+    return kernel
 
 
 def _natural_axis(size: int) -> np.ndarray:
@@ -1513,6 +1594,167 @@ def _pd_squared_radius(
     return np.asarray(_julia_add_sum(terms))
 
 
+_SEPARABLE_DENSE_OT_MIN_POINTS = 64 * 64
+
+
+def _can_use_separable_dense_ot_2d(
+    U: LatticeField,
+    V: LatticeField,
+    source: np.ndarray,
+    target: np.ndarray,
+    epsilon: Any,
+    options: dict[str, Any],
+) -> bool:
+    """Return whether the exact tensor-grid dense-OT fast path is safe."""
+
+    if set(options) - {"maxiter"}:
+        return False
+    maxiter = options.get("maxiter", 1000)
+    if not (
+        (type(maxiter) is int or isinstance(maxiter, np.int64))
+        and 1 <= int(maxiter) <= np.iinfo(np.int64).max
+    ):
+        return False
+    if not (
+        isinstance(epsilon, (float, np.float64))
+        and np.isfinite(epsilon)
+        and epsilon > 0
+    ):
+        return False
+    if (
+        source.ndim != 2
+        or source.shape != target.shape
+        or source.size < _SEPARABLE_DENSE_OT_MIN_POINTS
+        or source.dtype != np.dtype(np.float64)
+        or target.dtype != np.dtype(np.float64)
+        or np.asarray(U.data).dtype != np.dtype(np.float64)
+        or np.asarray(V.data).dtype != np.dtype(np.float64)
+    ):
+        return False
+    if not (
+        np.all(np.isfinite(source))
+        and np.all(np.isfinite(target))
+        and np.all(source >= 0)
+        and np.all(target >= 0)
+    ):
+        return False
+    return all(
+        np.asarray(axis).dtype == np.dtype(np.float64)
+        for axis in (*U.L, *V.L)
+    )
+
+
+def _separable_dense_ot_map_2d(
+    source: np.ndarray,
+    target: np.ndarray,
+    natural_source: Sequence[np.ndarray],
+    natural_target: Sequence[np.ndarray],
+    target_lattice: Sequence[np.ndarray],
+    epsilon: float,
+    *,
+    maxiter: int = 1000,
+) -> tuple[np.ndarray, bool]:
+    """Solve the same dense Gibbs problem through its exact 2-D factors.
+
+    Squared Euclidean cost on a Cartesian product is additive, hence its
+    Gibbs kernel is a Kronecker product.  Applying the two small axis kernels
+    gives the same mathematical dense Sinkhorn updates without materializing
+    the 85-million-entry cost, kernel, or transport plan used by a 96 by 96
+    solve.  This is not the convolutional approximation used by ``otPhase2``.
+    """
+
+    squared_terms: list[np.ndarray] = []
+    maxima: list[np.float64] = []
+    for source_axis, target_axis in zip(
+        natural_source, natural_target, strict=True
+    ):
+        difference = np.subtract(
+            np.asarray(source_axis)[:, None],
+            np.asarray(target_axis)[None, :],
+        )
+        squared = np.multiply(difference, difference)
+        squared_terms.append(squared)
+        maxima.append(np.max(squared))
+    normalization = maxima[0]
+    for maximum in maxima[1:]:
+        normalization = np.add(normalization, maximum)
+
+    kernels: list[np.ndarray] = []
+    for squared in squared_terms:
+        kernel = np.empty_like(squared)
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            np.divide(squared, normalization, out=kernel)
+            np.negative(kernel, out=kernel)
+            np.divide(kernel, float(epsilon), out=kernel)
+            np.exp(kernel, out=kernel)
+        kernels.append(kernel)
+
+    source_shape = source.shape
+    target_shape = target.shape
+
+    def apply_kernel(values: np.ndarray, *, transpose: bool = False) -> np.ndarray:
+        input_shape = source_shape if transpose else target_shape
+        matrix = np.asarray(values).reshape(input_shape, order="F")
+        if transpose:
+            transformed = kernels[0].T @ matrix @ kernels[1]
+        else:
+            transformed = kernels[0] @ matrix @ kernels[1].T
+        return np.asarray(transformed).ravel(order="F")
+
+    source_linear = source.ravel(order="F")
+    target_linear = target.ravel(order="F")
+    u = np.ones(source_linear.shape, dtype=np.float64)
+    v = np.ones(target_linear.shape, dtype=np.float64)
+    Kv = apply_kernel(v)
+    converged = False
+    relative_tolerance = np.sqrt(np.finfo(float).eps)
+    countdown = 10
+    for iteration in range(1, maxiter + 1):
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            u = source_linear / Kv
+            v = target_linear / apply_kernel(u, transpose=True)
+            Kv = apply_kernel(v)
+        countdown -= 1
+        if countdown == 0 or iteration == maxiter:
+            countdown = 10
+            current = u * Kv
+            norm_current = float(_julia_sum(np.abs(current)))
+            error = float(_julia_sum(np.abs(source_linear - current)))
+            source_norm = float(_julia_sum(np.abs(source_linear)))
+            converged = error < relative_tolerance * max(
+                source_norm, norm_current
+            )
+            if converged:
+                break
+
+    if not (
+        np.all(np.isfinite(u))
+        and np.all(np.isfinite(v))
+        and np.all(np.isfinite(Kv))
+    ):
+        return np.full((*source_shape, 2), np.nan), converged
+
+    v_grid = v.reshape(target_shape, order="F")
+    denominator = Kv.reshape(source_shape, order="F")
+    components: list[np.ndarray] = []
+    for dimension, coordinate in enumerate(target_lattice):
+        coordinate_shape = [1, 1]
+        coordinate_shape[dimension] = len(coordinate)
+        weighted_v = np.multiply(
+            v_grid,
+            np.asarray(coordinate).reshape(coordinate_shape),
+        )
+        numerator = apply_kernel(weighted_v.ravel(order="F")).reshape(
+            source_shape, order="F"
+        )
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            barycenter = np.divide(numerator, denominator)
+        # ``mapify`` defines every exactly empty plan row to map to zero.
+        barycenter[u.reshape(source_shape, order="F") == 0] = 0.0
+        components.append(np.asarray(barycenter, dtype=np.float64))
+    return np.stack(components, axis=-1), converged
+
+
 def otPhase(U: LatticeField, V: LatticeField, epsilon: float, **options: Any) -> LatticeField:
     """Generate a phase from the dense entropic optimal-transport map."""
 
@@ -1521,17 +1763,43 @@ def otPhase(U: LatticeField, V: LatticeField, epsilon: float, **options: Any) ->
     _validate_ot_fields(U, V)
     source, target = normalizeDistribution(U.data), normalizeDistribution(V.data)
     natural_source, natural_target = _ot_natural_lattices(source.shape, target.shape)
-    cost = getCostMatrix(natural_source, natural_target)
-    plan = _sinkhorn_gibbs(
-        source.ravel(order="F"),
-        target.ravel(order="F"),
-        cost,
-        epsilon,
-        **options,
-    )
-    if _contains_nan(plan):
-        raise FloatingPointError("sinkhorn returned nan; try changing epsilon")
-    transport_map = mapify(plan, U.L, V.L)
+    if _can_use_separable_dense_ot_2d(
+        U, V, source, target, epsilon, options
+    ):
+        maxiter = _int64_value(options.get("maxiter", 1000), "maxiter")
+        transport_map, converged = _separable_dense_ot_map_2d(
+            source,
+            target,
+            natural_source,
+            natural_target,
+            V.L,
+            float(epsilon),
+            maxiter=maxiter,
+        )
+        if not converged:
+            warnings.warn(
+                f"Sinkhorn algorithm ({maxiter}/{maxiter}): not converged",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if _contains_nan(transport_map):
+            raise FloatingPointError(
+                "sinkhorn returned nan; try changing epsilon"
+            )
+    else:
+        cost = getCostMatrix(natural_source, natural_target)
+        plan = _sinkhorn_gibbs(
+            source.ravel(order="F"),
+            target.ravel(order="F"),
+            cost,
+            epsilon,
+            **options,
+        )
+        if _contains_nan(plan):
+            raise FloatingPointError(
+                "sinkhorn returned nan; try changing epsilon"
+            )
+        transport_map = mapify(plan, U.L, V.L)
     order = tuple(range(np.ndim(U.data), 0, -1))
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
         phase = _julia_array_scalar_operation(

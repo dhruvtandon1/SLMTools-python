@@ -3671,19 +3671,25 @@ def _decimal_rtol() -> Decimal:
 
 
 def _object_contains_decimal(value: Any) -> bool:
-    array = np.asarray(value, dtype=object)
+    array = np.asarray(value)
+    if array.dtype.kind != "O":
+        return False
     return any(isinstance(item, Decimal) for item in array.flat)
 
 
 def _object_contains_decimal_complex(value: Any) -> bool:
-    array = np.asarray(value, dtype=object)
+    array = np.asarray(value)
+    if array.dtype.kind != "O":
+        return False
     return any(isinstance(item, _DecimalComplex) for item in array.flat)
 
 
 def _object_contains_mpfr(value: Any) -> bool:
     """Whether an object container participates in Julia BigFloat arithmetic."""
 
-    array = np.asarray(value, dtype=object)
+    array = np.asarray(value)
+    if array.dtype.kind != "O":
+        return False
     return any(
         isinstance(item, (_MPFR, _MPC, _DecimalComplex))
         for item in array.flat
