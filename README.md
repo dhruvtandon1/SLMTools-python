@@ -12,17 +12,20 @@ Julia checkout is the reference used for parity tests.
 
 ## Install
 
-Python 3.13 or newer is supported. From a source checkout:
+Python 3.13 is the development and release-validation runtime. The package
+metadata permits newer Python 3 versions, but they are not part of the
+validated release environment. From a source checkout:
 
 ```bash
-python -m pip install .
+python3.13 -m pip install .
 ```
 
 For development:
 
 ```bash
-python -m pip install -e ".[test,plot]"
-python -m pytest -p no:cacheprovider -W error
+python3.13 -m venv .venv
+.venv/bin/python -m pip install -e ".[test,plot]"
+.venv/bin/python -m pytest -p no:cacheprovider -W error
 ```
 
 The distribution name is `hoganlab-slmtools`; the Python import is

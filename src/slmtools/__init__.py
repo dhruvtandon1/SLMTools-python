@@ -120,12 +120,20 @@ from .ot import (
 from .visualization import _cycle1 as cycle1, look
 from .bmp8 import save_gray8bmp
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 JULIA_SOURCE_COMMIT = "ea1c1c9c06b4b2dc46372ac7ee031301b604a007"
 
 # Source-qualified helpers and explicit spellings for Julia-only call syntax
 # remain package attributes without entering the exact ``__all__`` surface.
-rampPrivate = ramp
+_ramp_private_implementation = ramp
+
+
+def rampPrivate(x: object) -> object:
+    """Qualified counterpart of Julia's distinct ``rampPrivate`` generic."""
+
+    return _ramp_private_implementation(x)
+
+
 from .templates import _l2form as l2form, _standard_output as lfStandardOutputFormat
 globals()["SinkhornIterBase!"] = _SinkhornIterBase
 

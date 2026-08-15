@@ -569,6 +569,152 @@ class LatticeFieldCoreTests(unittest.TestCase):
             field.data[0] = np.asarray(7)
         self.assertEqual(field.data[0], 5)
 
+    def test_checked_flat_iterator_hides_storage_and_keeps_iterator_semantics(
+        self,
+    ):
+        source = np.arange(6, dtype=np.int64).reshape(2, 3)
+        field = LF[Generic, np.int64, 2](
+            source, (range(2), range(3))
+        )
+        retained = field.data
+        detached = np.asarray(retained)
+        flat = retained.flat
+
+        # Native flatiter.base exposes its writable ndarray. The checked
+        # counterpart must terminate that escape route at the checked façade.
+        self.assertIs(flat.base, retained)
+        with self.assertRaises(ValueError):
+            flat.base[0, 0] = 1.5
+        np.testing.assert_array_equal(source, np.arange(6).reshape(2, 3))
+
+        flat.base[0, 0] = 10
+        self.assertEqual(source[0, 0], 10)
+        self.assertEqual(detached[0, 0], 10)
+
+        # The wrapper is an iterator itself, with the same C-order position
+        # reporting and detached-copy behavior as numpy.flatiter.
+        self.assertIs(iter(flat), flat)
+        self.assertEqual(flat.index, 0)
+        self.assertEqual(flat.coords, (0, 0))
+        self.assertEqual(next(flat), 10)
+        self.assertEqual(flat.index, 1)
+        self.assertEqual(flat.coords, (0, 1))
+        flat_array = np.asarray(flat)
+        np.testing.assert_array_equal(flat_array, [10, 1, 2, 3, 4, 5])
+        self.assertEqual(flat.index, 1)
+        flat_array[0] = -1
+        self.assertEqual(field.data[0, 0], 10)
+        np.testing.assert_array_equal(
+            np.asarray(flat, dtype=np.float64),
+            np.asarray([10, 1, 2, 3, 4, 5], dtype=np.float64),
+        )
+        self.assertEqual(flat.index, 1)
+        with self.assertRaises(ValueError):
+            np.asarray(flat, copy=False)
+        self.assertEqual(flat.index, 1)
+        flat_copy = flat.copy()
+        self.assertIs(type(flat_copy), np.ndarray)
+        flat_copy[0] = -1
+        self.assertEqual(field.data[0, 0], 10)
+
+        # Assignment keys follow flatiter rather than broader ndarray
+        # indexing. Boolean ndarray masks remain supported, while the
+        # historically rejected list spelling and new-axis selection fail.
+        for invalid_key in (
+            None,
+            (),
+            [True, False, True, False, False, False],
+        ):
+            with self.assertRaises(IndexError):
+                flat[invalid_key] = [7, 8]
+        flat[np.asarray([True, False, True, False, False, False])] = [3, 4]
+        np.testing.assert_array_equal(
+            field.data.copy(), np.asarray([[3, 1, 4], [3, 4, 5]])
+        )
+
+        # flatiter assignment repeats a shorter value sequence. Each repeated
+        # element still passes through the checked Julia conversion gate.
+        flat[:] = [7, 8]
+        np.testing.assert_array_equal(
+            field.data.copy(), np.asarray([[7, 8, 7], [8, 7, 8]])
+        )
+        with self.assertRaises(ValueError):
+            flat[:] = [9, 1.5]
+        self.assertEqual(field.data[0, 0], 9)
+        self.assertEqual(field.data[0, 1], 8)
+
+    def test_checked_put_repeats_trims_modes_and_empty_inputs(self):
+        def integer_field(values):
+            array = np.asarray(values, dtype=np.int64)
+            return LF[Generic, np.int64, array.ndim](
+                array, tuple(range(size) for size in array.shape)
+            )
+
+        repeated = integer_field(np.arange(6).reshape(2, 3))
+        repeated.data.put([0, 1, 2, 3], [10, 11])
+        np.testing.assert_array_equal(
+            repeated.data.copy(),
+            np.asarray([[10, 11, 10], [11, 4, 5]]),
+        )
+
+        trimmed = integer_field(np.arange(6).reshape(2, 3))
+        trimmed.data.put([0, 2], [20, 21, 22])
+        np.testing.assert_array_equal(
+            trimmed.data.copy(),
+            np.asarray([[20, 1, 21], [3, 4, 5]]),
+        )
+
+        wrapped = integer_field(np.arange(6))
+        wrapped.data.put([-7, 6, 8], [7, 8], mode="wrap")
+        np.testing.assert_array_equal(wrapped.data.copy(), [8, 1, 7, 3, 4, 7])
+
+        clipped = integer_field(np.arange(6))
+        clipped.data.put([-7, 6, 8], [7, 8], mode="clip")
+        np.testing.assert_array_equal(clipped.data.copy(), [7, 1, 2, 3, 4, 7])
+
+        negative = integer_field(np.arange(6))
+        negative.data.put([-1, -6], [7, 8])
+        np.testing.assert_array_equal(negative.data.copy(), [8, 1, 2, 3, 4, 7])
+
+        partial_index = integer_field(np.arange(4))
+        with self.assertRaises(IndexError):
+            partial_index.data.put([0, 9, 1], [7, 8, 9])
+        np.testing.assert_array_equal(partial_index.data.copy(), [7, 1, 2, 3])
+
+        partial_value = integer_field([1, 2, 3])
+        with self.assertRaises(ValueError):
+            partial_value.data.put([0, 1, 2], [5, 1.5])
+        np.testing.assert_array_equal(partial_value.data.copy(), [5, 2, 3])
+
+        invalid_indices = integer_field(np.arange(4))
+        for indices in (
+            np.asarray([0.0, 1.0]),
+            np.asarray([0.0 + 0.0j, 1.0 + 0.0j]),
+            np.asarray([0, 1], dtype=np.uint64),
+        ):
+            with self.assertRaises(TypeError):
+                invalid_indices.data.put(indices, [7, 8])
+            np.testing.assert_array_equal(
+                invalid_indices.data.copy(), np.arange(4)
+            )
+        invalid_indices.data.put([0.9, 1.9], [7, 8])
+        np.testing.assert_array_equal(
+            invalid_indices.data.copy(), [7, 8, 2, 3]
+        )
+
+        unchanged = integer_field([1, 2, 3])
+        unchanged.data.put([], [9])
+        unchanged.data.put([0], [])
+        np.testing.assert_array_equal(unchanged.data.copy(), [1, 2, 3])
+        with self.assertRaises(ValueError):
+            unchanged.data.put([], [9], mode="invalid")
+        np.testing.assert_array_equal(unchanged.data.copy(), [1, 2, 3])
+
+        empty = integer_field(np.asarray([], dtype=np.int64))
+        empty.data.put([], [])
+        with self.assertRaises(IndexError):
+            empty.data.put([0], [])
+
     def test_checked_data_generic_views_allocations_and_synchronization(self):
         field = LF[Generic, np.int64, 2](
             np.arange(9, dtype=np.int64).reshape(3, 3),

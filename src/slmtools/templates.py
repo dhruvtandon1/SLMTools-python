@@ -531,9 +531,9 @@ def _prepare(
 def lfRand(
     template: Any,
     *args: Any,
-    R: Any = np.float64,
     center: Any = _OMITTED,
     flambda: Any = _UNSET,
+    R: Any = np.float64,
 ) -> LatticeField:
     """Generate a uniformly random lattice field."""
 
@@ -1331,13 +1331,13 @@ def ftaText(
 def lfText(
     template: Any,
     *args: Any,
+    center: Any = _OMITTED,
+    flambda: Any = _UNSET,
     R: Any = np.float64,
     pixelsize: int | None = None,
     fnt: Any = "arial bold",
     halign: str = "hcenter",
     valign: str = "vcenter",
-    center: Any = _OMITTED,
-    flambda: Any = _UNSET,
     **options: Any,
 ) -> LatticeField:
     """Generate a two-dimensional text field."""
@@ -1547,9 +1547,9 @@ def _emoji(
 def lfHeart(
     template: Any,
     *args: Any,
-    flip: bool = False,
     center: Any = _OMITTED,
     flambda: Any = _UNSET,
+    flip: bool = False,
 ) -> LatticeField:
     """Generate the Julia heart mask on a two-dimensional lattice."""
 
@@ -1559,9 +1559,9 @@ def lfHeart(
 def lfSmile(
     template: Any,
     *args: Any,
-    flip: bool = False,
     center: Any = _OMITTED,
     flambda: Any = _UNSET,
+    flip: bool = False,
 ) -> LatticeField:
     """Generate the Julia smiley mask on a two-dimensional lattice."""
 
@@ -1571,9 +1571,9 @@ def lfSmile(
 def lfPointer(
     template: Any,
     *args: Any,
-    flip: bool = False,
     center: Any = _OMITTED,
     flambda: Any = _UNSET,
+    flip: bool = False,
 ) -> LatticeField:
     """Generate the Julia pointing-hand mask on a two-dimensional lattice."""
 

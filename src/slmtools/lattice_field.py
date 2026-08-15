@@ -4702,46 +4702,92 @@ class _FullTypedConstructor:
 class _CheckedFlatIterator:
     """Flat view whose assignments keep Julia array conversion semantics."""
 
-    __slots__ = ("_owner",)
+    __slots__ = ("_owner", "_iterator")
 
     def __init__(self, owner: "_CheckedFieldArray") -> None:
         self._owner = owner
+        self._iterator = owner._storage().flat
 
-    def __iter__(self) -> Iterator[Any]:
-        return iter(self._owner._storage().flat)
+    def __iter__(self) -> "_CheckedFlatIterator":
+        return self
+
+    def __next__(self) -> Any:
+        return next(self._iterator)
 
     def __len__(self) -> int:
-        return self._owner.size
+        return len(self._iterator)
+
+    def __array__(
+        self,
+        dtype: Any = None,
+        copy: bool | None = None,
+    ) -> np.ndarray:
+        """Return all values detached without advancing iterator state."""
+
+        if copy is False:
+            raise ValueError(
+                "A checked flat iterator cannot provide a safe no-copy array"
+            )
+        result = self._owner.flatten(order="C")
+        if dtype is not None:
+            result = result.astype(dtype, copy=False)
+        return result
 
     def __getitem__(self, key: Any) -> Any:
-        return self._owner._storage().flat[key]
+        result = self._iterator[key]
+        if isinstance(result, np.ndarray):
+            return np.array(result, copy=True, subok=False)
+        return result
 
     def __setitem__(self, key: Any, value: Any) -> None:
-        flat_indices = np.arange(self._owner.size)[key]
+        if isinstance(key, tuple) and not key:
+            raise IndexError(
+                "Assigning to a flat iterator with a 0-D index is not supported"
+            )
+        flat_indices = np.arange(self._owner.size).flat[key]
         target_indices = np.asarray(flat_indices)
         if target_indices.ndim == 0:
             coordinates = np.unravel_index(
                 int(target_indices), self._owner.shape, order="C"
             )
             self._owner[coordinates] = value
+            self._iterator = self._owner._storage().flat
             return
         raw_value = _CheckedFieldArray._unwrap_checked(value)
-        values = np.broadcast_to(
-            np.asarray(raw_value), target_indices.shape
-        )
+        values = np.asarray(raw_value).ravel(order="C")
+        if target_indices.size == 0 or values.size == 0:
+            self._iterator = self._owner._storage().flat
+            return
         state = self._owner._state()
         state.begin_write()
         try:
-            for index in np.ndindex(target_indices.shape):
+            for position, flat_index in enumerate(
+                target_indices.ravel(order="C")
+            ):
                 coordinates = np.unravel_index(
-                    int(target_indices[index]), self._owner.shape, order="C"
+                    int(flat_index), self._owner.shape, order="C"
                 )
-                self._owner[coordinates] = values[index]
+                self._owner[coordinates] = values[position % values.size]
         finally:
             state.end_write()
+            self._iterator = self._owner._storage().flat
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._owner._storage().flat, name)
+    @property
+    def base(self) -> "_CheckedFieldArray":
+        """Return the checked façade, never its writable backing ndarray."""
+
+        return self._owner
+
+    @property
+    def coords(self) -> tuple[int, ...]:
+        return self._iterator.coords
+
+    @property
+    def index(self) -> int:
+        return self._iterator.index
+
+    def copy(self) -> np.ndarray:
+        return self._iterator.copy()
 
 
 class _FieldReadOnlyGuard(np.ndarray):
@@ -5733,25 +5779,45 @@ class _CheckedFieldArray(np.ndarray):
         values: Any,
         mode: str = "raise",
     ) -> None:
-        raw_indices = np.asarray(indices)
-        raw_values = np.broadcast_to(
-            np.asarray(self._unwrap_checked(values)), raw_indices.shape
-        )
+        if mode not in {"raise", "wrap", "clip"}:
+            raise ValueError(
+                "mode must be one of 'raise', 'wrap', or 'clip'"
+            )
+        if isinstance(indices, np.ndarray) and not np.can_cast(
+            indices.dtype, np.dtype(np.intp), casting="safe"
+        ):
+            raise TypeError(
+                f"Cannot safely cast indices array from {indices.dtype!r} "
+                f"to {np.dtype(np.intp)!r}"
+            )
+        raw_indices = np.asarray(indices).ravel(order="C")
+        raw_values = np.asarray(
+            self._unwrap_checked(values)
+        ).ravel(order="C")
+        if self.size == 0 and raw_indices.size:
+            raise IndexError("cannot replace elements of an empty array")
+        if raw_indices.size == 0 or raw_values.size == 0:
+            return
         state = self._state()
         state.begin_write()
         try:
-            for index in np.ndindex(raw_indices.shape):
-                flat_index = int(raw_indices[index])
+            for position, raw_index in enumerate(raw_indices):
+                flat_index = int(raw_index)
                 if mode == "wrap":
                     flat_index %= self.size
                 elif mode == "clip":
                     flat_index = min(max(flat_index, 0), self.size - 1)
                 elif flat_index < 0:
                     flat_index += self.size
+                if flat_index < 0 or flat_index >= self.size:
+                    raise IndexError(
+                        f"index {int(raw_index)} is out of bounds for "
+                        f"flattened array of size {self.size}"
+                    )
                 coordinates = np.unravel_index(
                     flat_index, self.shape, order="C"
                 )
-                self[coordinates] = raw_values[index]
+                self[coordinates] = raw_values[position % raw_values.size]
         finally:
             state.end_write()
 

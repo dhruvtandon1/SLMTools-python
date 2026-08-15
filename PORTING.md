@@ -12,11 +12,14 @@ exceptions.
 - Audited commit: `ea1c1c9c06b4b2dc46372ac7ee031301b604a007`
 - Audited Julia environment: Julia `1.11.6` with the upstream
   `Project.toml` and `Manifest.toml`
-- Python package version: `0.3.0`
-- Supported Python runtime: CPython `3.13` or newer
+- Python package version: `0.3.1`
+- Development and release-validation runtime: CPython `3.13`
+- Package metadata minimum: CPython `3.13`
 
 The commit above is the behavioral source of truth. A future upstream sync
 updates the commit, implementation, tests, and package version together.
+Python-only runtime or correctness maintenance may increment the Python patch
+version while retaining this Julia baseline.
 `requirements-validation.txt` records the exact macOS arm64 Python environment
 used for the release audit without acting as a cross-platform dependency lock.
 
@@ -31,6 +34,25 @@ and, when the audited checkout is available, independently parse the Julia
 `src/SubImages.jl` exists in the upstream repository but is not included by
 `SLMTools.jl`. Its translation therefore remains the optional
 `slmtools.subimages` module and stays outside the package-root export list.
+
+### Public call syntax
+
+Successful Julia positional call forms retain their order and optional arity.
+Python necessarily merges Julia overloads into runtime dispatchers, so a
+signature may show `*args` where Julia shows several typed methods; the
+dispatcher still enforces the source method shapes. Parametric construction
+translates mechanically, for example `LF{Intensity}(data, L)` becomes
+`LF[Intensity](data, L)`.
+
+Source-declared keyword names, case, order, and defaults are retained. Julia
+identifiers that are not portable Python identifiers use direct ASCII
+spellings (`Φ0` → `phi0`, `θ` → `theta`, `α`/`β` →
+`alpha`/`beta`, `ε`/`ϵ` → `epsilon`, and `Lμ` → `Lmu`). Required Julia
+positional parameter names are not keyword API in Julia; Python may give those
+positions descriptive names and, as a normal Python convenience, allow them
+to be supplied by keyword. This adds no replacement spelling for a Julia
+keyword. Julia `Symbol` values use strings, `nothing` uses `None`, and Julia
+callable defaults use their documented Python counterparts.
 
 ## Module map
 
@@ -233,8 +255,9 @@ system OOM kill.
 Install and run the complete Python suite:
 
 ```bash
-python -m pip install -e ".[test,plot]"
-python -m pytest -p no:cacheprovider -W error
+python3.13 -m venv .venv
+.venv/bin/python -m pip install -e ".[test,plot]"
+.venv/bin/python -m pytest -p no:cacheprovider -W error
 ```
 
 The suite checks:

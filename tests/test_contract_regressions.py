@@ -316,8 +316,17 @@ def test_publication_metadata_has_tested_minimums_and_matching_version() -> None
     root = Path(__file__).resolve().parents[1]
     project = tomllib.loads((root / "pyproject.toml").read_text())
 
+    assert (root / ".python-version").read_text().strip() == "3.13"
+    assert "include .python-version" in (
+        root / "MANIFEST.in"
+    ).read_text().splitlines()
     assert project["project"]["version"] == slm.__version__
     assert project["project"]["requires-python"] == ">=3.13"
+    assert project["project"]["classifiers"] == [
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3 :: Only",
+        "Programming Language :: Python :: 3.13",
+    ]
     assert project["build-system"]["requires"] == ["setuptools>=83.0.0"]
     assert project["project"]["dependencies"] == [
         "gmpy2>=2.3.1",
